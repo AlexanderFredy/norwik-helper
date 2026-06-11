@@ -1,5 +1,6 @@
 """Agentic-цикл: запрос менеджера → инструменты → ответ для Telegram."""
 import logging
+from collections.abc import Awaitable, Callable
 
 import anthropic
 
@@ -18,7 +19,11 @@ class Orchestrator:
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
         self._executor = executor
 
-    async def handle_query(self, query: str) -> str:
+    async def handle_query(
+        self,
+        query: str,
+        on_tool: Callable[[str, dict], Awaitable[None]] | None = None,
+    ) -> str:
         """Обрабатывает один запрос менеджера и возвращает текст ответа."""
         messages: list[dict] = [{"role": "user", "content": query}]
 
@@ -56,6 +61,8 @@ class Orchestrator:
             results = []
             for tool in tool_uses:
                 logger.info("Инструмент %s: %s", tool.name, tool.input)
+                if on_tool:
+                    await on_tool(tool.name, tool.input)
                 output = await self._executor.execute(tool.name, tool.input)
                 results.append(
                     {

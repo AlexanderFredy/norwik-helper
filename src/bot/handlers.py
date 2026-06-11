@@ -1,8 +1,9 @@
 """Обработчики сообщений: админ-команды и запросы менеджера."""
 import html
+import io
 import logging
 
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
@@ -13,6 +14,15 @@ logger = logging.getLogger(__name__)
 ADMIN_ONLY = "Команда доступна только администратору"
 
 router = Router()
+
+_TOOL_STATUS: dict[str, str] = {
+    "search_emails": "Ищу в почте поставщиков...",
+    "read_attachment": "Читаю вложение...",
+    "get_email_contacts": "Получаю контакты поставщика...",
+    "search_norwik": "Ищу на сайте norwik.ru...",
+    "get_norwik_product": "Проверяю карточку товара...",
+    "web_search": "Ищу в интернете...",
+}
 
 
 def _parse_id(args: str | None) -> int | None:
@@ -83,24 +93,81 @@ async def cmd_start(message: Message) -> None:
     await message.answer(
         "Я помощник менеджера по продажам.\n"
         "Напишите название товара (бренд, коллекция/артикул, для плитки — размер) "
-        "и нужное количество — я найду поставщиков, остатки и цены."
+        "и нужное количество — я найду поставщиков, остатки и цены.\n"
+        "Можно отправить голосовое сообщение."
     )
+
+
+async def _process_query(message: Message, text: str, orchestrator, status_msg) -> None:
+    """Общая логика обработки запроса с обновлением статуса."""
+
+    async def on_tool(name: str, _input: dict) -> None:
+        label = _TOOL_STATUS.get(name, f"Выполняю {name}...")
+        try:
+            await status_msg.edit_text(label)
+        except Exception:
+            pass
+
+    try:
+        answer = await orchestrator.handle_query(text, on_tool=on_tool)
+    except Exception:
+        logger.exception("Ошибка обработки запроса")
+        await status_msg.edit_text("Произошла ошибка при обработке запроса. Попробуйте позже.")
+        return
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    for i in range(0, len(answer), 4096):
+        await message.answer(answer[i : i + 4096])
+
+
+@router.message(F.voice)
+async def handle_voice(message: Message, orchestrator, openai_api_key: str | None) -> None:
+    if not openai_api_key:
+        await message.answer(
+            "Транскрипция голосовых сообщений не настроена. "
+            "Добавьте OPENAI_API_KEY в .env и перезапустите бота."
+        )
+        return
+
+    status_msg = await message.answer("Распознаю голосовое сообщение...")
+
+    try:
+        from openai import AsyncOpenAI
+
+        file_info = await message.bot.get_file(message.voice.file_id)
+        buf = io.BytesIO()
+        await message.bot.download_file(file_info.file_path, destination=buf)
+        buf.seek(0)
+        buf.name = "voice.ogg"
+
+        oai = AsyncOpenAI(api_key=openai_api_key)
+        transcription = await oai.audio.transcriptions.create(
+            model="whisper-1",
+            file=buf,
+            language="ru",
+        )
+        text = transcription.text.strip()
+    except Exception:
+        logger.exception("Ошибка транскрипции голосового сообщения")
+        await status_msg.edit_text("Не удалось распознать голосовое сообщение. Попробуйте текстом.")
+        return
+
+    if not text:
+        await status_msg.edit_text("Голосовое сообщение пустое или не распознано.")
+        return
+
+    await status_msg.edit_text(f"Распознано: {text}\n\nОбрабатываю запрос...")
+    await _process_query(message, text, orchestrator, status_msg)
 
 
 @router.message()
 async def handle_query(message: Message, orchestrator) -> None:
     if not message.text:
-        await message.answer("Пожалуйста, отправьте запрос текстом")
+        await message.answer("Пожалуйста, отправьте запрос текстом или голосовым сообщением")
         return
-    await message.bot.send_chat_action(message.chat.id, "typing")
-    try:
-        answer = await orchestrator.handle_query(message.text)
-    except Exception:
-        logger.exception("Ошибка обработки запроса")
-        await message.answer(
-            "Произошла ошибка при обработке запроса. Попробуйте позже."
-        )
-        return
-    # Telegram ограничивает сообщение 4096 символами
-    for i in range(0, len(answer), 4096):
-        await message.answer(answer[i : i + 4096])
+    status_msg = await message.answer("Обрабатываю запрос...")
+    await _process_query(message, message.text, orchestrator, status_msg)

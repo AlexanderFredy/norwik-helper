@@ -37,7 +37,7 @@ async def main() -> None:
     )
 
     bot = Bot(token=config.telegram_bot_token)
-    dp = Dispatcher(store=store, orchestrator=orchestrator)
+    dp = Dispatcher(store=store, orchestrator=orchestrator, openai_api_key=config.openai_api_key)
     dp.message.middleware(AuthMiddleware(store, config.admin_telegram_id))
     dp.include_router(router)
 

@@ -26,6 +26,7 @@ class Config:
     mail_password: str
     anthropic_api_key: str
     db_path: Path
+    openai_api_key: str | None
 
 
 def load_config() -> Config:
@@ -44,4 +45,5 @@ def load_config() -> Config:
         mail_password=os.environ["MAIL_PASSWORD"],
         anthropic_api_key=os.environ["ANTHROPIC_API_KEY"],
         db_path=Path(os.getenv("DB_PATH", "data/users.db")),
+        openai_api_key=os.getenv("OPENAI_API_KEY") or None,
     )
