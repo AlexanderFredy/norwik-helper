@@ -4,10 +4,14 @@ import logging
 
 from aiogram import Bot, Dispatcher
 
+from src.agent.orchestrator import Orchestrator
+from src.agent.tools import ToolExecutor
 from src.bot.auth import AuthMiddleware
 from src.bot.handlers import router
 from src.config import load_config
+from src.email_tool.client import MailClient
 from src.storage.users import UserStore
+from src.website_tool.norwik import NorwikClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,8 +27,17 @@ async def main() -> None:
     store = UserStore(config.db_path)
     await store.init()
 
+    mail = MailClient(
+        config.mail_host, config.mail_port, config.mail_user, config.mail_password
+    )
+    norwik = NorwikClient()
+    orchestrator = Orchestrator(
+        api_key=config.anthropic_api_key,
+        executor=ToolExecutor(mail, norwik),
+    )
+
     bot = Bot(token=config.telegram_bot_token)
-    dp = Dispatcher(store=store)
+    dp = Dispatcher(store=store, orchestrator=orchestrator)
     dp.message.middleware(AuthMiddleware(store, config.admin_telegram_id))
     dp.include_router(router)
 

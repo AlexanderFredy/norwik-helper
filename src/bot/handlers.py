@@ -88,11 +88,19 @@ async def cmd_start(message: Message) -> None:
 
 
 @router.message()
-async def handle_query(message: Message) -> None:
+async def handle_query(message: Message, orchestrator) -> None:
     if not message.text:
         await message.answer("Пожалуйста, отправьте запрос текстом")
         return
-    # Фаза 4: здесь будет вызов AI-оркестратора
-    await message.answer(
-        "Запрос принят. Обработка запросов будет подключена в Фазе 4 (AI-оркестратор)."
-    )
+    await message.bot.send_chat_action(message.chat.id, "typing")
+    try:
+        answer = await orchestrator.handle_query(message.text)
+    except Exception:
+        logger.exception("Ошибка обработки запроса")
+        await message.answer(
+            "Произошла ошибка при обработке запроса. Попробуйте позже."
+        )
+        return
+    # Telegram ограничивает сообщение 4096 символами
+    for i in range(0, len(answer), 4096):
+        await message.answer(answer[i : i + 4096])
