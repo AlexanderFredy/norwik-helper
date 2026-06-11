@@ -17,14 +17,37 @@ UNSUPPORTED_LEGACY = (
 
 
 def excel_sheet_names(content: bytes) -> list[str]:
-    """Названия листов xlsx-книги (для классификации прайс/остатки)."""
-    from openpyxl import load_workbook
-
-    wb = load_workbook(io.BytesIO(content), read_only=True)
+    """Названия листов xlsx/xls-книги (для классификации прайс/остатки)."""
     try:
-        return list(wb.sheetnames)
-    finally:
-        wb.close()
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(content), read_only=True)
+        try:
+            return list(wb.sheetnames)
+        finally:
+            wb.close()
+    except Exception:
+        try:
+            import xlrd
+            wb = xlrd.open_workbook(file_contents=content)
+            return wb.sheet_names()
+        except Exception:
+            return []
+
+
+def _extract_xls(content: bytes, max_rows: int = 2000) -> str:
+    import xlrd
+
+    wb = xlrd.open_workbook(file_contents=content)
+    lines: list[str] = []
+    for sheet in wb.sheets():
+        lines.append(f"=== Лист: {sheet.name} ===")
+        for i in range(min(sheet.nrows, max_rows)):
+            cells = [str(sheet.cell_value(i, j)) for j in range(sheet.ncols)]
+            if any(c.strip() for c in cells):
+                lines.append("\t".join(cells))
+        if sheet.nrows > max_rows:
+            lines.append(f"... (показаны первые {max_rows} строк)")
+    return "\n".join(lines)
 
 
 def _extract_xlsx(content: bytes, max_rows: int = 2000) -> str:
@@ -118,7 +141,7 @@ def extract_text(filename: str, content: bytes) -> str:
         if ext == ".txt":
             return _extract_txt(content)
         if ext == ".xls":
-            return UNSUPPORTED_LEGACY.format(ext=".xls", modern=".xlsx")
+            return _extract_xls(content)
         if ext == ".doc":
             return UNSUPPORTED_LEGACY.format(ext=".doc", modern=".docx")
         return f"Формат {ext or '(без расширения)'} не поддерживается"
