@@ -1,7 +1,7 @@
 """Определения инструментов для Claude и их выполнение.
 
 Кастомные инструменты выполняются на нашей стороне (email, norwik.ru);
-web_search — серверный инструмент Anthropic (для случая А из spec.md).
+web_search — серверный инструмент Anthropic (для случая А из specs/master-spec.md).
 """
 import asyncio
 import json

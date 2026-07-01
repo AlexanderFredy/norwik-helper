@@ -2,7 +2,7 @@
 
 Ящик открывается через select(readonly=True); используются только команды
 SEARCH и FETCH. Операции записи (STORE, APPEND, EXPUNGE, COPY) и отправка
-писем не реализованы намеренно — см. spec.md, раздел 4.
+писем не реализованы намеренно — см. specs/master-spec.md, раздел 4.
 """
 import email
 import email.header

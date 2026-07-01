@@ -4,7 +4,7 @@ AI-агент с Telegram-ботом: по запросу менеджера н�
 (письма на mail.ru — только чтение), показывает остатки, закупочные цены и
 цену на сайте norwik.ru.
 
-Документация: [spec.md](spec.md) · [implementation-plan.md](implementation-plan.md)
+Документация: [master-spec.md](specs/master-spec.md) · [cart-orders-1c.md](specs/cart-orders-1c.md) · [implementation-plan.md](implementation-plan.md)
 
 ## Запуск локально
 
