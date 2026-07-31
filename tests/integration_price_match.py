@@ -92,11 +92,11 @@ SYSTEM_PROMPT = """Ты — контент-менеджер интернет-м�
      коэффициенты иных ЕИ к базовой, напр. {"упак": 2.367} = 1 упаковка = 2.367 м².
    - Если цена в прайсе дана за упаковку (или иную ЕИ) — приведи к базовой ЕИ, ДЕЛЯ на
      коэффициент из `alt_units` (цена_за_м² = цена_за_упак / 2.367), и только потом сравнивай.
-6a. ВЫЯВЛЕНИЕ РАСХОЖДЕНИЙ КОЭФФИЦИЕНТОВ ЕИ (важная отдельная задача, всегда выполняй):
-    для КАЖДОЙ сопоставленной позиции извлеки из прайса количество БАЗОВОЙ ЕИ в упаковке
-    (напр. м²/пачка из колонки «кол-во в упаковке»/«шт/м²»: «10шт\\2,16» → 2,16 м²/пачка) и
-    сравни с коэффициентом `alt_units` из 1С (напр. {"упак": 2.367}). Совпадает — ок;
-    расходится — это ошибка данных ЕИ, которую надо сообщить админу (позже он исправит в 1С).
+6a. ВЫЯВЛЕНИЕ РАСХОЖДЕНИЙ КОЭФФИЦИЕНТОВ ЕИ (обязательный шаг): для сопоставленных позиций
+    извлеки из прайса количество БАЗОВОЙ ЕИ в упаковке (напр. м²/пачка из «10шт\\2,16» → 2,16)
+    и ВЫЗОВИ инструмент `check_unit_coefficients` со списком {ref, pack_qty} по ВСЕМ таким
+    позициям (можно по одному ref на коллекцию). Инструмент сам сверит с `alt_units` из 1С и
+    вернёт вердикт. Расхождение — ошибка данных ЕИ для админа (позже исправит в 1С).
 5. Сопоставь строки прайса с товарами 1С: приоритет — точный артикул → размер+коллекция+декор
    → нечёткое по наименованию (учитывай отклонения написания, латиница/кириллица). Размер в
    формате Д×Ш×Т мм, длина/ширина могут быть диапазоном — это не расхождение.
@@ -131,7 +131,8 @@ TOOLS = [
         "description": (
             "Номенклатура одной ТМ с ценами по коду ТМ. Параметры: tm_code (строка-код из "
             "get_selling_tm), page (с 1), size (по умолчанию 200). Возвращает total и items "
-            "с полями ref/name/article/size/collection/parent/product_type/unit/purchase/rrc."
+            "с полями ref/name/article/size/collection/parent/product_type/unit/alt_units/"
+            "purchase/rrc."
         ),
         "input_schema": {
             "type": "object",
@@ -141,6 +142,35 @@ TOOLS = [
                 "size": {"type": "integer"},
             },
             "required": ["tm_code"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "check_unit_coefficients",
+        "description": (
+            "Сверяет фасовку прайса с коэффициентами ЕИ (alt_units) из 1С — ДЕТЕРМИНИРОВАННО. "
+            "Вызови для ВСЕХ сопоставленных позиций, где в прайсе есть кол-во базовой ЕИ в "
+            "упаковке. Возвращает по каждой позиции: коэффициент 1С, значение прайса, "
+            "совпадает/расходится. Используй результат в таблице расхождений коэффициентов."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "ref": {"type": "string", "description": "Код 1С позиции (из get_nomenclature)"},
+                            "pack_qty": {"type": "number", "description": "кол-во базовой ЕИ в упаковке из прайса (напр. м²/пачка)"},
+                            "unit": {"type": "string", "description": "имя ЕИ, напр. 'упак' (опционально)"},
+                        },
+                        "required": ["ref", "pack_qty"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["items"],
             "additionalProperties": False,
         },
     },
@@ -157,17 +187,51 @@ def _item_dict(it: NomItem) -> dict:
     }
 
 
-def _run_tool(onec: OnecClient, name: str, inp: dict) -> str:
+def _coef_verdict(item: NomItem, pack_qty: float, unit: str | None) -> dict:
+    """Детерминированная сверка фасовки прайса с alt_units товара 1С."""
+    au = item.alt_units or {}
+    if unit and unit in au:
+        onec_coef = au[unit]
+    elif "упак" in au:
+        onec_coef, unit = au["упак"], "упак"
+    elif au:
+        unit, onec_coef = next(iter(au.items()))
+    else:
+        onec_coef = None
+    if onec_coef in (None, 0):
+        match, diff_pct = None, None
+    else:
+        diff_pct = round((pack_qty - onec_coef) / onec_coef * 100, 2)
+        match = abs(diff_pct) < 1.0  # допуск 1%
+    return {"ref": item.ref, "name": item.name, "unit": unit or "",
+            "price_qty": pack_qty, "onec_coef": onec_coef,
+            "match": match, "diff_pct": diff_pct}
+
+
+def _run_tool(onec: OnecClient, name: str, inp: dict, state: dict) -> str:
     if name == "get_selling_tm":
         tms = onec.selling_tm()
         return json.dumps([{"name": t.name, "code": t.code} for t in tms], ensure_ascii=False)
     if name == "get_nomenclature":
         page = onec.by_tm(inp["tm_code"], page=inp.get("page", 1), size=inp.get("size", 200))
+        for it in page.items:
+            state["items"][it.ref] = it          # кэш для детерминированной сверки
         return json.dumps(
             {"tm": page.tm, "total": page.total, "page": page.page, "size": page.size,
              "items": [_item_dict(i) for i in page.items]},
             ensure_ascii=False,
         )
+    if name == "check_unit_coefficients":
+        out = []
+        for row in inp.get("items", []):
+            it = state["items"].get(row["ref"])
+            if not it:
+                out.append({"ref": row["ref"], "error": "ref не найден в загруженной номенклатуре"})
+                continue
+            v = _coef_verdict(it, row["pack_qty"], row.get("unit"))
+            state["coef_checks"].append(v)
+            out.append(v)
+        return json.dumps(out, ensure_ascii=False)
     return f"Неизвестный инструмент: {name}"
 
 
@@ -185,12 +249,34 @@ def _image_blocks(images: list[dict]) -> list[dict]:
     return blocks
 
 
+def _coef_table(checks: list[dict]) -> str:
+    """Детерминированная таблица расхождений коэффициентов ЕИ (гарантированно в отчёте)."""
+    if not checks:
+        return ("## Расхождения коэффициентов ЕИ (alt_units)\n\n"
+                "_Сверка не выполнялась: агент не вызвал check_unit_coefficients "
+                "(нет фасовки в прайсе или пропущено)._")
+    mism = [c for c in checks if c.get("match") is False]
+    lines = ["## Расхождения коэффициентов ЕИ (alt_units) — детерминированная сверка",
+             "", f"Сверено позиций: {len(checks)}; расхождений: **{len(mism)}**.", "",
+             "| Наименование | ref | ЕИ | Прайс | 1С (alt_units) | Δ% | Статус |",
+             "|---|---|---|---|---|---|---|"]
+    for c in (mism or checks):
+        st = "❌ расхождение" if c.get("match") is False else ("✅ совпадает" if c.get("match") else "—")
+        lines.append(f"| {c['name'][:40]} | {c['ref']} | {c['unit']} | {c['price_qty']} | "
+                     f"{c['onec_coef']} | {c['diff_pct']} | {st} |")
+    if mism and len(checks) > len(mism):
+        lines.append(f"\n_(показаны только расхождения; ещё {len(checks)-len(mism)} позиций совпали)_")
+    return "\n".join(lines)
+
+
 def match_pricelist(client, onec: OnecClient, price_text: str, meta: str,
                     images: list[dict] | None = None) -> str:
-    """Гоняет агента над одним прайсом, возвращает текстовый отчёт."""
+    """Гоняет агента над одним прайсом, возвращает текстовый отчёт + таблицу коэффициентов."""
+    state = {"items": {}, "coef_checks": []}
     content = [{"type": "text", "text": f"{meta}\n\nСодержимое прайса:\n{price_text}"}]
     content += _image_blocks(images or [])
     messages = [{"role": "user", "content": content}]
+    report = "(превышен лимит итераций агента)"
     for _ in range(20):
         resp = client.messages.create(
             model=MODEL, max_tokens=12000,
@@ -198,15 +284,18 @@ def match_pricelist(client, onec: OnecClient, price_text: str, meta: str,
         )
         tool_uses = [b for b in resp.content if b.type == "tool_use"]
         if resp.stop_reason != "tool_use" or not tool_uses:
-            return "".join(b.text for b in resp.content if b.type == "text").strip()
+            report = "".join(b.text for b in resp.content if b.type == "text").strip()
+            break
         messages.append({"role": "assistant", "content": resp.content})
         results = []
         for t in tool_uses:
-            print(f"    · {t.name}({', '.join(f'{k}={v}' for k, v in t.input.items())})")
+            shown = {k: (v if not isinstance(v, list) else f"[{len(v)} поз.]") for k, v in t.input.items()}
+            print(f"    · {t.name}({', '.join(f'{k}={v}' for k, v in shown.items())})")
             results.append({"type": "tool_result", "tool_use_id": t.id,
-                            "content": _run_tool(onec, t.name, t.input)})
+                            "content": _run_tool(onec, t.name, t.input, state)})
         messages.append({"role": "user", "content": results})
-    return "(превышен лимит итераций агента)"
+    # детерминированная таблица коэффициентов — всегда, независимо от текста агента
+    return report + "\n\n---\n\n" + _coef_table(state["coef_checks"])
 
 
 def _price_attachment(msg):
