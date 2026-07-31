@@ -44,6 +44,17 @@ class ParsePriceTableTest(unittest.TestCase):
     def test_unsupported_returns_empty(self):
         self.assertEqual(parse_price_table(b"whatever", "p.doc"), [])
 
+    def test_trailing_empty_cells_trimmed(self):
+        # "широкая" строка: данные + сотни пустых хвостовых колонок
+        content = _xlsx([
+            ["Арт", "Цена"] + [""] * 300,
+            ["56649", "960"] + [""] * 300,
+        ])
+        rows = non_empty_rows(parse_price_table(content, "p.xlsx")[0])
+        self.assertEqual(rows[0], ["Арт", "Цена"])          # хвост обрезан
+        self.assertEqual(rows[1], ["56649", "960"])
+        self.assertNotIn("\t\t\t", render_preview(parse_price_table(content, "p.xlsx")[0]))
+
 
 class OnecPriceNormalizationTest(unittest.TestCase):
     def test_prices_array_to_dict(self):

@@ -92,12 +92,20 @@ def parse_price_table(content: bytes, filename: str) -> list[Sheet]:
     return []
 
 
+def _rtrim(row: list[str]) -> list[str]:
+    """Убирает хвостовые пустые ячейки (листы бывают «широкими» — сотни пустых колонок)."""
+    i = len(row)
+    while i > 0 and not row[i - 1]:
+        i -= 1
+    return row[:i]
+
+
 def non_empty_rows(sheet: Sheet) -> list[list[str]]:
-    return [r for r in sheet.rows if any(c for c in r)]
+    return [_rtrim(r) for r in sheet.rows if any(c for c in r)]
 
 
 def render_preview(sheet: Sheet, max_rows: int = 250) -> str:
-    """Таб-текст листа для передачи агенту (ограничение по строкам)."""
+    """Таб-текст листа для передачи агенту (без хвостовых пустых ячеек, лимит строк)."""
     rows = non_empty_rows(sheet)
     lines = [f"=== Лист: {sheet.name} ({len(rows)} непустых строк) ==="]
     for r in rows[:max_rows]:

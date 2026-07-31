@@ -28,10 +28,18 @@ MODEL = "claude-opus-4-8"
 _PRICE_EXTS = (".xlsx", ".xls", ".csv", ".pdf")
 
 
-def price_to_text(content: bytes, filename: str, max_chars: int = 40000) -> str:
-    """Текст прайса для агента: таблицы через parse_price_table, иначе (pdf/docx) extract_text."""
+def price_to_text(content: bytes, filename: str, sheet: str | None = None,
+                  max_chars: int = 40000) -> str:
+    """Текст прайса для агента: таблицы через parse_price_table, иначе (pdf/docx) extract_text.
+
+    sheet — подстрока имени листа (без регистра); если задана и совпадает — берём только
+    эти листы, иначе все (фолбэк).
+    """
     sheets = parse_price_table(content, filename)
     if sheets:
+        if sheet:
+            picked = [s for s in sheets if sheet.lower() in s.name.lower()]
+            sheets = picked or sheets
         text = "\n\n".join(render_preview(s) for s in sheets)
     else:
         text = extract_text(filename, content)  # pdf/docx фолбэк
@@ -57,12 +65,19 @@ SYSTEM_PROMPT = """Ты — контент-менеджер интернет-м�
    формате Д×Ш×Т мм, длина/ширина могут быть диапазоном — это не расхождение.
 6. Для каждой сопоставленной позиции сравни цену прайса с текущей ценой 1С (purchase/rrc).
 
-Выведи отчёт (кратко, по-русски):
+ВАЖНО: расхождения собирай ТОЛЬКО по ТМ, которые реально есть в 1С (вернул get_selling_tm
+и get_nomenclature). Бренды прайса, которых нет в selling-tm, лишь перечисли одной строкой
+как «не выгружается» — без детализации позиций и расхождений.
+
+Выведи отчёт в Markdown (по-русски):
 - Бренд, product_type, код ТМ, сколько позиций в прайсе / в номенклатуре 1С.
-- Таблица: строка прайса → статус (confident/disputed/unmatched), ref, старая→новая цена
-  (закупка/РРЦ), %; для disputed — кандидаты.
-- Итог: сколько confident/disputed/unmatched, средний % по коллекциям, предупреждения
-  (расхождение parent/collection, несколько product_type, непарсибельные цены).
+- **Таблица расхождений цен** (только сопоставленные позиции ТМ из 1С, где цена прайса ≠
+  текущей в 1С): наименование, ref, вид цены, старая→новая, %.
+- Таблица сопоставления: строка прайса → статус (confident/disputed/unmatched), ref;
+  для disputed — кандидаты.
+- Итог: сколько confident/disputed/unmatched, средний % по коллекциям.
+- Предупреждения: расхождение parent/collection, размеры, несколько product_type,
+  непарсибельные цены, бренды не в selling-tm.
 """
 
 TOOLS = [
@@ -171,8 +186,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--max", type=int, default=3)
-    ap.add_argument("--file", type=str, help="локальный файл прайса вместо почты")
+    ap.add_argument("--file", type=str, help="локальный файл или папка прайсов вместо почты")
     ap.add_argument("--brand", type=str, help="подсказка бренда для --file")
+    ap.add_argument("--sheet", type=str, help="подстрока имени листа (напр. 'SPC LVT')")
+    ap.add_argument("--out", type=str, help="папка для файлов-отчётов (по одному на прайс)")
+    ap.add_argument("--max-chars", type=int, default=40000, help="лимит текста прайса в промпт")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -181,29 +199,42 @@ def main() -> None:
     onec = OnecClient(cfg.onec_base_url, cfg.onec_token)
     client = anthropic.Anthropic(api_key=cfg.anthropic_api_key)
 
+    out_dir = Path(args.out) if args.out else None
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
     try:
-        jobs = []  # (meta, price_text)
+        jobs = []  # (name, meta, price_text)
         if args.file:
-            files = sorted(Path(args.file).glob("*")) if Path(args.file).is_dir() else [Path(args.file)]
+            p = Path(args.file)
+            files = sorted(f for f in p.glob("*") if f.is_file()) if p.is_dir() else [p]
             for f in files:
-                text = price_to_text(f.read_bytes(), f.name)
+                text = price_to_text(f.read_bytes(), f.name, sheet=args.sheet, max_chars=args.max_chars)
                 meta = f"Файл: {f.name}" + (f"; бренд-подсказка: {args.brand}" if args.brand else "")
-                jobs.append((meta, text))
+                jobs.append((f.stem, meta, text))
         else:
             mail = MailClient(cfg.mail_host, cfg.mail_port, cfg.mail_user, cfg.mail_password)
             print(f"Ищу прайсы в почте за {args.days} дн...")
             emails = collect_price_emails(mail, args.days, args.max)
             print(f"Найдено прайсов: {len(emails)}")
             for full, att in emails:
-                text = price_to_text(att.content, att.filename)
+                text = price_to_text(att.content, att.filename, sheet=args.sheet, max_chars=args.max_chars)
                 meta = (f"От: {full.sender_name} <{full.sender_email}>; тема: {full.subject}; "
                         f"вложение: {att.filename}")
-                jobs.append((meta, text))
+                jobs.append((Path(att.filename).stem, meta, text))
 
-        for i, (meta, text) in enumerate(jobs, 1):
+        for i, (name, meta, text) in enumerate(jobs, 1):
             print(f"\n{'='*70}\n[{i}/{len(jobs)}] {meta}\n{'='*70}")
             report = match_pricelist(client, onec, text, meta)
             print(report)
+            if out_dir:
+                safe = "".join(c if c.isalnum() or c in " -_." else "_" for c in name).strip()
+                path = out_dir / f"{safe}.md"
+                header = f"# Отчёт сопоставления: {name}\n\n_{meta}_"
+                if args.sheet:
+                    header += f"\n_Лист: {args.sheet}_"
+                path.write_text(f"{header}\n\n{report}\n", encoding="utf-8")
+                print(f"\n[отчёт сохранён: {path}]")
     finally:
         onec.close()
 
