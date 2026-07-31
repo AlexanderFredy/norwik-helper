@@ -18,14 +18,28 @@ from pathlib import Path
 import anthropic
 
 from src.config import load_config
-from src.email_tool.attachments import excel_sheet_names
+from src.email_tool.attachments import excel_sheet_names, extract_text
 from src.email_tool.classifier import MailKind, classify
 from src.email_tool.client import MailClient
 from src.onec.client import NomItem, OnecClient
 from src.price_tool.parser import parse_price_table, render_preview
 
 MODEL = "claude-opus-4-8"
-_PRICE_EXTS = (".xlsx", ".xls", ".csv")
+_PRICE_EXTS = (".xlsx", ".xls", ".csv", ".pdf")
+
+
+def price_to_text(content: bytes, filename: str, max_chars: int = 40000) -> str:
+    """Текст прайса для агента: таблицы через parse_price_table, иначе (pdf/docx) extract_text."""
+    sheets = parse_price_table(content, filename)
+    if sheets:
+        text = "\n\n".join(render_preview(s) for s in sheets)
+    else:
+        text = extract_text(filename, content)  # pdf/docx фолбэк
+    if not text:
+        return "(не удалось разобрать)"
+    if len(text) > max_chars:
+        text = text[:max_chars] + f"\n... (обрезано, всего {len(text)} символов)"
+    return text
 
 SYSTEM_PROMPT = """Ты — контент-менеджер интернет-магазина. Задача: разобрать прайс поставщика
 и сопоставить его позиции с номенклатурой 1С. Только чтение, ничего не записывай.
@@ -170,19 +184,18 @@ def main() -> None:
     try:
         jobs = []  # (meta, price_text)
         if args.file:
-            content = Path(args.file).read_bytes()
-            sheets = parse_price_table(content, args.file)
-            text = "\n\n".join(render_preview(s) for s in sheets) or "(не удалось разобрать)"
-            meta = f"Файл: {args.file}" + (f"; бренд-подсказка: {args.brand}" if args.brand else "")
-            jobs.append((meta, text))
+            files = sorted(Path(args.file).glob("*")) if Path(args.file).is_dir() else [Path(args.file)]
+            for f in files:
+                text = price_to_text(f.read_bytes(), f.name)
+                meta = f"Файл: {f.name}" + (f"; бренд-подсказка: {args.brand}" if args.brand else "")
+                jobs.append((meta, text))
         else:
             mail = MailClient(cfg.mail_host, cfg.mail_port, cfg.mail_user, cfg.mail_password)
             print(f"Ищу прайсы в почте за {args.days} дн...")
             emails = collect_price_emails(mail, args.days, args.max)
             print(f"Найдено прайсов: {len(emails)}")
             for full, att in emails:
-                sheets = parse_price_table(att.content, att.filename)
-                text = "\n\n".join(render_preview(s) for s in sheets) or "(не удалось разобрать)"
+                text = price_to_text(att.content, att.filename)
                 meta = (f"От: {full.sender_name} <{full.sender_email}>; тема: {full.subject}; "
                         f"вложение: {att.filename}")
                 jobs.append((meta, text))
