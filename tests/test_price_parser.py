@@ -4,7 +4,7 @@ import unittest
 
 from openpyxl import Workbook
 
-from src.onec.client import _prices_to_dict, _price
+from src.onec.client import _prices_to_dict, _price, _alt_units_to_dict
 from src.price_tool.parser import parse_price_table, non_empty_rows, render_preview
 
 
@@ -69,6 +69,12 @@ class OnecPriceNormalizationTest(unittest.TestCase):
     def test_missing_price_is_none(self):
         self.assertIsNone(_price({}))
         self.assertIsNone(_price(None))
+
+    def test_alt_units_array_to_dict(self):
+        d = _alt_units_to_dict([{"упак": 2.367}])
+        self.assertEqual(d, {"упак": 2.367})
+        self.assertEqual(_alt_units_to_dict([]), {})
+        self.assertEqual(_alt_units_to_dict([{"упак": "нечисло"}]), {})  # мусор пропущен
 
 
 if __name__ == "__main__":
