@@ -33,6 +33,7 @@ class NomItem:
     product_type: str
     collection: str
     parent: str
+    alt_units: dict          # {ЕИ: коэффициент к базовой}, напр. {"упак": 2.367}
     purchase: Price | None
     rrc: Price | None
 
@@ -65,6 +66,18 @@ def _prices_to_dict(prices: list) -> dict:
     for e in prices or []:
         for k, v in e.items():
             out[k] = v
+    return out
+
+
+def _alt_units_to_dict(alt_units: list) -> dict:
+    """alt_units — массив синглтонов [{"упак": 2.367}] → {"упак": 2.367} (float)."""
+    out: dict = {}
+    for e in alt_units or []:
+        for k, v in e.items():
+            try:
+                out[k] = float(v)
+            except (TypeError, ValueError):
+                continue
     return out
 
 
@@ -108,6 +121,7 @@ class OnecClient:
                     product_type=it.get("product_type", ""),
                     collection=it.get("collection", ""),
                     parent=it.get("parent", ""),
+                    alt_units=_alt_units_to_dict(it.get("alt_units", [])),
                     purchase=_price(p.get("purchase")),
                     rrc=_price(p.get("rrc")),
                 )
