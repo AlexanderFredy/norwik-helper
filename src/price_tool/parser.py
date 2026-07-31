@@ -75,11 +75,70 @@ def image_anchor_rows(content: bytes) -> dict[str, list[int]]:
     return out
 
 
-def mark_images(sheets: list[Sheet], content: bytes, filename: str) -> list[Sheet]:
-    """Вставляет строки-маркеры IMAGE_MARKER на позиции встроенных картинок (только xlsx)."""
-    if not filename.lower().endswith(".xlsx"):
-        return sheets
-    anchors = image_anchor_rows(content)
+def _media_type(data: bytes) -> str:
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
+
+def _image_bytes(im) -> bytes | None:
+    try:
+        data = im._data()  # openpyxl >= 3
+        if data:
+            return data
+    except Exception:
+        pass
+    ref = getattr(im, "ref", None)
+    try:
+        if hasattr(ref, "getvalue"):
+            return ref.getvalue()
+        if isinstance(ref, (str, bytes)):
+            with open(ref, "rb") as f:
+                return f.read()
+    except Exception:
+        pass
+    return None
+
+
+def extract_images(content: bytes) -> dict[str, list[tuple[int, bytes, str]]]:
+    """Встроенные изображения по листам: {лист: [(строка_1based, байты, media_type)]}.
+
+    Для проверки, что «баннер» — действительно название бренда (агент смотрит на картинку).
+    """
+    from openpyxl import load_workbook
+
+    out: dict[str, list[tuple[int, bytes, str]]] = {}
+    try:
+        wb = load_workbook(io.BytesIO(content))
+    except Exception:
+        return out
+    try:
+        for ws in wb.worksheets:
+            found = []
+            for im in getattr(ws, "_images", []):
+                try:
+                    row = im.anchor._from.row + 1
+                except Exception:
+                    row = 1
+                data = _image_bytes(im)
+                if data:
+                    found.append((row, data, _media_type(data)))
+            if found:
+                out[ws.title] = sorted(found, key=lambda t: t[0])
+    finally:
+        wb.close()
+    return out
+
+
+def mark_images(sheets: list[Sheet], anchors: dict[str, list[int]],
+                label: str = IMAGE_MARKER) -> list[Sheet]:
+    """Вставляет строки-маркеры на позиции картинок. anchors: {лист: [строки_1based]}."""
     by_name = {s.name: s for s in sheets}
     for name, rows in anchors.items():
         s = by_name.get(name)
@@ -87,7 +146,7 @@ def mark_images(sheets: list[Sheet], content: bytes, filename: str) -> list[Shee
             continue
         for r in sorted(rows, reverse=True):   # с конца, чтобы индексы не сдвигались
             idx = min(max(r - 1, 0), len(s.rows))
-            s.rows.insert(idx, [IMAGE_MARKER])
+            s.rows.insert(idx, [label])
     return sheets
 
 

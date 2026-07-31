@@ -10,6 +10,7 @@ Read-only: читает почту (IMAP peek), тянет 1С (selling-tm / by-
 Нужны в .env: MAIL_*, ANTHROPIC_API_KEY, ONEC_BASE_URL, ONEC_TOKEN.
 """
 import argparse
+import base64
 import json
 import sys
 from datetime import date, timedelta
@@ -22,33 +23,46 @@ from src.email_tool.attachments import excel_sheet_names, extract_text
 from src.email_tool.classifier import MailKind, classify
 from src.email_tool.client import MailClient
 from src.onec.client import NomItem, OnecClient
-from src.price_tool.parser import mark_images, parse_price_table, render_preview
+from src.price_tool.parser import extract_images, parse_price_table, render_preview
 
 MODEL = "claude-opus-4-8"
 _PRICE_EXTS = (".xlsx", ".xls", ".csv", ".pdf")
+_MAX_IMAGES = 8
+_MAX_IMG_BYTES = 4_000_000
 
 
 def price_to_text(content: bytes, filename: str, sheet: str | None = None,
-                  max_chars: int = 40000) -> str:
-    """Текст прайса для агента: таблицы через parse_price_table, иначе (pdf/docx) extract_text.
+                  max_chars: int = 40000) -> tuple[str, list[dict]]:
+    """Текст прайса + встроенные изображения (для проверки баннеров-брендов).
 
-    sheet — подстрока имени листа (без регистра); если задана и совпадает — берём только
-    эти листы, иначе все (фолбэк).
+    sheet — подстрока имени листа (фолбэк на все). Возвращает (текст, images), где images —
+    [{n, row, sheet, bytes, media_type}]; в текст на позиции картинки вставлен маркер #n.
     """
     sheets = parse_price_table(content, filename)
+    images: list[dict] = []
     if sheets:
-        mark_images(sheets, content, filename)  # баннеры брендов вставлены картинкой
         if sheet:
             picked = [s for s in sheets if sheet.lower() in s.name.lower()]
             sheets = picked or sheets
+        by_sheet = extract_images(content) if filename.lower().endswith(".xlsx") else {}
+        by_name = {s.name: s for s in sheets}
+        for name in [s.name for s in sheets]:
+            for (row, data, mtype) in by_sheet.get(name, []):
+                images.append({"n": len(images) + 1, "row": row, "sheet": name,
+                               "bytes": data, "media_type": mtype})
+        # вставляем нумерованные маркеры (с конца — чтобы индексы не сдвигались)
+        for img in sorted(images, key=lambda i: i["row"], reverse=True):
+            s = by_name[img["sheet"]]
+            idx = min(max(img["row"] - 1, 0), len(s.rows))
+            s.rows.insert(idx, [f"⟨ИЗОБРАЖЕНИЕ #{img['n']} — см. приложенное изображение⟩"])
         text = "\n\n".join(render_preview(s) for s in sheets)
     else:
         text = extract_text(filename, content)  # pdf/docx фолбэк
     if not text:
-        return "(не удалось разобрать)"
+        text = "(не удалось разобрать)"
     if len(text) > max_chars:
         text = text[:max_chars] + f"\n... (обрезано, всего {len(text)} символов)"
-    return text
+    return text, images
 
 SYSTEM_PROMPT = """Ты — контент-менеджер интернет-магазина. Задача: разобрать прайс поставщика
 и сопоставить его позиции с номенклатурой 1С. Только чтение, ничего не записывай.
@@ -56,10 +70,12 @@ SYSTEM_PROMPT = """Ты — контент-менеджер интернет-м�
 Шаги:
 1. Определи ВСЕ бренды в прайсе (прайс бывает мультибрендовым) и тип товара (product_type).
    Бренды бывают: в колонке «Бренд»; в строках-заголовках разделов; в шапке/примечаниях.
-   ВАЖНО: разделителем бренда может быть БАННЕР-КАРТИНКА — она видна как строка-маркер
-   «⟨ИЗОБРАЖЕНИЕ/БАННЕР…⟩». После такого маркера часто начинается ДРУГОЙ бренд: соотнеси
-   последующие коллекции с другим брендом, упомянутым в прайсе (напр. в шапке «MOST FLOOR
-   и A+ FLOOR» → после баннера идёт A+ FLOOR), а не с предыдущим.
+   ПРО КАРТИНКИ: в тексте есть маркеры «⟨ИЗОБРАЖЕНИЕ #N⟩», а сами картинки приложены к
+   сообщению. Наличие картинки САМО ПО СЕБЕ НЕ означает смену бренда — картинки бывают
+   любые (фото товара, логотип, декор). ПОСМОТРИ на приложенное изображение: считай его
+   разделителем нового бренда ТОЛЬКО если на нём явно написано НАЗВАНИЕ БРЕНДА (баннер).
+   Тогда коллекции ПОСЛЕ маркера отнеси к этому бренду. Если на картинке нет названия
+   бренда — игнорируй её как разделитель, бренд не меняется.
 2. Вызови get_selling_tm ОДИН раз. Для КАЖДОГО бренда прайса найди код (Code) по
    наименованию (NameTM бывает двуязычным «Latin / Кириллица» — сравнивай нормализованно).
    Раздели бренды на: (а) есть в 1С → обрабатываем; (б) нет в selling-tm → только упоминаем.
@@ -138,9 +154,26 @@ def _run_tool(onec: OnecClient, name: str, inp: dict) -> str:
     return f"Неизвестный инструмент: {name}"
 
 
-def match_pricelist(client, onec: OnecClient, price_text: str, meta: str) -> str:
+def _image_blocks(images: list[dict]) -> list[dict]:
+    """Image-блоки Anthropic для приложенных картинок прайса (с подписью строки)."""
+    blocks = []
+    for img in images:
+        if len(img["bytes"]) > _MAX_IMG_BYTES or len(blocks) >= _MAX_IMAGES * 2:
+            continue
+        blocks.append({"type": "text",
+                       "text": f"Приложенное изображение #{img['n']} (лист «{img['sheet']}», строка {img['row']}):"})
+        blocks.append({"type": "image", "source": {
+            "type": "base64", "media_type": img["media_type"],
+            "data": base64.b64encode(img["bytes"]).decode()}})
+    return blocks
+
+
+def match_pricelist(client, onec: OnecClient, price_text: str, meta: str,
+                    images: list[dict] | None = None) -> str:
     """Гоняет агента над одним прайсом, возвращает текстовый отчёт."""
-    messages = [{"role": "user", "content": f"{meta}\n\nСодержимое прайса:\n{price_text}"}]
+    content = [{"type": "text", "text": f"{meta}\n\nСодержимое прайса:\n{price_text}"}]
+    content += _image_blocks(images or [])
+    messages = [{"role": "user", "content": content}]
     for _ in range(20):
         resp = client.messages.create(
             model=MODEL, max_tokens=8000,
@@ -211,28 +244,28 @@ def main() -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        jobs = []  # (name, meta, price_text)
+        jobs = []  # (name, meta, price_text, images)
         if args.file:
             p = Path(args.file)
             files = sorted(f for f in p.glob("*") if f.is_file()) if p.is_dir() else [p]
             for f in files:
-                text = price_to_text(f.read_bytes(), f.name, sheet=args.sheet, max_chars=args.max_chars)
+                text, images = price_to_text(f.read_bytes(), f.name, sheet=args.sheet, max_chars=args.max_chars)
                 meta = f"Файл: {f.name}" + (f"; бренд-подсказка: {args.brand}" if args.brand else "")
-                jobs.append((f.stem, meta, text))
+                jobs.append((f.stem, meta, text, images))
         else:
             mail = MailClient(cfg.mail_host, cfg.mail_port, cfg.mail_user, cfg.mail_password)
             print(f"Ищу прайсы в почте за {args.days} дн...")
             emails = collect_price_emails(mail, args.days, args.max)
             print(f"Найдено прайсов: {len(emails)}")
             for full, att in emails:
-                text = price_to_text(att.content, att.filename, sheet=args.sheet, max_chars=args.max_chars)
+                text, images = price_to_text(att.content, att.filename, sheet=args.sheet, max_chars=args.max_chars)
                 meta = (f"От: {full.sender_name} <{full.sender_email}>; тема: {full.subject}; "
                         f"вложение: {att.filename}")
-                jobs.append((Path(att.filename).stem, meta, text))
+                jobs.append((Path(att.filename).stem, meta, text, images))
 
-        for i, (name, meta, text) in enumerate(jobs, 1):
-            print(f"\n{'='*70}\n[{i}/{len(jobs)}] {meta}\n{'='*70}")
-            report = match_pricelist(client, onec, text, meta)
+        for i, (name, meta, text, images) in enumerate(jobs, 1):
+            print(f"\n{'='*70}\n[{i}/{len(jobs)}] {meta} | картинок: {len(images)}\n{'='*70}")
+            report = match_pricelist(client, onec, text, meta, images)
             print(report)
             if out_dir:
                 safe = "".join(c if c.isalnum() or c in " -_." else "_" for c in name).strip()
