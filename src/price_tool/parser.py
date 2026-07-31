@@ -27,6 +27,9 @@ def _cell(v) -> str:
     return str(v).strip()
 
 
+IMAGE_MARKER = "⟨ИЗОБРАЖЕНИЕ/БАННЕР — возможен разделитель бренда или раздела⟩"
+
+
 def _from_xlsx(content: bytes) -> list[Sheet]:
     from openpyxl import load_workbook
 
@@ -41,6 +44,50 @@ def _from_xlsx(content: bytes) -> list[Sheet]:
             sheets.append(Sheet(name=ws.title, rows=rows))
     finally:
         wb.close()
+    return sheets
+
+
+def image_anchor_rows(content: bytes) -> dict[str, list[int]]:
+    """Строки-якоря встроенных изображений по листам (1-based).
+
+    Баннеры брендов часто вставляют картинкой, а не текстом — read_only их не видит,
+    поэтому грузим книгу обычным режимом. Возвращает {имя_листа: [номера строк]}.
+    """
+    from openpyxl import load_workbook
+
+    out: dict[str, list[int]] = {}
+    try:
+        wb = load_workbook(io.BytesIO(content))
+    except Exception:
+        return out
+    try:
+        for ws in wb.worksheets:
+            rows = []
+            for im in getattr(ws, "_images", []):
+                try:
+                    rows.append(im.anchor._from.row + 1)
+                except Exception:
+                    continue
+            if rows:
+                out[ws.title] = sorted(rows)
+    finally:
+        wb.close()
+    return out
+
+
+def mark_images(sheets: list[Sheet], content: bytes, filename: str) -> list[Sheet]:
+    """Вставляет строки-маркеры IMAGE_MARKER на позиции встроенных картинок (только xlsx)."""
+    if not filename.lower().endswith(".xlsx"):
+        return sheets
+    anchors = image_anchor_rows(content)
+    by_name = {s.name: s for s in sheets}
+    for name, rows in anchors.items():
+        s = by_name.get(name)
+        if not s:
+            continue
+        for r in sorted(rows, reverse=True):   # с конца, чтобы индексы не сдвигались
+            idx = min(max(r - 1, 0), len(s.rows))
+            s.rows.insert(idx, [IMAGE_MARKER])
     return sheets
 
 

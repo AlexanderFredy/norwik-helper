@@ -22,7 +22,7 @@ from src.email_tool.attachments import excel_sheet_names, extract_text
 from src.email_tool.classifier import MailKind, classify
 from src.email_tool.client import MailClient
 from src.onec.client import NomItem, OnecClient
-from src.price_tool.parser import parse_price_table, render_preview
+from src.price_tool.parser import mark_images, parse_price_table, render_preview
 
 MODEL = "claude-opus-4-8"
 _PRICE_EXTS = (".xlsx", ".xls", ".csv", ".pdf")
@@ -37,6 +37,7 @@ def price_to_text(content: bytes, filename: str, sheet: str | None = None,
     """
     sheets = parse_price_table(content, filename)
     if sheets:
+        mark_images(sheets, content, filename)  # баннеры брендов вставлены картинкой
         if sheet:
             picked = [s for s in sheets if sheet.lower() in s.name.lower()]
             sheets = picked or sheets
@@ -53,8 +54,12 @@ SYSTEM_PROMPT = """Ты — контент-менеджер интернет-м�
 и сопоставить его позиции с номенклатурой 1С. Только чтение, ничего не записывай.
 
 Шаги:
-1. Определи ВСЕ бренды в прайсе (прайс бывает мультибрендовым — обычно есть колонка
-   «Бренд»; собери уникальные значения) и тип товара (product_type).
+1. Определи ВСЕ бренды в прайсе (прайс бывает мультибрендовым) и тип товара (product_type).
+   Бренды бывают: в колонке «Бренд»; в строках-заголовках разделов; в шапке/примечаниях.
+   ВАЖНО: разделителем бренда может быть БАННЕР-КАРТИНКА — она видна как строка-маркер
+   «⟨ИЗОБРАЖЕНИЕ/БАННЕР…⟩». После такого маркера часто начинается ДРУГОЙ бренд: соотнеси
+   последующие коллекции с другим брендом, упомянутым в прайсе (напр. в шапке «MOST FLOOR
+   и A+ FLOOR» → после баннера идёт A+ FLOOR), а не с предыдущим.
 2. Вызови get_selling_tm ОДИН раз. Для КАЖДОГО бренда прайса найди код (Code) по
    наименованию (NameTM бывает двуязычным «Latin / Кириллица» — сравнивай нормализованно).
    Раздели бренды на: (а) есть в 1С → обрабатываем; (б) нет в selling-tm → только упоминаем.
