@@ -27,6 +27,8 @@ class Config:
     anthropic_api_key: str
     db_path: Path
     openai_api_key: str | None
+    onec_base_url: str | None
+    onec_token: str | None
 
 
 def load_config() -> Config:
@@ -46,4 +48,6 @@ def load_config() -> Config:
         anthropic_api_key=os.environ["ANTHROPIC_API_KEY"],
         db_path=Path(os.getenv("DB_PATH", "data/users.db")),
         openai_api_key=os.getenv("OPENAI_API_KEY") or None,
+        onec_base_url=(os.getenv("ONEC_BASE_URL") or "").rstrip("/") or None,
+        onec_token=os.getenv("ONEC_TOKEN") or None,
     )
