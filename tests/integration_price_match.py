@@ -67,6 +67,11 @@ def price_to_text(content: bytes, filename: str, sheet: str | None = None,
 SYSTEM_PROMPT = """Ты — контент-менеджер интернет-магазина. Задача: разобрать прайс поставщика
 и сопоставить его позиции с номенклатурой 1С. Только чтение, ничего не записывай.
 
+ГЛАВНЫЕ РЕЗУЛЬТАТЫ ОТЧЁТА (оба обязательны, не пропускай):
+(A) расхождения ЦЕН прайса и 1С; (B) расхождения КОЭФФИЦИЕНТОВ ЕИ (фасовки: кол-во базовой
+ЕИ в упаковке из прайса vs `alt_units` из 1С). Секцию (B) выводи ВСЕГДА для сопоставленных
+позиций — даже если всё совпадает (тогда явно «расхождений коэффициентов нет»).
+
 Шаги:
 1. Определи ВСЕ бренды в прайсе (прайс бывает мультибрендовым) и тип товара (product_type).
    Бренды бывают: в колонке «Бренд»; в строках-заголовках разделов; в шапке/примечаниях.
@@ -188,7 +193,7 @@ def match_pricelist(client, onec: OnecClient, price_text: str, meta: str,
     messages = [{"role": "user", "content": content}]
     for _ in range(20):
         resp = client.messages.create(
-            model=MODEL, max_tokens=8000,
+            model=MODEL, max_tokens=12000,
             system=SYSTEM_PROMPT, tools=TOOLS, messages=messages,
         )
         tool_uses = [b for b in resp.content if b.type == "tool_use"]
