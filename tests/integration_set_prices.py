@@ -5,9 +5,11 @@
 перезаписывается, история не растёт).
 
 Что меняем — расхождения из отчётов сопоставления (.claude/test-prices/reports):
-  · Most Flooring / Excellent  — РРЦ 2270 → 2070   (прайс «Most Floor»)
-  · Most Flooring / Brilliant  — РРЦ 1780 → 1960   (прайс «Most Floor»)
-  · Peli / Vintage             — закупка 949 → 999 (прайс «LINDERWOOD», точечно)
+  · Most Flooring / Excellent  — РРЦ 2270 → 2070   форма (а), вся коллекция
+  · Most Flooring / Brilliant  — РРЦ 1780 → 1960   форма (а), вся коллекция
+  · Peli / Vintage             — закупка 949 → 999 форма (б), точечно по 5 товарам
+
+Коды папок для формы (а) берутся из by-tm (`parent.code`) — руками задавать не нужно.
 
 Запуск:
     .venv\\Scripts\\python -m tests.integration_set_prices --dry        # показать payload
@@ -46,15 +48,22 @@ BRILLIANT = ["YO-00070616", "YO-00070618", "YO-00070620", "YO-00070621",
              "YO-00070622", "YO-00070623", "YO-00077627", "YO-00077628"]
 VINTAGE = ["YO-00068864", "YO-00068865", "YO-00068866", "YO-00068867", "YO-00068869"]
 
-# (ref, ТМ, вид цены, новое значение)
+# (ref, ТМ, вид цены, новое значение) — ожидаемый результат для сверки
 PLAN = ([(r, TM_MOST, "rrc", 2070.0) for r in EXCELLENT]
         + [(r, TM_MOST, "rrc", 1960.0) for r in BRILLIANT]
         + [(r, TM_PELI, "purchase", 999.0) for r in VINTAGE])
 
-BATCH_TITLES = [
-    ("1. Most Flooring / Excellent — РРЦ 2270 → 2070", EXCELLENT, TM_MOST, "rrc", 2070.0),
-    ("2. Most Flooring / Brilliant — РРЦ 1780 → 1960", BRILLIANT, TM_MOST, "rrc", 1960.0),
-    ("3. Peli / Vintage — закупка 949 → 999 (точечно)", VINTAGE, TM_PELI, "purchase", 999.0),
+# Две коллекции — формой (а) по collection_ref (код папки берётся из by-tm по имени),
+# точечные товары — формой (б) по ref.
+COLLECTION_BATCHES = [
+    ("1. Most Flooring / Excellent — РРЦ 2270 → 2070, вся коллекция",
+     TM_MOST, "Excellent", "rrc", 2070.0),
+    ("2. Most Flooring / Brilliant — РРЦ 1780 → 1960, вся коллекция",
+     TM_MOST, "Brilliant", "rrc", 1960.0),
+]
+ITEM_BATCHES = [
+    ("3. Peli / Vintage — закупка 949 → 999, точечно по товарам",
+     VINTAGE, TM_PELI, "purchase", 999.0),
 ]
 
 ERROR_PROBES = [
@@ -120,6 +129,15 @@ def read_all(client: OnecClient) -> dict[str, NomItem]:
     return out
 
 
+def collection_code(items: dict[str, NomItem], tm_items: list[str], name: str) -> str | None:
+    """Код папки-коллекции из by-tm (parent.code). None — сервис ещё отдаёт parent строкой."""
+    for ref in tm_items:
+        it = items.get(ref)
+        if it and it.collection == name and it.collection_ref:
+            return it.collection_ref
+    return None
+
+
 def save_snapshot(items: dict[str, NomItem]) -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
     data = {ref: {"name": it.name, "collection": it.collection,
@@ -182,7 +200,8 @@ def main() -> int:
     ap.add_argument("--probe", action="store_true", help="только пути ошибок")
     ap.add_argument("--revert", action="store_true", help="вернуть цены из снимка «до»")
     ap.add_argument("--collections", nargs="*", default=[],
-                    help="коды папок-коллекций для формы (а): Excellent Brilliant")
+                    help="переопределить коды папок для формы (а): <Excellent> <Brilliant>; "
+                         "по умолчанию берутся из by-tm (parent.code)")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -196,7 +215,11 @@ def main() -> int:
 
     try:
         if args.dry:
-            for title, refs, tm, kind, value in BATCH_TITLES:
+            for title, tm, name, kind, value in COLLECTION_BATCHES:
+                log(f"\n## {title}\n")
+                report_response({"items": [{"tm": tm, "collection_ref": f"<код папки {name}>",
+                                            "prices": {kind: value}}]})
+            for title, refs, tm, kind, value in ITEM_BATCHES:
                 log(f"\n## {title}\n")
                 report_response({"items": [{"ref": r, "tm": tm, "prices": {kind: value}}
                                            for r in refs]})
@@ -231,20 +254,26 @@ def main() -> int:
         if args.probe:
             return 0
 
-        for title, refs, tm, kind, value in BATCH_TITLES:
+        forced = list(args.collections)
+        for idx, (title, tm, name, kind, value) in enumerate(COLLECTION_BATCHES):
             log(f"\n## {title}\n")
-            payload = {"items": [{"ref": r, "tm": tm, "prices": {kind: value}} for r in refs]}
-            log(f"Позиций в запросе: {len(payload['items'])}")
+            refs = EXCELLENT if name == "Excellent" else BRILLIANT
+            folder = forced[idx] if idx < len(forced) else collection_code(before_items, refs, name)
+            if not folder:
+                log(f"⚠️ Пропуск: by-tm не отдал код папки для «{name}» "
+                    f"(parent должен быть объектом {{code, name}})")
+                continue
+            log(f"collection_ref = `{folder}`")
+            payload = {"items": [{"tm": tm, "collection_ref": folder, "prices": {kind: value}}]}
             code, data, err = post_set_prices(cfg.onec_base_url, cfg.onec_token, payload)
             log(f"HTTP {code}" + (f" — {err}" if err else ""))
             if data:
                 report_response(data)
 
-        for idx, code_folder in enumerate(args.collections):
-            value = 2070.0 if idx == 0 else 1960.0
-            log(f"\n## 4.{idx + 1} Форма (а): коллекция {code_folder} — РРЦ {value}\n")
-            payload = {"items": [{"tm": TM_MOST, "collection_ref": code_folder,
-                                  "prices": {"rrc": value}}]}
+        for title, refs, tm, kind, value in ITEM_BATCHES:
+            log(f"\n## {title}\n")
+            payload = {"items": [{"ref": r, "tm": tm, "prices": {kind: value}} for r in refs]}
+            log(f"Позиций в запросе: {len(payload['items'])}")
             code, data, err = post_set_prices(cfg.onec_base_url, cfg.onec_token, payload)
             log(f"HTTP {code}" + (f" — {err}" if err else ""))
             if data:

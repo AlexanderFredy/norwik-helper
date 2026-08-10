@@ -4,7 +4,8 @@ import unittest
 
 from openpyxl import Workbook
 
-from src.onec.client import _prices_to_dict, _price, _alt_units_to_dict
+from src.onec.client import (_prices_to_dict, _price, _alt_units_to_dict,
+                             _parent_name, _parent_code)
 from src.price_tool.parser import parse_price_table, non_empty_rows, render_preview
 
 
@@ -69,6 +70,17 @@ class OnecPriceNormalizationTest(unittest.TestCase):
     def test_missing_price_is_none(self):
         self.assertIsNone(_price({}))
         self.assertIsNone(_price(None))
+
+    def test_parent_object_gives_name_and_code(self):
+        parent = {"code": "YO-00075139", "name": "Excellent"}
+        self.assertEqual(_parent_name(parent), "Excellent")
+        self.assertEqual(_parent_code(parent), "YO-00075139")
+
+    def test_parent_legacy_string_still_parsed(self):
+        # ранняя версия сервиса отдавала parent строкой — код папки тогда неизвестен
+        self.assertEqual(_parent_name("Excellent"), "Excellent")
+        self.assertEqual(_parent_code("Excellent"), "")
+        self.assertEqual(_parent_name(None), "")
 
     def test_alt_units_array_to_dict(self):
         d = _alt_units_to_dict([{"упак": 2.367}])

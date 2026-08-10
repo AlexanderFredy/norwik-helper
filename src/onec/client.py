@@ -32,7 +32,8 @@ class NomItem:
     size: str
     product_type: str
     collection: str
-    parent: str
+    parent: str                # имя папки-родителя (≈ коллекция)
+    collection_ref: str        # Код папки-родителя — идентификатор для set-prices, форма (а)
     alt_units: dict          # {ЕИ: коэффициент к базовой}, напр. {"упак": 2.367}
     purchase: Price | None
     rrc: Price | None
@@ -67,6 +68,17 @@ def _prices_to_dict(prices: list) -> dict:
         for k, v in e.items():
             out[k] = v
     return out
+
+
+def _parent_name(parent) -> str:
+    """parent — объект {code, name}; ранняя версия сервиса отдавала просто строку."""
+    if isinstance(parent, dict):
+        return parent.get("name") or ""
+    return parent or ""
+
+
+def _parent_code(parent) -> str:
+    return parent.get("code") or "" if isinstance(parent, dict) else ""
 
 
 def _alt_units_to_dict(alt_units: list) -> dict:
@@ -120,7 +132,8 @@ class OnecClient:
                     size=it.get("size", ""),
                     product_type=it.get("product_type", ""),
                     collection=it.get("collection", ""),
-                    parent=it.get("parent", ""),
+                    parent=_parent_name(it.get("parent")),
+                    collection_ref=_parent_code(it.get("parent")),
                     alt_units=_alt_units_to_dict(it.get("alt_units", [])),
                     purchase=_price(p.get("purchase")),
                     rrc=_price(p.get("rrc")),

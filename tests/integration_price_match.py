@@ -180,7 +180,8 @@ TOOLS = [
 def _item_dict(it: NomItem) -> dict:
     return {
         "ref": it.ref, "name": it.name, "article": it.article, "size": it.size,
-        "collection": it.collection, "parent": it.parent, "product_type": it.product_type,
+        "collection": it.collection, "parent": it.parent,
+        "collection_ref": it.collection_ref, "product_type": it.product_type,
         "unit": it.unit, "alt_units": it.alt_units,
         "purchase": {"value": it.purchase.value, "date": it.purchase.date} if it.purchase else None,
         "rrc": {"value": it.rrc.value, "date": it.rrc.date} if it.rrc else None,
