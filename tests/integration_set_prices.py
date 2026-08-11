@@ -161,6 +161,49 @@ def report_response(data: dict) -> None:
     log("```")
 
 
+def _fmt(value) -> str:
+    return "нет" if value is None else f"{value:g}"
+
+
+def telegram_preview(responses: list[dict]) -> None:
+    """Сообщение админу, собранное ТОЛЬКО из ответов — без повторных запросов в 1С (§13.1)."""
+    log("\n## Сообщение админу (собрано только из ответов set-prices)\n")
+    kinds = {"purchase": "закупка", "rrc": "РРЦ"}
+    total_upd = total_unch = total_fail = 0
+    day = ""
+    lines: list[str] = []
+
+    for data in responses:
+        day = data.get("date", day)
+        total_upd += data.get("updated", 0)
+        total_unch += data.get("unchanged", 0)
+        total_fail += data.get("failed", 0)
+        for res in data.get("results", []):
+            head = f"{res.get('tm_name', '')} / {res.get('collection', '')}"
+            if "changes" in res:                       # форма (а)
+                lines.append(f"• **{head}** — {res.get('count')} поз.")
+                for ch in res["changes"]:
+                    mark = " (уже актуально)" if ch.get("skipped") else ""
+                    lines.append(
+                        f"    ↳ {kinds.get(ch['price_type'], ch['price_type'])}: "
+                        f"{_fmt(ch.get('old'))} → {_fmt(ch.get('new'))}"
+                        f" — {ch.get('count')} поз.{mark}")
+            else:                                      # форма (б)
+                for kind, det in (res.get("written") or {}).items():
+                    lines.append(
+                        f"• **{head}** · {res.get('name', '')} — "
+                        f"{kinds.get(kind, kind)}: {_fmt(det.get('old'))} → {_fmt(det.get('new'))}")
+        for err in data.get("errors", []):
+            lines.append(f"• ⚠️ {err.get('code')}: {err.get('message')}")
+
+    log("> **Цены обновлены**" + (f" {day}" if day else "")
+        + f" — {total_upd} позиций"
+        + (f", без изменений {total_unch}" if total_unch else "")
+        + (f", ошибок {total_fail}" if total_fail else ""))
+    for line in lines:
+        log("> " + line)
+
+
 def run_probes(base_url: str, token: str) -> None:
     log("\n## Пути ошибок (записей быть не должно)\n")
     log("| случай | ответ 1С |")
@@ -254,6 +297,7 @@ def main() -> int:
         if args.probe:
             return 0
 
+        responses: list[dict] = []
         forced = list(args.collections)
         for idx, (title, tm, name, kind, value) in enumerate(COLLECTION_BATCHES):
             log(f"\n## {title}\n")
@@ -269,6 +313,9 @@ def main() -> int:
             log(f"HTTP {code}" + (f" — {err}" if err else ""))
             if data:
                 report_response(data)
+                responses.append(data)
+                if "changes" not in (data.get("results") or [{}])[0]:
+                    log("⚠️ Ответ формы (а) без `changes` — в 1С старая версия обработчика")
 
         for title, refs, tm, kind, value in ITEM_BATCHES:
             log(f"\n## {title}\n")
@@ -278,7 +325,9 @@ def main() -> int:
             log(f"HTTP {code}" + (f" — {err}" if err else ""))
             if data:
                 report_response(data)
+                responses.append(data)
 
+        telegram_preview(responses)
         verify(client, before, [(r, k, v) for r, _, k, v in PLAN])
         return 0
     finally:
