@@ -15,6 +15,7 @@ from decimal import Decimal, InvalidOperation
 from src.onec.client import NomItem, OnecClient
 from src.price_tool.changes import GroupResult, build_payload, plan_collection
 from src.price_tool.parser import parse_price_table, render_preview
+from src.price_tool.signature import price_signature
 from src.storage.pricing import PricingStore
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,29 @@ PRICING_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {"sheet": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "save_price_mapping",
+        "description": (
+            "Запомнить трактовку колонок этого формата прайса, чтобы в следующий раз не "
+            "спрашивать админа заново. Вызывай СРАЗУ ПОСЛЕ того, как админ ответил на "
+            "вопрос о колонках (какая закупка, какая РРЦ, цена за м² или за упаковку). "
+            "Привязка идёт к структуре файла, а не к имени файла: следующий прайс того же "
+            "поставщика в том же формате подхватит её автоматически."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "supplier": {"type": "string", "description": "поставщик — для показа админу"},
+                "purchase_column": {"type": "string", "description": "заголовок колонки закупки, дословно"},
+                "rrc_column": {"type": "string", "description": "заголовок колонки РРЦ; опустить, если её нет"},
+                "basis": {"type": "string", "description": "base_unit (цена за базовую ЕИ) или package (за упаковку)"},
+                "sheet": {"type": "string", "description": "лист с таблицей цен, если листов несколько"},
+                "note": {"type": "string", "description": "чем именно был обусловлен выбор (слова админа)"},
+            },
+            "required": ["purchase_column"],
             "additionalProperties": False,
         },
     },
@@ -159,7 +183,9 @@ class PricingTools:
     async def execute(self, name: str, inp: dict) -> str:
         try:
             if name == "read_price_file":
-                return await asyncio.to_thread(self._read_price_file, inp)
+                return await self._read_with_mapping(inp)
+            if name == "save_price_mapping":
+                return await self._save_mapping(inp)
             if name == "get_selling_tm":
                 return await asyncio.to_thread(self._selling_tm)
             if name == "get_1c_nomenclature":
@@ -172,6 +198,52 @@ class PricingTools:
             return f"Ошибка выполнения {name}: {exc}"
 
     # ------------------------------------------------------------------ чтение
+
+    def _signature(self) -> str:
+        """Сигнатура структуры текущего прайса — ключ маппинга (§6.5.2)."""
+        if not self._file:
+            return ""
+        filename, content = self._file
+        sheets = parse_price_table(content, filename)
+        if sheets:
+            return price_signature(sheets)
+        from src.email_tool.attachments import extract_text
+        return price_signature([], extract_text(filename, content))
+
+    async def _read_with_mapping(self, inp: dict) -> str:
+        text = await asyncio.to_thread(self._read_price_file, inp)
+        signature = await asyncio.to_thread(self._signature)
+        if not signature:
+            return text
+        known = await self._store.get_mapping(signature)
+        if not known:
+            return (text + "\n\n[Формат прайса встречается впервые: трактовку колонок нужно "
+                    "определить, при неоднозначности — спросить админа и сохранить "
+                    "через save_price_mapping.]")
+        m = known["mapping"]
+        parts = [f"закупка = «{m.get('purchase_column')}»"]
+        if m.get("rrc_column"):
+            parts.append(f"РРЦ = «{m['rrc_column']}»")
+        if m.get("basis"):
+            parts.append(f"база цены: {m['basis']}")
+        if m.get("sheet"):
+            parts.append(f"лист: «{m['sheet']}»")
+        note = f" Основание: {m['note']}." if m.get("note") else ""
+        return (text + "\n\n[ЗАПОМНЕННЫЙ МАППИНГ этого формата прайса"
+                + (f" (поставщик: {known['supplier']}" if known.get("supplier") else "")
+                + f", сохранён {known['updated_at'][:10]}): "
+                + "; ".join(parts) + f".{note} "
+                "Применяй его и НЕ переспрашивай админа. Если админ явно скажет иначе — "
+                "сохрани новую трактовку через save_price_mapping.]")
+
+    async def _save_mapping(self, inp: dict) -> str:
+        signature = await asyncio.to_thread(self._signature)
+        if not signature:
+            return "Не удалось вычислить сигнатуру прайса — маппинг не сохранён."
+        mapping = {k: v for k, v in inp.items() if k != "supplier" and v}
+        await self._store.save_mapping(signature, inp.get("supplier"), mapping)
+        return ("Маппинг сохранён: следующий прайс этого формата будет разобран без "
+                "вопросов о колонках.")
 
     def _read_price_file(self, inp: dict) -> str:
         if not self._file:

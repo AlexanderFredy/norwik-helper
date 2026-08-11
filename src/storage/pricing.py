@@ -29,6 +29,13 @@ CREATE TABLE IF NOT EXISTS pending_proposal (
     status      TEXT NOT NULL DEFAULT 'pending'   -- pending | applied | rejected
 );
 CREATE INDEX IF NOT EXISTS ix_pending_user ON pending_proposal (user_id, status);
+CREATE TABLE IF NOT EXISTS price_mappings (
+    signature  TEXT PRIMARY KEY,        -- сигнатура структуры прайса (§6.5.2)
+    supplier   TEXT,                    -- как назывался поставщик — для показа админу
+    mapping    TEXT NOT NULL,           -- JSON: колонки цен, база, лист
+    updated_at TEXT NOT NULL,
+    uses       INTEGER NOT NULL DEFAULT 0
+);
 """
 
 DIALOG_TTL_MINUTES = 60
@@ -150,6 +157,39 @@ class PricingStore:
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute("UPDATE pending_proposal SET status = 'pending' "
                              "WHERE proposal_id = ? AND status = 'applying'", (proposal_id,))
+            await db.commit()
+
+    # ------------------------------------------------------- маппинг колонок (§6.5)
+
+    async def get_mapping(self, signature: str) -> dict | None:
+        """Запомненная трактовка колонок для этого формата прайса."""
+        if not signature:
+            return None
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT supplier, mapping, updated_at, uses FROM price_mappings "
+                "WHERE signature = ?", (signature,))
+            row = await cur.fetchone()
+            if row:
+                await db.execute("UPDATE price_mappings SET uses = uses + 1 "
+                                 "WHERE signature = ?", (signature,))
+                await db.commit()
+        if not row:
+            return None
+        return {"supplier": row[0], "mapping": json.loads(row[1]),
+                "updated_at": row[2], "uses": row[3]}
+
+    async def save_mapping(self, signature: str, supplier: str | None, mapping: dict) -> None:
+        """Upsert: ответ админа перекрывает прежнюю трактовку того же формата."""
+        if not signature:
+            return
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO price_mappings (signature, supplier, mapping, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(signature) DO UPDATE SET "
+                "supplier = excluded.supplier, mapping = excluded.mapping, "
+                "updated_at = excluded.updated_at",
+                (signature, supplier, json.dumps(mapping, ensure_ascii=False), _now()))
             await db.commit()
 
     async def reject(self, user_id: int, proposal_id: int) -> bool:

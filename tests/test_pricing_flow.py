@@ -99,6 +99,42 @@ class PricingFlowTest(unittest.IsolatedAsyncioTestCase):
         await self.store.release(pending.proposal_id)            # запоздалый откат
         self.assertIsNone(await self.store.get_pending(42))
 
+    def _xlsx(self, title: str) -> bytes:
+        import io as _io
+        from openpyxl import Workbook
+        wb = Workbook(); ws = wb.active; ws.title = "Прайс"
+        ws.append([title])
+        ws.append(["Артикул", "Наименование", "самовывоз", "с доставкой", "РРЦ"])
+        ws.append(["VN-511", "Ван Браун", 949, 999, 1649])
+        buf = _io.BytesIO(); wb.save(buf); return buf.getvalue()
+
+    async def test_mapping_saved_and_applied_next_time(self):
+        """Ответ админа про колонки должен переживать смену прайса того же формата."""
+        self.tools.set_file("price-july.xlsx", self._xlsx("Прайс с 20.07.2026"))
+        first = await self.tools.execute("read_price_file", {})
+        self.assertIn("встречается впервые", first)
+
+        await self.tools.execute("save_price_mapping", {
+            "supplier": "LINDERWOOD", "purchase_column": "самовывоз",
+            "rrc_column": "РРЦ", "basis": "base_unit",
+            "note": "админ сказал брать минимальные цены"})
+
+        # следующий месяц: другой файл, другие данные, тот же формат
+        later = PricingTools(self.onec, self.store, user_id=42)
+        later.set_file("price-august.xlsx", self._xlsx("Прайс с 25.08.2026"))
+        text = await later.execute("read_price_file", {})
+        self.assertIn("ЗАПОМНЕННЫЙ МАППИНГ", text)
+        self.assertIn("самовывоз", text)
+        self.assertIn("НЕ переспрашивай", text)
+
+    async def test_mapping_is_overwritten_when_admin_changes_mind(self):
+        self.tools.set_file("p.xlsx", self._xlsx("Прайс"))
+        await self.tools.execute("save_price_mapping", {"purchase_column": "самовывоз"})
+        await self.tools.execute("save_price_mapping", {"purchase_column": "с доставкой"})
+        text = await self.tools.execute("read_price_file", {})
+        self.assertIn("с доставкой", text)
+        self.assertNotIn("«самовывоз»", text)
+
     async def test_unchanged_collections_are_collapsed(self):
         """Коллекции без изменений не должны прятать собой то, что меняется."""
         self.onec._items = [item("YO-1", 949, coll="YO-A"), item("YO-2", 500, coll="YO-B")]

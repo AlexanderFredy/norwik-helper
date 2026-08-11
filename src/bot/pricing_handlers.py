@@ -25,6 +25,7 @@ MAX_FILE_BYTES = 20 * 1024 * 1024
 
 _STATUS = {
     "read_price_file": "Читаю прайс...",
+    "save_price_mapping": "Запоминаю формат прайса...",
     "get_selling_tm": "Проверяю выгрузку ТМ в 1С...",
     "get_1c_nomenclature": "Загружаю номенклатуру из 1С...",
     "propose_prices": "Считаю изменения и розницу...",
