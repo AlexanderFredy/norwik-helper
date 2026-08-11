@@ -9,7 +9,7 @@ import io
 import logging
 
 from aiogram import F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from src.agent.pricing_tools import PRICING_TOOLS, PricingTools
@@ -120,6 +120,68 @@ async def cmd_cancel(message: Message, pricing_store: PricingStore) -> None:
     _files.pop(message.from_user.id, None)
     await pricing_store.reset(message.from_user.id)
     await message.answer("Работа с прайсом прекращена, предложение отменено.")
+
+
+def _describe(entry: dict) -> str:
+    m = entry["mapping"]
+    parts = [f"закупка «{m.get('purchase_column')}»"]
+    if m.get("rrc_column"):
+        parts.append(f"РРЦ «{m['rrc_column']}»")
+    if m.get("basis") and m["basis"] != "base_unit":
+        parts.append(f"база: {m['basis']}")
+    if m.get("sheet"):
+        parts.append(f"лист «{m['sheet']}»")
+    return ", ".join(parts)
+
+
+@router.message(Command("mappings"))
+async def cmd_mappings(message: Message, pricing_store: PricingStore, is_admin: bool) -> None:
+    """Какие форматы прайсов агент уже разбирает без вопросов."""
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+    entries = await pricing_store.list_mappings()
+    if not entries:
+        await message.answer("Запомненных форматов прайсов пока нет — вопрос о колонках "
+                             "будет задан при первом прайсе.")
+        return
+    lines = ["Запомненные форматы прайсов:"]
+    for i, e in enumerate(entries, 1):
+        used = f", применён {e['uses']} раз" if e["uses"] else ", ещё не применялся"
+        lines.append(f"{i}. {e['supplier'] or 'поставщик не назван'} — {_describe(e)} "
+                     f"({e['updated_at'][:10]}{used})")
+        if e["mapping"].get("note"):
+            lines.append(f"   основание: {e['mapping']['note']}")
+    lines.append("\nЗабыть: /mapping_forget <номер> — тогда следующий прайс этого формата "
+                 "снова спросит про колонки.")
+    await _send(message, "\n".join(lines))
+
+
+@router.message(Command("mapping_forget"))
+async def cmd_mapping_forget(message: Message, command: CommandObject,
+                             pricing_store: PricingStore, is_admin: bool) -> None:
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+    arg = (command.args or "").strip()
+    if not arg:
+        await message.answer("Укажите номер из /mappings, например: /mapping_forget 1")
+        return
+
+    entries = await pricing_store.list_mappings()
+    target = None
+    if arg.isdigit() and 1 <= int(arg) <= len(entries):
+        target = entries[int(arg) - 1]
+    else:                                   # допускаем и саму сигнатуру (её видно в БД)
+        target = next((e for e in entries if e["signature"].startswith(arg.lower())), None)
+    if target is None:
+        await message.answer("Не нашёл такой записи. Посмотрите список: /mappings")
+        return
+
+    await pricing_store.forget_mapping(target["signature"])
+    await message.answer(
+        f"Забыл формат «{target['supplier'] or 'без названия'}» ({_describe(target)}).\n"
+        "Следующий прайс этого формата снова спросит, какую колонку считать закупкой.")
 
 
 @router.message(F.text, lambda m: m.from_user.id in _files)

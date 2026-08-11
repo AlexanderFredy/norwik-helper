@@ -179,6 +179,22 @@ class PricingStore:
         return {"supplier": row[0], "mapping": json.loads(row[1]),
                 "updated_at": row[2], "uses": row[3]}
 
+    async def list_mappings(self) -> list[dict]:
+        """Все запомненные форматы, свежие сверху — для команды /mappings."""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT signature, supplier, mapping, updated_at, uses FROM price_mappings "
+                "ORDER BY updated_at DESC")
+            rows = await cur.fetchall()
+        return [{"signature": r[0], "supplier": r[1], "mapping": json.loads(r[2]),
+                 "updated_at": r[3], "uses": r[4]} for r in rows]
+
+    async def forget_mapping(self, signature: str) -> bool:
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute("DELETE FROM price_mappings WHERE signature = ?", (signature,))
+            await db.commit()
+            return cur.rowcount > 0
+
     async def save_mapping(self, signature: str, supplier: str | None, mapping: dict) -> None:
         """Upsert: ответ админа перекрывает прежнюю трактовку того же формата."""
         if not signature:
