@@ -36,10 +36,17 @@ class AttachmentsTest(unittest.TestCase):
     def test_txt_extract(self) -> None:
         self.assertEqual(extract_text("note.txt", "остатки: 10 уп".encode()), "остатки: 10 уп")
 
-    def test_legacy_xls_message(self) -> None:
+    def test_broken_xls_reports_error_without_crash(self) -> None:
+        # .xls читается через xlrd (requirements.txt); битый файл должен дать
+        # человекочитаемое сообщение, а не исключение
         text = extract_text("old.xls", b"\xd0\xcf\x11\xe0")
-        self.assertIn(".xls", text)
-        self.assertIn(".xlsx", text)
+        self.assertIn("old.xls", text)
+        self.assertIn("Ошибка чтения", text)
+
+    def test_legacy_doc_suggests_modern_format(self) -> None:
+        text = extract_text("old.doc", b"\xd0\xcf\x11\xe0")
+        self.assertIn(".doc", text)
+        self.assertIn(".docx", text)
 
     def test_broken_file_no_crash(self) -> None:
         text = extract_text("broken.xlsx", b"not a real xlsx")

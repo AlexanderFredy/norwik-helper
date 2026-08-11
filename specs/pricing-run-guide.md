@@ -6,28 +6,50 @@
 
 ---
 
-## 1. Подготовка (один раз)
+## 1. Запуск
 
-**`.env` в корне проекта** (откуда запускается бот) — добавить две строки; сейчас они есть
-только в `.env` воркtree, и без них бот стартует, но 1С не увидит:
+Код режима цен живёт на ветке `worktree-spec-orders-1c`, то есть **в папке воркtree**.
+Виртуальное окружение — общее, в корне проекта, поэтому путь к `python` полный.
 
-```
-ONEC_BASE_URL=http://82.202.169.111/api_shop/hs/ai-tools
-ONEC_TOKEN=<токен>
-```
-
-Необязательно: `PRICE_MIN_CHANGE_PCT=2` — порог значимости изменения цены (умолчание 2 %).
-
-**Зависимость для старых прайсов**:
-
-```
-.venv\Scripts\pip install xlrd
+```powershell
+cd C:\Data\ClodeCodeProjects\shop-helper\.claude\worktrees\spec-orders-1c
+C:\Data\ClodeCodeProjects\shop-helper\.venv\Scripts\python.exe -m src.main
 ```
 
-Без неё `.xls` (старый формат) не читается; `.xlsx`, `.csv`, `.pdf` работают и так.
+Останов — `Ctrl+C`.
 
-**Запуск бота**: `.venv\Scripts\python -m src.main`
-В логе должно появиться `Интеграция с 1С включена: http://...`.
+В логе при старте должно быть:
+
+```
+Конфигурация загружена, ящик: ...
+Интеграция с 1С включена: http://82.202.169.111/api_shop/hs/ai-tools
+Запуск бота (polling)
+```
+
+Если вместо этого `ONEC_BASE_URL/ONEC_TOKEN не заданы` — запуск идёт не из папки воркtree
+(в корневом `.env` этих переменных нет).
+
+**Правки `.env` не нужны**: `.env` в воркtree уже содержит и токен Telegram, и `ADMIN_TELEGRAM_ID`,
+и доступ к 1С. Необязательный параметр — `PRICE_MIN_CHANGE_PCT=2` (порог значимости
+изменения цены, умолчание 2 %).
+
+**Зависимости** — все установлены, включая `xlrd` для старых `.xls`. Если окружение
+пересоздаётся:
+
+```powershell
+C:\Data\ClodeCodeProjects\shop-helper\.venv\Scripts\pip.exe install -r requirements.txt
+```
+
+**Перед прогоном полезно** прогнать тесты (должно быть `OK`, 63 теста):
+
+```powershell
+C:\Data\ClodeCodeProjects\shop-helper\.venv\Scripts\python.exe -m unittest discover tests
+```
+
+> Бот из воркtree заводит **свою** базу `data\users.db` (путь в `.env` относительный).
+> Whitelist там пуст, но админ (`ADMIN_TELEGRAM_ID`) проходит всегда — для прогона этого
+> достаточно. Когда ветку вольёшь в `master`, бот из корня подхватит основную базу, и в
+> корневой `.env` нужно будет добавить `ONEC_BASE_URL` и `ONEC_TOKEN`.
 
 ---
 
