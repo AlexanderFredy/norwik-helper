@@ -74,9 +74,42 @@ class PricingFlowTest(unittest.IsolatedAsyncioTestCase):
         taken = await self.store.take_pending(42, pending.proposal_id)
         self.assertEqual(taken.payload, pending.payload)
         self.onec.set_prices(taken.payload)
+        await self.store.mark_applied(taken.proposal_id)
         self.assertEqual(self.onec.written[0], pending.payload)
         # повторное нажатие кнопки не должно ничего записать
         self.assertIsNone(await self.store.take_pending(42, pending.proposal_id))
+
+    async def test_failed_write_returns_proposal_to_queue(self):
+        """Обрыв связи с 1С не должен стоить админу повторного разбора прайса."""
+        await self._propose()
+        pending = await self.store.get_pending(42)
+        taken = await self.store.take_pending(42, pending.proposal_id)
+        self.assertIsNone(await self.store.get_pending(42))      # взято в работу
+        await self.store.release(taken.proposal_id)              # запись упала
+        again = await self.store.get_pending(42)
+        self.assertIsNotNone(again)
+        self.assertEqual(again.proposal_id, pending.proposal_id)
+        self.assertEqual(again.payload, pending.payload)
+
+    async def test_release_does_not_resurrect_applied(self):
+        await self._propose()
+        pending = await self.store.get_pending(42)
+        await self.store.take_pending(42, pending.proposal_id)
+        await self.store.mark_applied(pending.proposal_id)
+        await self.store.release(pending.proposal_id)            # запоздалый откат
+        self.assertIsNone(await self.store.get_pending(42))
+
+    async def test_unchanged_collections_are_collapsed(self):
+        """Коллекции без изменений не должны прятать собой то, что меняется."""
+        self.onec._items = [item("YO-1", 949, coll="YO-A"), item("YO-2", 500, coll="YO-B")]
+        text = await self.tools.execute("propose_prices", {
+            "supplier": "X",
+            "groups": [
+                {"tm_code": "T", "tm_name": "TM", "collection_ref": "YO-A", "purchase": 949},
+                {"tm_code": "T", "tm_name": "TM", "collection_ref": "YO-B", "purchase": 600},
+            ]})
+        self.assertIn("без изменений (1)", text)
+        self.assertIn("закупка 500 → 600", text)
 
     async def test_new_proposal_supersedes_old(self):
         await self._propose(purchase=999)

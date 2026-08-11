@@ -252,14 +252,24 @@ class PricingTools:
         total_items = 0
         for tm_name, groups in by_tm.items():
             lines.append(f"— {tm_name}")
+            untouched: list[str] = []
             for g in groups:
                 rows = (_transitions(g, "purchase", "закупка")
                         + _transitions(g, "rrc", "РРЦ")
                         + _transitions(g, "retail", "розница"))
+                if not rows:
+                    # коллекции без изменений не перечисляем по одной: в прайсе их
+                    # обычно большинство, и они прячут собой то, что реально меняется
+                    untouched.append(g.collection)
+                    continue
                 total_items += len(g.to_write)
                 lines.append(f"  • {g.collection} — {len(g.plans)} поз.")
-                for r in rows or ["изменений нет"]:
+                for r in rows:
                     lines.append(f"      {r}")
+            if untouched:
+                shown = ", ".join(untouched[:6])
+                tail = f" и ещё {len(untouched) - 6}" if len(untouched) > 6 else ""
+                lines.append(f"  • без изменений ({len(untouched)}): {shown}{tail}")
         lines.append("?")
 
         warns = list(inp.get("warnings") or []) + problems

@@ -120,10 +120,15 @@ class PricingStore:
                         summary=row[2], item_count=row[3])
 
     async def take_pending(self, user_id: int, proposal_id: int) -> Proposal | None:
-        """Атомарно забирает предложение в работу: повторное нажатие кнопки не сработает."""
+        """Атомарно берёт предложение в работу: повторное нажатие кнопки не сработает.
+
+        Статус промежуточный (`applying`) — запись в 1С ещё не выполнена. По её итогу
+        вызывается `mark_applied` или `release` (1С периодически рвёт соединение, и терять
+        из-за этого разобранный прайс нельзя).
+        """
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "UPDATE pending_proposal SET status = 'applied' "
+                "UPDATE pending_proposal SET status = 'applying' "
                 "WHERE proposal_id = ? AND user_id = ? AND status = 'pending' "
                 "RETURNING payload, summary, item_count",
                 (proposal_id, user_id))
@@ -133,6 +138,19 @@ class PricingStore:
             return None
         return Proposal(proposal_id=proposal_id, user_id=user_id, payload=json.loads(row[0]),
                         summary=row[1], item_count=row[2])
+
+    async def mark_applied(self, proposal_id: int) -> None:
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("UPDATE pending_proposal SET status = 'applied' "
+                             "WHERE proposal_id = ?", (proposal_id,))
+            await db.commit()
+
+    async def release(self, proposal_id: int) -> None:
+        """Вернуть предложение в очередь — запись не состоялась, кнопку можно нажать снова."""
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("UPDATE pending_proposal SET status = 'pending' "
+                             "WHERE proposal_id = ? AND status = 'applying'", (proposal_id,))
+            await db.commit()
 
     async def reject(self, user_id: int, proposal_id: int) -> bool:
         async with aiosqlite.connect(self._db_path) as db:

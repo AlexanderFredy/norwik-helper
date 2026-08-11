@@ -161,10 +161,23 @@ async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: Pr
         result = await asyncio.to_thread(onec.set_prices, proposal.payload)
     except Exception as exc:                       # noqa: BLE001
         logger.exception("Ошибка записи цен в 1С")
-        await progress.edit_text(f"Ошибка записи в 1С: {exc}\nЦены не обновлены.")
+        # запись не состоялась — возвращаем предложение в очередь и кнопку админу,
+        # чтобы не гонять разбор прайса заново из-за оборванного соединения
+        await pricing_store.release(proposal.proposal_id)
+        await progress.edit_text(
+            f"Ошибка записи в 1С: {exc}\nЦены не обновлены — можно повторить.",
+            reply_markup=_keyboard(proposal.proposal_id))
         return
 
+    await pricing_store.mark_applied(proposal.proposal_id)
     await progress.edit_text(_format_result(result))
+
+    # цены записаны — выходим из режима прайса, иначе следующий обычный вопрос
+    # админа будет истолкован как ответ по прайсу
+    _files.pop(user_id, None)
+    await pricing_store.reset(user_id)
+    await callback.message.answer(
+        "Работа с прайсом завершена. Пришлите следующий файл, когда понадобится.")
 
 
 def _format_result(result: dict) -> str:
