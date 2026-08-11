@@ -37,6 +37,7 @@ class NomItem:
     collection_ref: str        # Код папки-родителя — идентификатор для set-prices, форма (а)
     alt_units: dict          # {ЕИ: коэффициент к базовой}, напр. {"упак": 2.367}
     purchase: Price | None
+    retail: Price | None       # розничная цена YO-000004 (specs/retail-price-rules.md)
     rrc: Price | None
 
 
@@ -150,6 +151,7 @@ class OnecClient:
                     collection_ref=_parent_code(it.get("parent")),
                     alt_units=_alt_units_to_dict(it.get("alt_units", [])),
                     purchase=_price(p.get("purchase")),
+                    retail=_price(p.get("retail")),
                     rrc=_price(p.get("rrc")),
                 )
             )
