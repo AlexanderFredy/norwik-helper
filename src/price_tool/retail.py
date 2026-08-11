@@ -3,6 +3,9 @@
 Чистая функция без сети: вход — закупка, РРЦ с датой, текущая розница; выход — решение
 писать/не писать с причиной. Частные правила по ТМ/категории/коллекции (§7) пока не заданы,
 применяется базовое правило §2.
+
+РРЦ на величину розницы НЕ влияет: обрезки нет. Свежая РРЦ ниже закупки или ниже
+рассчитанной розницы — повод сообщить админу, а не изменить цену (§3).
 """
 from __future__ import annotations
 
@@ -17,7 +20,7 @@ TIERS: tuple[tuple[Decimal | None, Decimal], ...] = (
     (None, Decimal("12")),              # > 2000 → 12%
 )
 
-RRC_MAX_AGE_DAYS = 30      # §3, п.2
+RRC_MAX_AGE_DAYS = 30      # §3: РРЦ старше — не рассматриваем даже как сигнал
 MIN_CHANGE_PCT = Decimal("2")   # §6
 
 
@@ -26,8 +29,7 @@ class RetailDecision:
     value: Decimal | None      # None — розница не формируется
     write: bool                # писать ли в 1С
     reason: str                # машинный код причины
-    capped: bool = False       # обрезана по РРЦ (§3)
-    warning: str | None = None # предупреждение админу (§10)
+    warning: str | None = None # сигнал по РРЦ админу (§3, §10)
 
 
 def markup_pct(purchase: Decimal) -> Decimal:
@@ -59,10 +61,11 @@ def compute_retail(
     if purchase is None or purchase <= 0:
         return RetailDecision(None, False, "no_purchase")
 
-    value = purchase * (Decimal("1") + markup_pct(purchase) / Decimal("100"))
-    capped = False
-    warning = None
+    # §2 + §5. РРЦ на величину розницы НЕ влияет — обрезки нет (§3).
+    value = _round_ruble(purchase * (Decimal("1") + markup_pct(purchase) / Decimal("100")))
 
+    # §3. Свежая РРЦ ниже закупки или ниже розницы — сигнал админу, не корректировка.
+    warning = None
     fresh_rrc = (
         rrc is not None
         and rrc > 0
@@ -70,23 +73,17 @@ def compute_retail(
         and today is not None
         and rrc_date >= today - timedelta(days=RRC_MAX_AGE_DAYS)
     )
-
     if fresh_rrc:
-        if rrc <= purchase:                      # §4: обрезка дала бы продажу в убыток
+        if rrc <= purchase:
             warning = "rrc_below_purchase"
-        elif value > rrc:                        # §3
-            value = rrc
-            capped = True
-
-    value = _round_ruble(value)
-    if capped and rrc is not None and value > rrc:
-        value = rrc                              # §5: округление не должно превысить РРЦ
+        elif rrc < value:
+            warning = "rrc_below_retail"
 
     if current_retail is None or current_retail <= 0:
-        return RetailDecision(value, True, "first_time", capped, warning)
+        return RetailDecision(value, True, "first_time", warning)
 
     change_pct = abs(value - current_retail) / current_retail * Decimal("100")
     if change_pct < MIN_CHANGE_PCT:              # §6
-        return RetailDecision(value, False, "below_threshold", capped, warning)
+        return RetailDecision(value, False, "below_threshold", warning)
 
-    return RetailDecision(value, True, "changed", capped, warning)
+    return RetailDecision(value, True, "changed", warning)

@@ -23,24 +23,30 @@ class RetailComputeTest(unittest.TestCase):
         self.assertEqual(d.value, D("1199"))                  # 1198.80 → 1199
         self.assertTrue(d.write)
 
-    def test_capped_by_fresh_rrc(self):
+    def test_rrc_never_caps_retail(self):
         d = compute_retail(D("1500"), rrc=D("1600"), rrc_date=date(2026, 8, 1), today=TODAY)
-        self.assertEqual(d.value, D("1600"))                  # 1725 → обрезано
-        self.assertTrue(d.capped)
+        self.assertEqual(d.value, D("1725"))                  # 1500 × 1.15, РРЦ не режет
+        self.assertEqual(d.warning, "rrc_below_retail")       # но админу сообщаем
 
-    def test_no_cap_when_rrc_stale(self):
+    def test_stale_rrc_below_retail_is_not_reported(self):
         d = compute_retail(D("1200"), rrc=D("1220.99"), rrc_date=date(2019, 5, 1), today=TODAY)
         self.assertEqual(d.value, D("1380"))
-        self.assertFalse(d.capped)
+        self.assertIsNone(d.warning)                          # устаревшую РРЦ не рассматриваем
 
-    def test_no_cap_when_rrc_missing(self):
-        self.assertEqual(compute_retail(D("1000"), today=TODAY).value, D("1150"))
+    def test_no_rrc_no_warning(self):
+        d = compute_retail(D("1000"), today=TODAY)
+        self.assertEqual(d.value, D("1150"))
+        self.assertIsNone(d.warning)
 
-    def test_rrc_below_purchase_warns_and_keeps_calculated(self):
+    def test_fresh_rrc_above_retail_is_silent(self):
+        d = compute_retail(D("999"), rrc=D("1649"), rrc_date=date(2026, 7, 20), today=TODAY)
+        self.assertEqual(d.value, D("1199"))
+        self.assertIsNone(d.warning)                          # обычный случай
+
+    def test_rrc_below_purchase_warns(self):
         d = compute_retail(D("1200"), rrc=D("1150"), rrc_date=date(2026, 8, 1), today=TODAY)
-        self.assertEqual(d.value, D("1380"))                  # не обрезаем — §4
-        self.assertFalse(d.capped)
-        self.assertEqual(d.warning, "rrc_below_purchase")
+        self.assertEqual(d.value, D("1380"))
+        self.assertEqual(d.warning, "rrc_below_purchase")     # приоритетнее rrc_below_retail
 
     def test_threshold_blocks_small_change(self):
         d = compute_retail(D("912.50"), current_retail=D("1080"), today=TODAY)
