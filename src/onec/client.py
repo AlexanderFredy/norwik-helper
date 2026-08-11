@@ -5,6 +5,7 @@
 Синхронный клиент; при использовании из async — вызывать через asyncio.to_thread.
 """
 import json
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -96,7 +97,9 @@ def _alt_units_to_dict(alt_units: list) -> dict:
 class OnecClient:
     """Синхронный клиент 1С. base_url — до /api_shop/hs/ai-tools (без хвостового /)."""
 
-    def __init__(self, base_url: str, token: str, timeout: float = 30.0) -> None:
+    def __init__(self, base_url: str, token: str, timeout: float = 30.0,
+                 retries: int = 5) -> None:
+        self._retries = max(1, retries)
         self._client = httpx.Client(
             base_url=base_url.rstrip("/"),
             headers={"X-API-Token": token},
@@ -106,14 +109,25 @@ class OnecClient:
     def close(self) -> None:
         self._client.close()
 
+    def _get(self, path: str, params: dict | None = None) -> httpx.Response:
+        """GET с повторами: сервис 1С периодически не принимает соединение (WinError 10060)."""
+        last: Exception | None = None
+        for attempt in range(self._retries):
+            try:
+                return self._client.get(path, params=params)
+            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
+                last = exc
+                time.sleep(2 * (attempt + 1))
+        raise last  # type: ignore[misc]
+
     def selling_tm(self) -> list[TradeMark]:
-        r = self._client.get("/get-products/selling-tm")
+        r = self._get("/get-products/selling-tm")
         r.raise_for_status()
         data = _loads_bom(r.content)
         return [TradeMark(name=x.get("NameTM", ""), code=str(x.get("Code", ""))) for x in data]
 
     def by_tm(self, tm_code: str, page: int = 1, size: int = 200) -> NomenclaturePage:
-        r = self._client.get(
+        r = self._get(
             "/get-products/by-tm",
             params={"tm": tm_code, "page": page, "size": size},
         )

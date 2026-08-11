@@ -193,6 +193,11 @@ def telegram_preview(responses: list[dict]) -> None:
                     lines.append(
                         f"• **{head}** · {res.get('name', '')} — "
                         f"{kinds.get(kind, kind)}: {_fmt(det.get('old'))} → {_fmt(det.get('new'))}")
+                # позиции, где цена уже актуальна, тоже должны быть видны админу
+                for kind, det in (res.get("skipped") or {}).items():
+                    lines.append(
+                        f"• **{head}** · {res.get('name', '')} — "
+                        f"{kinds.get(kind, kind)}: {_fmt(det.get('value'))} (уже актуально)")
         for err in data.get("errors", []):
             lines.append(f"• ⚠️ {err.get('code')}: {err.get('message')}")
 
