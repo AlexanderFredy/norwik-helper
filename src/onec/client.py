@@ -163,6 +163,21 @@ class OnecClient:
             items=items,
         )
 
+    def set_prices(self, items: list[dict]) -> dict:
+        """ЕДИНСТВЕННАЯ операция записи (§10). Возвращает разобранный ответ 1С.
+
+        Вызывается только после явного подтверждения админа — гейт реализован в боте
+        (кнопка), модели этот метод недоступен.
+        """
+        body = json.dumps({"items": items}, ensure_ascii=False).encode("utf-8")
+        r = self._client.post("/get-products/set-prices", content=body,
+                              headers={"Content-Type": "application/json"}, timeout=300)
+        text = r.content.decode("utf-8-sig", errors="replace")
+        if "<!DOCTYPE" in text:
+            raise RuntimeError(f"1С вернул HTML вместо JSON (HTTP {r.status_code})")
+        r.raise_for_status()
+        return json.loads(text)
+
     def by_tm_all(self, tm_code: str, size: int = 200, max_pages: int = 20) -> list[NomItem]:
         """Все страницы номенклатуры ТМ (для теста сопоставления)."""
         first = self.by_tm(tm_code, page=1, size=size)

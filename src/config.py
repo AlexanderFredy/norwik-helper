@@ -29,6 +29,7 @@ class Config:
     openai_api_key: str | None
     onec_base_url: str | None
     onec_token: str | None
+    price_min_change_pct: float
 
 
 def load_config() -> Config:
@@ -50,4 +51,6 @@ def load_config() -> Config:
         openai_api_key=os.getenv("OPENAI_API_KEY") or None,
         onec_base_url=(os.getenv("ONEC_BASE_URL") or "").rstrip("/") or None,
         onec_token=os.getenv("ONEC_TOKEN") or None,
+        # порог значимости изменения цены, % (§9.1 спеки): меньше — не пишем
+        price_min_change_pct=float(os.getenv("PRICE_MIN_CHANGE_PCT") or 2.0),
     )
