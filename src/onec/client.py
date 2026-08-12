@@ -6,7 +6,7 @@
 """
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -48,6 +48,21 @@ class NomenclaturePage:
     page: int
     size: int
     items: list[NomItem]
+    errors: list[dict] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class Nomenclature:
+    """Вся номенклатура ТМ: страницы склеены, ошибки позиций собраны.
+
+    `errors` — позиции, которые 1С отдать не смогла (§ by-tm.bsl: сбой на одном товаре
+    больше не роняет запрос). Их нельзя молча терять: сопоставление с прайсом окажется
+    неполным, и админ должен об этом узнать.
+    """
+    tm: str
+    total: int
+    items: list[NomItem]
+    errors: list[dict] = field(default_factory=list)
 
 
 def _loads_bom(content: bytes):
@@ -161,6 +176,7 @@ class OnecClient:
             page=int(data.get("offset", page)),
             size=int(data.get("limit", size)),
             items=items,
+            errors=[e for e in (data.get("errors") or []) if isinstance(e, dict)],
         )
 
     def set_prices(self, items: list[dict]) -> dict:
@@ -178,11 +194,15 @@ class OnecClient:
         r.raise_for_status()
         return json.loads(text)
 
-    def by_tm_all(self, tm_code: str, size: int = 200, max_pages: int = 20) -> list[NomItem]:
-        """Все страницы номенклатуры ТМ (для теста сопоставления)."""
+    def by_tm_all(self, tm_code: str, size: int = 200, max_pages: int = 20) -> Nomenclature:
+        """Все страницы номенклатуры ТМ вместе с ошибками отдельных позиций."""
         first = self.by_tm(tm_code, page=1, size=size)
         items = list(first.items)
+        errors = list(first.errors)
         pages = (first.total + size - 1) // size if size else 1
         for page in range(2, min(pages, max_pages) + 1):
-            items.extend(self.by_tm(tm_code, page=page, size=size).items)
-        return items
+            chunk = self.by_tm(tm_code, page=page, size=size)
+            items.extend(chunk.items)
+            errors.extend(chunk.errors)
+        return Nomenclature(tm=first.tm or tm_code, total=first.total, items=items,
+                            errors=errors)

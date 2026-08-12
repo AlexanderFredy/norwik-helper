@@ -260,7 +260,16 @@ class ToolExecutor:
             names = ", ".join(t.name for t in tms) or "список пуст"
             return f"ТМ «{inp.get('tm')}» нет в выгрузке на сайт. Есть: {names}"
 
-        items = await asyncio.to_thread(self._onec.by_tm_all, tm.code)
+        nom = await asyncio.to_thread(self._onec.by_tm_all, tm.code)
+        items = nom.items
+
+        def finish(text: str) -> str:
+            """1С могла не отдать часть позиций — тогда ответ неполный, и это надо сказать."""
+            if not nom.errors:
+                return text
+            return (f"{text}\n\n(1С не отдала {len(nom.errors)} поз. по этой марке — "
+                    "по ним ответить не могу.)")
+
         if not items:
             return f"У ТМ {tm.name} нет товаров в выгрузке."
 
@@ -269,24 +278,24 @@ class ToolExecutor:
             items = [i for i in items
                      if collection.lower() in (i.collection or i.parent or "").lower()]
             if not items:
-                return f"Коллекция «{collection}» у ТМ {tm.name} не найдена."
+                return finish(f"Коллекция «{collection}» у ТМ {tm.name} не найдена.")
 
         sources = await self._sources(items)
         product = (inp.get("product") or "").strip()
         if product:
             found = _match_products(items, product)
             if not found:
-                return f"Товар «{product}» не найден у ТМ {tm.name}."
+                return finish(f"Товар «{product}» не найден у ТМ {tm.name}.")
             if len(found) == 1:
-                return describe_product(found[0], sources)
+                return finish(describe_product(found[0], sources))
             if len(found) <= 5:
-                return "Подходит несколько товаров:\n" + "\n".join(
-                    describe_product(i, sources) for i in found)
-            return describe_group(f"«{product}» у {tm.name}", found, sources)
+                return finish("Подходит несколько товаров:\n" + "\n".join(
+                    describe_product(i, sources) for i in found))
+            return finish(describe_group(f"«{product}» у {tm.name}", found, sources))
 
         if collection:
             title = items[0].collection or items[0].parent or collection
-            return describe_group(f"{tm.name} {title}", items, sources)
+            return finish(describe_group(f"{tm.name} {title}", items, sources))
 
         # запрос по ТМ целиком — разбираем по коллекциям в той же логике (п.6 ТЗ)
         groups: dict[str, list] = {}
@@ -299,7 +308,7 @@ class ToolExecutor:
             lines.append("• " + describe_group(title, group, sources))
         if len(ordered) > 40:
             lines.append(f"... и ещё {len(ordered) - 40} коллекций — уточни, какая нужна.")
-        return "\n".join(lines)
+        return finish("\n".join(lines))
 
     async def _search_norwik(self, inp: dict) -> str:
         results = await asyncio.to_thread(self._norwik.search, inp["query"])

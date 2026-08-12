@@ -15,7 +15,7 @@ import time
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
-from src.onec.client import NomItem, OnecClient
+from src.onec.client import NomItem, Nomenclature, OnecClient
 from src.price_tool.changes import GroupResult, build_payload, plan_collection
 from src.price_tool.parser import extract_images, parse_price_table, render_preview
 from src.price_tool.signature import price_signature
@@ -378,23 +378,33 @@ class PricingTools:
         tms = self._onec.selling_tm()
         return json.dumps([{"name": t.name, "code": t.code} for t in tms], ensure_ascii=False)
 
-    def _items(self, tm_code: str) -> list[NomItem]:
+    def _nom(self, tm_code: str) -> Nomenclature:
         hit = _NOM_CACHE.get(tm_code)
         if hit and time.monotonic() - hit[0] < NOM_CACHE_TTL:
             return hit[1]
         started = time.monotonic()
-        items = self._onec.by_tm_all(tm_code)
-        logger.info("Номенклатура ТМ %s: %d поз. за %.1f c", tm_code, len(items),
-                    time.monotonic() - started)
-        _NOM_CACHE[tm_code] = (time.monotonic(), items)
-        return items
+        nom = self._onec.by_tm_all(tm_code)
+        logger.info("Номенклатура ТМ %s: %d поз. за %.1f c%s", tm_code, len(nom.items),
+                    time.monotonic() - started,
+                    f", НЕ ОТДАНО 1С: {len(nom.errors)}" if nom.errors else "")
+        _NOM_CACHE[tm_code] = (time.monotonic(), nom)
+        return nom
+
+    def _items(self, tm_code: str) -> list[NomItem]:
+        return self._nom(tm_code).items
 
     def _nomenclature(self, inp: dict) -> str:
         page, size = int(inp.get("page", 1)), int(inp.get("size", 200))
-        items = self._items(inp["tm_code"])
+        nom = self._nom(inp["tm_code"])
+        items = nom.items
         chunk = items[(page - 1) * size: page * size]
         return json.dumps({
             "tm": inp["tm_code"], "total": len(items), "page": page,
+            # позиции, которые 1С не смогла отдать: их не будет в items, и молчать
+            # об этом нельзя — сопоставление с прайсом окажется неполным
+            "not_returned_by_1c": [
+                {"ref": e.get("ref"), "code": e.get("code"), "message": e.get("message")}
+                for e in nom.errors[:20]],
             "items": [{
                 "ref": i.ref, "name": i.name, "article": i.article, "size": i.size,
                 "collection": i.collection, "collection_ref": i.collection_ref,
@@ -412,8 +422,19 @@ class PricingTools:
         results: list[GroupResult] = []
         problems: list[str] = []
 
+        seen_tm: set[str] = set()
         for g in inp.get("groups", []):
-            items = await asyncio.to_thread(self._items, g["tm_code"])
+            nom = await asyncio.to_thread(self._nom, g["tm_code"])
+            # 1С может не отдать часть позиций (см. specs/1c/by-tm.bsl): они не попадут
+            # в сопоставление, и админ должен увидеть это в предложении, а не догадываться
+            if nom.errors and g["tm_code"] not in seen_tm:
+                refs = ", ".join(str(e.get("ref")) for e in nom.errors[:5] if e.get("ref"))
+                problems.append(
+                    f"⚠️ 1С не отдала {len(nom.errors)} поз. по ТМ "
+                    f"{g.get('tm_name') or g['tm_code']} — они НЕ проверены по прайсу"
+                    + (f" ({refs}{', …' if len(nom.errors) > 5 else ''})" if refs else ""))
+            seen_tm.add(g["tm_code"])
+            items = nom.items
             sel = [i for i in items if i.collection_ref == g.get("collection_ref")]
             if not sel:
                 problems.append(f"коллекция {g.get('collection_ref')} не найдена у ТМ {g['tm_code']}")

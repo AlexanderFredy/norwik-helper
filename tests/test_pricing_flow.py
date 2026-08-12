@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from src.agent.pricing_tools import PricingTools, clear_nomenclature_cache
-from src.onec.client import NomItem, Price
+from src.onec.client import NomItem, Nomenclature, Price
 from src.storage.pricing import PricingStore
 
 
@@ -27,10 +27,12 @@ class FakeOnec:
         self._items = items
         self.written: list[list[dict]] = []
         self.reads = 0
+        self.errors: list[dict] = []      # позиции, которые 1С не отдала
 
     def by_tm_all(self, tm_code, **kw):
         self.reads += 1
-        return self._items
+        return Nomenclature(tm=tm_code, total=len(self._items), items=self._items,
+                            errors=self.errors)
 
     def set_prices(self, items):
         self.written.append(items)
@@ -180,6 +182,28 @@ class PricingFlowTest(unittest.IsolatedAsyncioTestCase):
         clear_nomenclature_cache()                                    # новый прайс
         await next_turn.execute("get_1c_nomenclature", {"tm_code": "000000298"})
         self.assertEqual(self.onec.reads, 2)
+
+    async def test_positions_1c_could_not_return_reach_the_admin(self):
+        """1С отдаёт часть позиций с ошибкой — предложение обязано это показать.
+
+        Иначе непроверенные по прайсу товары просто исчезают из сопоставления.
+        """
+        self.onec.errors = [{"ref": "YO-00032200", "code": "item_failed",
+                             "message": "Значение не является значением объектного типа"}]
+        text = await self._propose()
+        self.assertIn("1С не отдала 1 поз.", text)
+        self.assertIn("YO-00032200", text)
+        self.assertIn("НЕ проверены по прайсу", text)
+
+    async def test_nomenclature_tool_reports_missing_positions(self):
+        self.onec.errors = [{"ref": "YO-1", "code": "item_failed", "message": "сбой"}]
+        out = await self.tools.execute("get_1c_nomenclature", {"tm_code": "000000298"})
+        self.assertIn("not_returned_by_1c", out)
+        self.assertIn("YO-1", out)
+
+    async def test_clean_response_has_no_warning(self):
+        text = await self._propose()
+        self.assertNotIn("не отдала", text)
 
     async def test_dialog_history_roundtrip(self):
         await self.store.save_messages(42, [{"role": "user", "content": "привет"}])

@@ -328,7 +328,7 @@ def main() -> int:
             if not b.get("in_1c") or not b.get("tm_code"):
                 continue
             if b["tm_code"] not in nom_cache:
-                nom_cache[b["tm_code"]] = onec.by_tm_all(b["tm_code"])
+                nom_cache[b["tm_code"]] = onec.by_tm_all(b["tm_code"]).items
             items = nom_cache[b["tm_code"]]
             groups, seen = [], {}
             for g in b.get("groups", []):

@@ -124,7 +124,7 @@ def price(item: NomItem, kind: str):
 def read_all(client: OnecClient) -> dict[str, NomItem]:
     out: dict[str, NomItem] = {}
     for tm in (TM_MOST, TM_PELI):
-        for it in client.by_tm_all(tm):
+        for it in client.by_tm_all(tm).items:
             out[it.ref] = it
     return out
 

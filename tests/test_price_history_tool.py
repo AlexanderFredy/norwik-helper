@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from src.agent.tools import TOOL_DEFINITIONS, ToolExecutor
-from src.onec.client import NomItem, Price, TradeMark
+from src.onec.client import NomItem, Nomenclature, Price, TradeMark
 from src.price_tool.broadcast import journal_rows
 from src.storage.pricing import PricingStore
 
@@ -17,15 +17,17 @@ def item(ref, name, coll, coll_ref, purchase=1050, date="2026-07-20", article=""
 
 
 class FakeOnec:
-    def __init__(self, items):
+    def __init__(self, items, errors=None):
         self._items = items
+        self.errors = errors or []
 
     def selling_tm(self):
         return [TradeMark(name="Classen / Классен", code="000000104"),
                 TradeMark(name="Peli", code="000000298")]
 
     def by_tm_all(self, tm_code, **kw):
-        return self._items if tm_code == "000000104" else []
+        items = self._items if tm_code == "000000104" else []
+        return Nomenclature(tm=tm_code, total=len(items), items=items, errors=self.errors)
 
 
 ITEMS = ([item(f"YO-a{i}", f"Classen Adventure Дуб {i}", "Adventure", "YO-A") for i in range(5)]
@@ -97,6 +99,14 @@ class PriceHistoryToolTest(unittest.IsolatedAsyncioTestCase):
     async def test_manual_edit_admitted(self):
         text = await self._ask(tm="Classen", product="62593")
         self.assertIn("вручную", text)
+
+    async def test_incomplete_answer_is_flagged(self):
+        """Если 1С часть позиций не отдала, менеджеру нельзя отвечать как за полные данные."""
+        self.tools = ToolExecutor(
+            mail=None, norwik=None, pricing_store=self.store,
+            onec=FakeOnec(ITEMS, errors=[{"ref": "YO-z", "code": "item_failed"}]))
+        text = await self._ask(tm="Classen", product="62593")
+        self.assertIn("1С не отдала 1 поз.", text)
 
     async def test_without_1c_says_so(self):
         tools = ToolExecutor(mail=None, norwik=None)
