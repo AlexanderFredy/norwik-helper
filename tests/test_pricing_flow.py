@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.agent.pricing_tools import PricingTools
+from src.agent.pricing_tools import PricingTools, clear_nomenclature_cache
 from src.onec.client import NomItem, Price
 from src.storage.pricing import PricingStore
 
@@ -26,8 +26,10 @@ class FakeOnec:
     def __init__(self, items):
         self._items = items
         self.written: list[list[dict]] = []
+        self.reads = 0
 
     def by_tm_all(self, tm_code, **kw):
+        self.reads += 1
         return self._items
 
     def set_prices(self, items):
@@ -37,6 +39,7 @@ class FakeOnec:
 
 class PricingFlowTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        clear_nomenclature_cache()      # кэш номенклатуры общий на процесс
         self._dir = tempfile.TemporaryDirectory()
         self.store = PricingStore(Path(self._dir.name) / "t.db")
         await self.store.init()
@@ -160,6 +163,23 @@ class PricingFlowTest(unittest.IsolatedAsyncioTestCase):
         pending = await self.store.get_pending(42)
         self.assertTrue(await self.store.reject(42, pending.proposal_id))
         self.assertIsNone(await self.store.get_pending(42))
+
+    async def test_nomenclature_survives_between_turns(self):
+        """Каждый ответ админа создаёт новый PricingTools — 1С не должна перекачиваться.
+
+        Из-за этого мультибрендовый прайс «зависал»: ответ «плинтус не трогай» заново
+        тянул номенклатуру всех ТМ прайса.
+        """
+        await self._propose()
+        self.assertEqual(self.onec.reads, 1)
+
+        next_turn = PricingTools(self.onec, self.store, user_id=42)   # следующий ход
+        await next_turn.execute("get_1c_nomenclature", {"tm_code": "000000298"})
+        self.assertEqual(self.onec.reads, 1)                          # взято из кэша
+
+        clear_nomenclature_cache()                                    # новый прайс
+        await next_turn.execute("get_1c_nomenclature", {"tm_code": "000000298"})
+        self.assertEqual(self.onec.reads, 2)
 
     async def test_dialog_history_roundtrip(self):
         await self.store.save_messages(42, [{"role": "user", "content": "привет"}])

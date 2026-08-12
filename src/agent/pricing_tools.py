@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
+import time
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
@@ -23,9 +25,21 @@ logger = logging.getLogger(__name__)
 
 # Картинки едут в истории диалога (SQLite + каждый следующий запрос к модели), поэтому
 # лимиты жёсткие: логотипы весят десятки килобайт, всё крупное — это фото товаров.
+MAX_TEXT_CHARS = 40000
 MAX_IMAGES = 6
 MAX_IMAGE_BYTES = 1_500_000
 MAX_IMAGE_TOTAL_BYTES = 4_000_000
+
+# Номенклатура ТМ живёт дольше одного хода диалога: PricingTools создаётся заново на
+# каждое сообщение админа, и без общего кэша каждый его ответ («плинтус не трогай»)
+# заново выкачивал бы из 1С все ТМ прайса — минуты молчания на мультибрендовом прайсе.
+# Кэш сбрасывается при новом прайсе и после записи цен (см. clear_nomenclature_cache).
+NOM_CACHE_TTL = 1800
+_NOM_CACHE: dict[str, tuple[float, list]] = {}
+
+
+def clear_nomenclature_cache() -> None:
+    _NOM_CACHE.clear()
 
 PRICING_TOOLS = [
     {
@@ -180,7 +194,6 @@ class PricingTools:
         self._store = store
         self._user_id = user_id
         self._file: tuple[str, bytes] | None = None      # (имя, содержимое) текущего прайса
-        self._nom: dict[str, list[NomItem]] = {}         # кэш номенклатуры по коду ТМ
         self._images: list[dict] = []                    # баннеры из прайса — для модели
         self.last_summary: str | None = None
 
@@ -276,8 +289,11 @@ class PricingTools:
         # и раздел другой ТМ выглядит продолжением предыдущей. Ставим маркер и прикладываем
         # само изображение — прочитать логотип может только модель.
         self._images = self._collect_images(content, filename, sheets)
-        text = "\n\n".join(render_preview(s) for s in sheets)
-        return text[:40000]
+        text = "\n\n".join(render_preview(s) for s in sheets)[:MAX_TEXT_CHARS]
+        # текст обрезается по лимиту, и маркер картинки может в него не попасть —
+        # тогда изображение приложить не к чему: модель получит его без объяснения
+        self._images = [i for i in self._images if f"ИЗОБРАЖЕНИЕ #{i['n']}" in text]
+        return text
 
     def _collect_images(self, content: bytes, filename: str, sheets: list) -> list[dict]:
         if not filename.lower().endswith(".xlsx"):
@@ -299,25 +315,43 @@ class PricingTools:
                                   "media_type": media_type})
         found.sort(key=lambda i: (i["sheet"], i["row"]))
 
-        attached, budget = [], MAX_IMAGE_TOTAL_BYTES
+        # Один и тот же логотип часто вставлен десятками копий (в прайсе Монарха — 93
+        # копии одной картинки, 2.7 МБ). Прикладываем каждую РАЗНУЮ картинку один раз,
+        # повторы только ссылаются на неё: иначе лимит съедается копиями одной и той же.
+        seen: dict[bytes, dict] = {}
+        attached: list[dict] = []
+        budget = MAX_IMAGE_TOTAL_BYTES
         for image in found:
-            fits = (len(attached) < MAX_IMAGES and len(image["data"]) <= MAX_IMAGE_BYTES
-                    and len(image["data"]) <= budget)
-            if fits:
-                budget -= len(image["data"])
+            digest = hashlib.sha1(image["data"]).digest()
+            first = seen.get(digest)
+            if first is not None:
+                n = first.get("n")
+                image["label"] = (
+                    f"⟨ИЗОБРАЖЕНИЕ #{n} ещё раз — та же картинка, что у строки "
+                    f"{first['row']}⟩" if n else
+                    f"⟨ИЗОБРАЖЕНИЕ — повтор картинки у строки {first['row']}, "
+                    "она не приложена⟩")
+                continue
+            seen[digest] = image
+            size = len(image["data"])
+            if size > MAX_IMAGE_BYTES:
+                image["label"] = (f"⟨ИЗОБРАЖЕНИЕ у строки {image['row']} — {size // 1024} КБ, "
+                                  "слишком большое, не приложено⟩")
+            elif len(attached) >= MAX_IMAGES or size > budget:
+                image["label"] = (f"⟨ИЗОБРАЖЕНИЕ у строки {image['row']} — не приложено, "
+                                  f"исчерпан лимит в {MAX_IMAGES} картинок на прайс⟩")
+            else:
+                budget -= size
                 image["n"] = len(attached) + 1
                 attached.append(image)
                 # Строка — это ЯКОРЬ (левый верхний угол) картинки: визуально она может
                 # накрывать и соседние строки, поэтому точную границу раздела модель
                 # должна определять по содержимому, а не по позиции маркера.
-                label = (f"⟨ИЗОБРАЖЕНИЕ #{image['n']}, привязано к строке {image['row']} "
-                         f"листа «{image['sheet']}» — приложено к этому же результату. "
-                         "Картинка может перекрывать соседние строки: точную границу "
-                         "раздела определи по заголовкам коллекций и формату артикулов⟩")
-            else:
-                label = (f"⟨ИЗОБРАЖЕНИЕ у строки {image['row']} — слишком большое, "
-                         "не приложено⟩")
-            image["label"] = label
+                image["label"] = (
+                    f"⟨ИЗОБРАЖЕНИЕ #{image['n']}, привязано к строке {image['row']} "
+                    f"листа «{image['sheet']}» — приложено к этому же результату. "
+                    "Картинка может перекрывать соседние строки: точную границу "
+                    "раздела определи по заголовкам коллекций и формату артикулов⟩")
 
         # маркеры вставляем с конца, чтобы не сдвинуть ещё не обработанные строки
         for image in sorted(found, key=lambda i: i["row"], reverse=True):
@@ -345,9 +379,15 @@ class PricingTools:
         return json.dumps([{"name": t.name, "code": t.code} for t in tms], ensure_ascii=False)
 
     def _items(self, tm_code: str) -> list[NomItem]:
-        if tm_code not in self._nom:
-            self._nom[tm_code] = self._onec.by_tm_all(tm_code)
-        return self._nom[tm_code]
+        hit = _NOM_CACHE.get(tm_code)
+        if hit and time.monotonic() - hit[0] < NOM_CACHE_TTL:
+            return hit[1]
+        started = time.monotonic()
+        items = self._onec.by_tm_all(tm_code)
+        logger.info("Номенклатура ТМ %s: %d поз. за %.1f c", tm_code, len(items),
+                    time.monotonic() - started)
+        _NOM_CACHE[tm_code] = (time.monotonic(), items)
+        return items
 
     def _nomenclature(self, inp: dict) -> str:
         page, size = int(inp.get("page", 1)), int(inp.get("size", 200))

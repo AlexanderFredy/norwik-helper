@@ -13,7 +13,7 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from src.agent.pricing_tools import PRICING_TOOLS, PricingTools
+from src.agent.pricing_tools import PRICING_TOOLS, PricingTools, clear_nomenclature_cache
 from src.agent.prompts import PRICING_PROMPT
 from src.price_tool.broadcast import build_broadcast, journal_rows
 from src.storage.pricing import PricingStore
@@ -112,6 +112,7 @@ async def handle_price_document(message: Message, orchestrator, onec, pricing_st
     await message.bot.download_file(file_info.file_path, destination=buf)
     _files[message.from_user.id] = (doc.file_name, buf.getvalue())
     await pricing_store.reset(message.from_user.id)   # новый прайс — новый диалог
+    clear_nomenclature_cache()                        # и свежие цены из 1С
 
     caption = (message.caption or "").strip()
     task = f"Прислан прайс «{doc.file_name}»." + (f" Комментарий админа: {caption}" if caption else "")
@@ -298,6 +299,7 @@ async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: Pr
     # админа будет истолкован как ответ по прайсу
     _files.pop(user_id, None)
     await pricing_store.reset(user_id)
+    clear_nomenclature_cache()      # цены в 1С изменились — кэш устарел
     await callback.message.answer(
         "Работа с прайсом завершена. Пришлите следующий файл, когда понадобится.")
 
