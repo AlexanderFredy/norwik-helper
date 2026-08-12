@@ -36,6 +36,26 @@ CREATE TABLE IF NOT EXISTS price_mappings (
     updated_at TEXT NOT NULL,
     uses       INTEGER NOT NULL DEFAULT 0
 );
+-- Журнал наших записей цен: 1С хранит дату изменения, но не источник. Только отсюда
+-- известно, из какого прайса цена взялась (dev_tasks п.6).
+CREATE TABLE IF NOT EXISTS price_writes (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    written_on     TEXT NOT NULL,       -- день записи = период регистра цен 1С
+    tm_code        TEXT,
+    tm_name        TEXT,
+    collection_ref TEXT,
+    collection     TEXT,
+    item_ref       TEXT,
+    item_name      TEXT,
+    price_type     TEXT NOT NULL,
+    old_value      REAL,
+    new_value      REAL,
+    supplier       TEXT,
+    price_doc      TEXT,                -- имя файла прайса
+    price_date     TEXT                 -- дата самого прайса, не записи
+);
+CREATE INDEX IF NOT EXISTS ix_price_writes_item ON price_writes (item_ref, written_on);
+CREATE INDEX IF NOT EXISTS ix_price_writes_day ON price_writes (written_on);
 """
 
 DIALOG_TTL_MINUTES = 60
@@ -48,6 +68,7 @@ class Proposal:
     payload: list[dict]
     summary: str
     item_count: int
+    digest: dict | None = None     # снимок «было → стало» для рассылки и журнала (п.6)
 
 
 def _now() -> str:
@@ -62,6 +83,11 @@ class PricingStore:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self._db_path) as db:
             await db.executescript(_SCHEMA)
+            # база уже могла быть создана до появления дайджеста — дописываем колонку
+            cur = await db.execute("PRAGMA table_info(pending_proposal)")
+            columns = {row[1] for row in await cur.fetchall()}
+            if "digest" not in columns:
+                await db.execute("ALTER TABLE pending_proposal ADD COLUMN digest TEXT")
             await db.commit()
 
     # ------------------------------------------------------------------ диалог
@@ -102,29 +128,32 @@ class PricingStore:
 
     # ------------------------------------------------------- предложения к записи
 
-    async def save_proposal(self, user_id: int, payload: list[dict], summary: str) -> int:
+    async def save_proposal(self, user_id: int, payload: list[dict], summary: str,
+                            digest: dict | None = None) -> int:
         """Новое предложение заменяет предыдущее неподтверждённое."""
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute("UPDATE pending_proposal SET status = 'rejected' "
                              "WHERE user_id = ? AND status = 'pending'", (user_id,))
             cur = await db.execute(
                 "INSERT INTO pending_proposal (user_id, payload, summary, item_count, "
-                "created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, json.dumps(payload, ensure_ascii=False), summary, len(payload), _now()))
+                "created_at, digest) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, json.dumps(payload, ensure_ascii=False), summary, len(payload),
+                 _now(), json.dumps(digest, ensure_ascii=False) if digest else None))
             await db.commit()
             return cur.lastrowid
 
     async def get_pending(self, user_id: int) -> Proposal | None:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT proposal_id, payload, summary, item_count FROM pending_proposal "
+                "SELECT proposal_id, payload, summary, item_count, digest FROM pending_proposal "
                 "WHERE user_id = ? AND status = 'pending' ORDER BY proposal_id DESC LIMIT 1",
                 (user_id,))
             row = await cur.fetchone()
         if not row:
             return None
         return Proposal(proposal_id=row[0], user_id=user_id, payload=json.loads(row[1]),
-                        summary=row[2], item_count=row[3])
+                        summary=row[2], item_count=row[3],
+                        digest=json.loads(row[4]) if row[4] else None)
 
     async def take_pending(self, user_id: int, proposal_id: int) -> Proposal | None:
         """Атомарно берёт предложение в работу: повторное нажатие кнопки не сработает.
@@ -137,14 +166,15 @@ class PricingStore:
             cur = await db.execute(
                 "UPDATE pending_proposal SET status = 'applying' "
                 "WHERE proposal_id = ? AND user_id = ? AND status = 'pending' "
-                "RETURNING payload, summary, item_count",
+                "RETURNING payload, summary, item_count, digest",
                 (proposal_id, user_id))
             row = await cur.fetchone()
             await db.commit()
         if not row:
             return None
         return Proposal(proposal_id=proposal_id, user_id=user_id, payload=json.loads(row[0]),
-                        summary=row[1], item_count=row[2])
+                        summary=row[1], item_count=row[2],
+                        digest=json.loads(row[3]) if row[3] else None)
 
     async def mark_applied(self, proposal_id: int) -> None:
         async with aiosqlite.connect(self._db_path) as db:
@@ -158,6 +188,48 @@ class PricingStore:
             await db.execute("UPDATE pending_proposal SET status = 'pending' "
                              "WHERE proposal_id = ? AND status = 'applying'", (proposal_id,))
             await db.commit()
+
+    # -------------------------------------------------------- журнал записей (п.6)
+
+    async def record_writes(self, rows: list[dict]) -> int:
+        """Запомнить, что именно и из какого прайса записано. Пишется после ответа 1С."""
+        if not rows:
+            return 0
+        fields = ("written_on", "tm_code", "tm_name", "collection_ref", "collection",
+                  "item_ref", "item_name", "price_type", "old_value", "new_value",
+                  "supplier", "price_doc", "price_date")
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.executemany(
+                f"INSERT INTO price_writes ({', '.join(fields)}) "
+                f"VALUES ({', '.join('?' * len(fields))})",
+                [tuple(r.get(f) for f in fields) for r in rows])
+            await db.commit()
+        return len(rows)
+
+    async def price_sources(self, item_refs: list[str], dates: list[str]) -> dict:
+        """{(item_ref, дата): {supplier, price_doc, price_date}} — откуда взялась цена.
+
+        Ключ включает дату: цена, записанная нами 20.07, объясняется прайсом только если
+        1С показывает изменение именно за 20.07. Совпадения нет — значит правили мимо нас.
+        """
+        refs = [r for r in dict.fromkeys(item_refs) if r]
+        days = [d for d in dict.fromkeys(dates) if d]
+        if not refs or not days:
+            return {}
+        out: dict = {}
+        async with aiosqlite.connect(self._db_path) as db:
+            for i in range(0, len(refs), 400):      # предел числа параметров SQLite
+                chunk = refs[i:i + 400]
+                cur = await db.execute(
+                    "SELECT item_ref, written_on, supplier, price_doc, price_date "
+                    "FROM price_writes WHERE item_ref IN "
+                    f"({', '.join('?' * len(chunk))}) AND written_on IN "
+                    f"({', '.join('?' * len(days))}) ORDER BY id",
+                    (*chunk, *days))
+                for ref, day, supplier, doc, price_date in await cur.fetchall():
+                    out[(ref, day)] = {"supplier": supplier, "price_doc": doc,
+                                       "price_date": price_date}
+        return out
 
     # ------------------------------------------------------- маппинг колонок (§6.5)
 

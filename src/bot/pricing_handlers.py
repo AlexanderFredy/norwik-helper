@@ -7,6 +7,7 @@
 import asyncio
 import io
 import logging
+from datetime import date
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
@@ -14,7 +15,9 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from src.agent.pricing_tools import PRICING_TOOLS, PricingTools
 from src.agent.prompts import PRICING_PROMPT
+from src.price_tool.broadcast import build_broadcast, journal_rows
 from src.storage.pricing import PricingStore
+from src.storage.users import UserStore
 
 logger = logging.getLogger(__name__)
 
@@ -205,9 +208,38 @@ async def handle_price_reply(message: Message, orchestrator, onec, pricing_store
     await _run(message, message.text, orchestrator, onec, pricing_store, status_msg)
 
 
+def _written_on(result: dict) -> str:
+    """День записи в терминах регистра цен 1С — им же датируется журнал."""
+    raw = str(result.get("date") or "")
+    return raw[:10] if len(raw) >= 10 and raw[4:5] == "-" else date.today().isoformat()
+
+
+async def _notify_managers(bot, store: UserStore, digest: dict, result: dict,
+                           admin_id: int) -> int:
+    """Короткое уведомление менеджерам (п.6 ТЗ). Админ его не получает — у него отчёт.
+
+    Позиции с ошибками 1С исключаются: сообщить об изменении цены, которая не записалась,
+    хуже, чем не сообщить вовсе.
+    """
+    failed = {e.get("ref") for e in (result.get("errors") or []) if e.get("ref")}
+    text = build_broadcast(digest, failed)
+    if not text:
+        return 0
+    sent = 0
+    for user in await store.list_all():
+        if user.telegram_id == admin_id:
+            continue
+        try:
+            await bot.send_message(user.telegram_id, text)
+            sent += 1
+        except Exception:                          # заблокировал бота, удалил чат и т.п.
+            logger.warning("Не доставлено менеджеру %s", user.telegram_id, exc_info=True)
+    return sent
+
+
 @router.callback_query(F.data.startswith("price:"))
 async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: PricingStore,
-                                is_admin: bool) -> None:
+                                store: UserStore, is_admin: bool) -> None:
     _, action, raw_id = callback.data.split(":")
     user_id = callback.from_user.id
     if not is_admin:
@@ -244,7 +276,23 @@ async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: Pr
         return
 
     await pricing_store.mark_applied(proposal.proposal_id)
-    await progress.edit_text(_format_result(result))
+    report = _format_result(result)
+
+    # журнал и рассылка (п.6): 1С хранит дату изменения, но не источник цены —
+    # «из какого прайса» знаем только мы, и только отсюда
+    if proposal.digest:
+        failed = {e.get("ref") for e in (result.get("errors") or []) if e.get("ref")}
+        try:
+            await pricing_store.record_writes(
+                journal_rows(proposal.digest, _written_on(result), failed))
+        except Exception:
+            logger.exception("Не удалось записать журнал цен")   # цены в 1С уже записаны
+        sent = await _notify_managers(callback.message.bot, store, proposal.digest,
+                                      result, user_id)
+        if sent:
+            report += f"\n\nМенеджерам отправлено уведомление: {sent}."
+
+    await progress.edit_text(report)
 
     # цены записаны — выходим из режима прайса, иначе следующий обычный вопрос
     # админа будет истолкован как ответ по прайсу

@@ -97,6 +97,8 @@ PRICING_TOOLS = [
             "type": "object",
             "properties": {
                 "supplier": {"type": "string", "description": "поставщик, как его назвал админ или как в прайсе"},
+                "price_doc": {"type": "string", "description": "как назвать прайс менеджерам, напр. «Монарх-логистик»; по умолчанию имя файла"},
+                "price_date": {"type": "string", "description": "дата самого прайса ГГГГ-ММ-ДД, если она видна в шапке или имени файла"},
                 "groups": {
                     "type": "array",
                     "description": "по одной записи на коллекцию 1С",
@@ -308,10 +310,32 @@ class PricingTools:
         self.last_summary = summary
 
         if payload:
-            await self._store.save_proposal(self._user_id, payload, summary)
+            await self._store.save_proposal(self._user_id, payload, summary,
+                                            digest=self._digest(inp, results))
             return (summary + "\n\n[Предложение сохранено. Покажи этот текст админу дословно "
                     "и жди нажатия кнопки — сам ничего не записывай.]")
         return summary + "\n\n[Записывать нечего — кнопка подтверждения не появится.]"
+
+    def _digest(self, inp: dict, results: list[GroupResult]) -> dict:
+        """Снимок «было → стало» по товарам — для рассылки менеджерам и журнала (п.6).
+
+        Сохраняется вместе с payload: после нажатия кнопки пересчитать его уже неоткуда,
+        а «было» есть только на нашей стороне.
+        """
+        return {
+            "supplier": inp.get("supplier"),
+            "price_doc": inp.get("price_doc") or (self._file[0] if self._file else None),
+            "price_date": inp.get("price_date"),
+            "groups": [{
+                "tm_code": g.tm_code, "tm_name": g.tm_name,
+                "collection": g.collection, "collection_ref": g.collection_ref,
+                "items": [{
+                    "ref": p.ref, "name": p.name,
+                    "prices": {k: [None if p.before.get(k) is None else float(p.before[k]),
+                                   float(v)] for k, v in p.prices.items()},
+                } for p in g.to_write],
+            } for g in results if g.to_write],
+        }
 
     def _render(self, inp: dict, results: list[GroupResult], problems: list[str],
                 payload: list[dict]) -> str:

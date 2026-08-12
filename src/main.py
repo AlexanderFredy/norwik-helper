@@ -46,7 +46,7 @@ async def main() -> None:
     norwik = NorwikClient()
     orchestrator = Orchestrator(
         api_key=config.anthropic_api_key,
-        executor=ToolExecutor(mail, norwik),
+        executor=ToolExecutor(mail, norwik, onec=onec, pricing_store=pricing_store),
     )
 
     bot = Bot(token=config.telegram_bot_token)

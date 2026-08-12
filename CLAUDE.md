@@ -41,9 +41,11 @@ Telegram (aiogram) → AuthMiddleware → handlers.py
 
 **Оркестратор** (`src/agent/orchestrator.py`) — ручной agentic loop, не tool runner. Причина: нужна обработка `stop_reason == "pause_turn"` для серверного `web_search` (Anthropic-hosted). Цикл продолжается до `end_turn` или отсутствия `tool_uses`. Лимит `MAX_ITERATIONS = 30`. Принимает `on_tool` callback — вызывается перед каждым инструментом для обновления статуса в Telegram.
 
-**Инструменты** (`src/agent/tools.py`) — 5 кастомных + 1 серверный:
+**Инструменты** (`src/agent/tools.py`) — 6 кастомных + 1 серверный:
 - `search_emails` / `read_attachment` / `get_email_contacts` — IMAP
 - `search_norwik` / `get_norwik_product` — парсинг norwik.ru
+- `get_price_history` — «когда меняли цены»: даты из 1С (`by-tm`), источник цены из
+  журнала `price_writes`; форматирует ответ код (`src/price_tool/history.py`), не модель
 - `web_search` — `{"type": "web_search_20260209"}`, выполняется на стороне Anthropic (случай А: поставщик не найден)
 
 **IMAP-клиент** (`src/email_tool/client.py`) — синхронный, вызывается через `asyncio.to_thread`. Строго read-only: `select(readonly=True)`, только `BODY.PEEK` (не ставит флаг `\Seen`). Операции записи не реализованы намеренно.
