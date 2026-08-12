@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from datetime import date
@@ -14,11 +15,17 @@ from decimal import Decimal, InvalidOperation
 
 from src.onec.client import NomItem, OnecClient
 from src.price_tool.changes import GroupResult, build_payload, plan_collection
-from src.price_tool.parser import parse_price_table, render_preview
+from src.price_tool.parser import extract_images, parse_price_table, render_preview
 from src.price_tool.signature import price_signature
 from src.storage.pricing import PricingStore
 
 logger = logging.getLogger(__name__)
+
+# Картинки едут в истории диалога (SQLite + каждый следующий запрос к модели), поэтому
+# лимиты жёсткие: логотипы весят десятки килобайт, всё крупное — это фото товаров.
+MAX_IMAGES = 6
+MAX_IMAGE_BYTES = 1_500_000
+MAX_IMAGE_TOTAL_BYTES = 4_000_000
 
 PRICING_TOOLS = [
     {
@@ -174,6 +181,7 @@ class PricingTools:
         self._user_id = user_id
         self._file: tuple[str, bytes] | None = None      # (имя, содержимое) текущего прайса
         self._nom: dict[str, list[NomItem]] = {}         # кэш номенклатуры по коду ТМ
+        self._images: list[dict] = []                    # баннеры из прайса — для модели
         self.last_summary: str | None = None
 
     def set_file(self, filename: str, content: bytes) -> None:
@@ -182,7 +190,7 @@ class PricingTools:
     def handles(self, name: str) -> bool:
         return name in {t["name"] for t in PRICING_TOOLS}
 
-    async def execute(self, name: str, inp: dict) -> str:
+    async def execute(self, name: str, inp: dict) -> str | list[dict]:
         try:
             if name == "read_price_file":
                 return await self._read_with_mapping(inp)
@@ -212,16 +220,17 @@ class PricingTools:
         from src.email_tool.attachments import extract_text
         return price_signature([], extract_text(filename, content))
 
-    async def _read_with_mapping(self, inp: dict) -> str:
+    async def _read_with_mapping(self, inp: dict) -> str | list[dict]:
         text = await asyncio.to_thread(self._read_price_file, inp)
         signature = await asyncio.to_thread(self._signature)
         if not signature:
-            return text
+            return self._attach(text)
         known = await self._store.get_mapping(signature)
         if not known:
-            return (text + "\n\n[Формат прайса встречается впервые: трактовку колонок нужно "
-                    "определить, при неоднозначности — спросить админа и сохранить "
-                    "через save_price_mapping.]")
+            return self._attach(
+                text + "\n\n[Формат прайса встречается впервые: трактовку колонок нужно "
+                "определить, при неоднозначности — спросить админа и сохранить "
+                "через save_price_mapping.]")
         m = known["mapping"]
         parts = [f"закупка = «{m.get('purchase_column')}»"]
         if m.get("rrc_column"):
@@ -231,7 +240,7 @@ class PricingTools:
         if m.get("sheet"):
             parts.append(f"лист: «{m['sheet']}»")
         note = f" Основание: {m['note']}." if m.get("note") else ""
-        return (text + "\n\n[ЗАПОМНЕННЫЙ МАППИНГ этого формата прайса"
+        return self._attach(text + "\n\n[ЗАПОМНЕННЫЙ МАППИНГ этого формата прайса"
                 + (f" (поставщик: {known['supplier']}" if known.get("supplier") else "")
                 + f", сохранён {known['updated_at'][:10]}): "
                 + "; ".join(parts) + f".{note} "
@@ -248,6 +257,8 @@ class PricingTools:
                 "вопросов о колонках.")
 
     def _read_price_file(self, inp: dict) -> str:
+        """Текст прайса; найденные картинки складывает в self._images (см. _attach)."""
+        self._images = []
         if not self._file:
             return "Файл прайса не приложен. Попроси админа прислать файл документом."
         filename, content = self._file
@@ -260,8 +271,74 @@ class PricingTools:
         if wanted:
             picked = [s for s in sheets if wanted.lower() in s.name.lower()]
             sheets = picked or sheets
+
+        # Баннер бренда в прайсе часто вставлен картинкой: в тексте на его месте пусто,
+        # и раздел другой ТМ выглядит продолжением предыдущей. Ставим маркер и прикладываем
+        # само изображение — прочитать логотип может только модель.
+        self._images = self._collect_images(content, filename, sheets)
         text = "\n\n".join(render_preview(s) for s in sheets)
         return text[:40000]
+
+    def _collect_images(self, content: bytes, filename: str, sheets: list) -> list[dict]:
+        if not filename.lower().endswith(".xlsx"):
+            return []
+        try:
+            by_sheet = extract_images(content)
+        except Exception:
+            logger.warning("Не удалось извлечь изображения прайса", exc_info=True)
+            return []
+        if not by_sheet:
+            return []
+
+        by_name = {s.name: s for s in sheets}
+        found: list[dict] = []
+        for name, images in by_sheet.items():
+            if name in by_name:
+                for row, data, media_type in images:
+                    found.append({"row": row, "sheet": name, "data": data,
+                                  "media_type": media_type})
+        found.sort(key=lambda i: (i["sheet"], i["row"]))
+
+        attached, budget = [], MAX_IMAGE_TOTAL_BYTES
+        for image in found:
+            fits = (len(attached) < MAX_IMAGES and len(image["data"]) <= MAX_IMAGE_BYTES
+                    and len(image["data"]) <= budget)
+            if fits:
+                budget -= len(image["data"])
+                image["n"] = len(attached) + 1
+                attached.append(image)
+                # Строка — это ЯКОРЬ (левый верхний угол) картинки: визуально она может
+                # накрывать и соседние строки, поэтому точную границу раздела модель
+                # должна определять по содержимому, а не по позиции маркера.
+                label = (f"⟨ИЗОБРАЖЕНИЕ #{image['n']}, привязано к строке {image['row']} "
+                         f"листа «{image['sheet']}» — приложено к этому же результату. "
+                         "Картинка может перекрывать соседние строки: точную границу "
+                         "раздела определи по заголовкам коллекций и формату артикулов⟩")
+            else:
+                label = (f"⟨ИЗОБРАЖЕНИЕ у строки {image['row']} — слишком большое, "
+                         "не приложено⟩")
+            image["label"] = label
+
+        # маркеры вставляем с конца, чтобы не сдвинуть ещё не обработанные строки
+        for image in sorted(found, key=lambda i: i["row"], reverse=True):
+            sheet = by_name[image["sheet"]]
+            idx = min(max(image["row"] - 1, 0), len(sheet.rows))
+            sheet.rows.insert(idx, [image["label"]])
+        return attached
+
+    def _attach(self, text: str) -> str | list[dict]:
+        """Результат инструмента: текст + картинки блоками, если они есть."""
+        if not self._images:
+            return text
+        blocks: list[dict] = [{"type": "text", "text": text}]
+        for image in self._images:
+            blocks.append({"type": "text",
+                           "text": f"Изображение #{image['n']} "
+                                   f"(лист «{image['sheet']}», строка {image['row']}):"})
+            blocks.append({"type": "image", "source": {
+                "type": "base64", "media_type": image["media_type"],
+                "data": base64.b64encode(image["data"]).decode("ascii")}})
+        return blocks
 
     def _selling_tm(self) -> str:
         tms = self._onec.selling_tm()

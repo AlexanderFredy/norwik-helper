@@ -89,6 +89,9 @@ class Orchestrator:
                     output = await self._executor.execute(tool.name, tool.input)
                 results.append(
                     {
+                        # output — строка ЛИБО список блоков: read_price_file прикладывает
+                        # к тексту баннеры из прайса картинками, прочитать их может только
+                        # модель. Не сводить к str().
                         "type": "tool_result",
                         "tool_use_id": tool.id,
                         "content": output,
