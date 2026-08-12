@@ -25,7 +25,7 @@ from src.email_tool.client import MailClient
 from src.onec.client import NomItem, OnecClient
 from src.price_tool.parser import extract_images, parse_price_table, render_preview
 
-MODEL = "claude-opus-4-8"
+MODEL = "claude-opus-5"
 _PRICE_EXTS = (".xlsx", ".xls", ".csv", ".pdf")
 _MAX_IMAGES = 8
 _MAX_IMG_BYTES = 4_000_000

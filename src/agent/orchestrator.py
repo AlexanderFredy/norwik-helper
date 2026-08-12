@@ -9,7 +9,7 @@ from src.agent.tools import TOOL_DEFINITIONS, ToolExecutor
 
 logger = logging.getLogger(__name__)
 
-MODEL = "claude-opus-4-8"
+MODEL = "claude-opus-5"
 MAX_TOKENS = 16000
 MAX_ITERATIONS = 30
 
