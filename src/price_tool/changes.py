@@ -100,9 +100,12 @@ def plan_collection(items: list[NomItem], tm_code: str, tm_name: str,
                     today: date, min_pct: Decimal = MIN_CHANGE_PCT) -> GroupResult:
     plans = [plan_item(i, new_purchase, new_rrc, today, min_pct) for i in items]
     first = items[0] if items else None
+    # У части товаров реквизит «Коллекция» не заполнен (в каталоге таких ~130): они лежат
+    # прямо в папке ТМ. Показывать админу пустое имя нельзя — берём имя папки-родителя.
     return GroupResult(tm_code=tm_code, tm_name=tm_name,
                        collection_ref=first.collection_ref if first else "",
-                       collection=first.collection if first else "",
+                       collection=(first.collection or first.parent or "без коллекции")
+                       if first else "",
                        plans=plans)
 
 

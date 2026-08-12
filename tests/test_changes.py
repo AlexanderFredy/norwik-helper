@@ -17,6 +17,21 @@ def item(ref="YO-1", purchase=None, rrc=None, retail=None, coll="YO-C", name="Т
                    purchase=p(purchase), retail=p(retail), rrc=p(rrc))
 
 
+class CollectionNameTest(unittest.TestCase):
+    def test_empty_collection_falls_back_to_parent(self):
+        """У ~130 товаров каталога реквизит «Коллекция» пуст — админу нужно имя папки."""
+        bare = NomItem(ref="YO-1", id="1", name="Паркетная доска Farecom", article="",
+                       unit="м2", size="", product_type="Паркетная доска", collection="",
+                       parent="Farecom", collection_ref="YO-F", alt_units={},
+                       purchase=Price(500.0, "2026-01-01"), retail=None, rrc=None)
+        g = plan_collection([bare], "T", "Farecom", D("600"), None, TODAY)
+        self.assertEqual(g.collection, "Farecom")
+
+    def test_collection_wins_over_parent(self):
+        g = plan_collection([item(purchase=500)], "T", "TM", D("600"), None, TODAY)
+        self.assertEqual(g.collection, "Vintage")
+
+
 class ThresholdTest(unittest.TestCase):
     def test_below_threshold_not_written(self):
         self.assertFalse(significant(D("1070"), D("1069.93")))     # 0.007%
