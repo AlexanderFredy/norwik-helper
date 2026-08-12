@@ -8,6 +8,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
 from src.bot.commands import build_help
+from src.bot.errors import describe_api_error
 from src.storage.users import UserStore
 
 logger = logging.getLogger(__name__)
@@ -118,9 +119,10 @@ async def _process_query(message: Message, text: str, orchestrator, status_msg) 
 
     try:
         answer = await orchestrator.handle_query(text, on_tool=on_tool)
-    except Exception:
+    except Exception as exc:                           # noqa: BLE001
         logger.exception("Ошибка обработки запроса")
-        await status_msg.edit_text("Произошла ошибка при обработке запроса. Попробуйте позже.")
+        await status_msg.edit_text(describe_api_error(
+            exc, "Произошла ошибка при обработке запроса. Попробуйте позже."))
         return
 
     try:

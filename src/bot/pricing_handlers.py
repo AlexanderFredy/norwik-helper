@@ -15,6 +15,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from src.agent.pricing_tools import PRICING_TOOLS, PricingTools, clear_nomenclature_cache
 from src.agent.prompts import PRICING_PROMPT
+from src.bot.errors import describe_api_error
 from src.price_tool.broadcast import build_broadcast, journal_rows
 from src.storage.pricing import PricingStore
 from src.storage.users import UserStore
@@ -72,9 +73,10 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
         answer, history = await orchestrator.handle_turn(
             history, on_tool=on_tool, system=PRICING_PROMPT,
             extra_tools=PRICING_TOOLS, extra_executor=tools)
-    except Exception:
+    except Exception as exc:                           # noqa: BLE001
         logger.exception("Ошибка обработки прайса")
-        await status_msg.edit_text("Ошибка при обработке прайса. Подробности в логах.")
+        await status_msg.edit_text(describe_api_error(
+            exc, "Ошибка при обработке прайса. Подробности в логах."))
         return
 
     await store.save_messages(user_id, history)
