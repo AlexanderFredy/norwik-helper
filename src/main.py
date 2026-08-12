@@ -7,6 +7,7 @@ from aiogram import Bot, Dispatcher
 from src.agent.orchestrator import Orchestrator
 from src.agent.tools import ToolExecutor
 from src.bot.auth import AuthMiddleware
+from src.bot.commands import setup_bot_commands
 from src.bot.handlers import router
 from src.bot.pricing_handlers import router as pricing_router
 from src.config import load_config
@@ -55,6 +56,8 @@ async def main() -> None:
     dp.callback_query.middleware(AuthMiddleware(store, config.admin_telegram_id))
     dp.include_router(pricing_router)   # прайсы — до общего роутера: он ловит любой текст
     dp.include_router(router)
+
+    await setup_bot_commands(bot, config.admin_telegram_id)
 
     logger.info("Запуск бота (polling)")
     await dp.start_polling(bot)

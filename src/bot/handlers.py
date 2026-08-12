@@ -7,6 +7,7 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
+from src.bot.commands import build_help
 from src.storage.users import UserStore
 
 logger = logging.getLogger(__name__)
@@ -94,8 +95,15 @@ async def cmd_start(message: Message) -> None:
         "Я помощник менеджера по продажам.\n"
         "Напишите название товара (бренд, коллекция/артикул, для плитки — размер) "
         "и нужное количество — я найду поставщиков, остатки и цены.\n"
-        "Можно отправить голосовое сообщение."
+        "Можно отправить голосовое сообщение.\n\n"
+        "Подробнее — /help"
     )
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message, is_admin: bool, onec=None) -> None:
+    await message.answer(build_help(is_admin, onec_enabled=onec is not None),
+                         parse_mode="HTML")
 
 
 async def _process_query(message: Message, text: str, orchestrator, status_msg) -> None:

@@ -184,7 +184,18 @@ async def cmd_mapping_forget(message: Message, command: CommandObject,
         "Следующий прайс этого формата снова спросит, какую колонку считать закупкой.")
 
 
-@router.message(F.text, lambda m: m.from_user.id in _files)
+def _is_price_reply(message: Message) -> bool:
+    """Текст внутри открытого диалога по прайсу.
+
+    Команды исключены: иначе `/help`, `/start` и прочие уйдут модели как ответ на её
+    вопрос о колонках. Команды самого режима цен зарегистрированы выше и до сюда не
+    доходят, но остальные живут в общем роутере — за этим фильтром.
+    """
+    return (message.from_user.id in _files
+            and bool(message.text) and not message.text.startswith("/"))
+
+
+@router.message(F.text, _is_price_reply)
 async def handle_price_reply(message: Message, orchestrator, onec, pricing_store: PricingStore,
                              is_admin: bool) -> None:
     """Ответ админа внутри диалога по прайсу (уточнение колонки, бренда и т.п.)."""
