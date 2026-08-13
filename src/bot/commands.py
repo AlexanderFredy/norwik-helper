@@ -20,6 +20,9 @@ ADMIN_COMMANDS = COMMON_COMMANDS + [
     BotCommand(command="cancel_price", description="Прекратить работу с прайсом"),
     BotCommand(command="mappings", description="Запомненные форматы прайсов"),
     BotCommand(command="mapping_forget", description="Забыть формат прайса"),
+    BotCommand(command="categories", description="Категории товаров, которые анализируем"),
+    BotCommand(command="category_add", description="Добавить категорию"),
+    BotCommand(command="category_remove", description="Убрать категорию"),
     BotCommand(command="exclusives", description="Эксклюзивы поставщиков"),
     BotCommand(command="exclusive_forget", description="Снять пометку эксклюзива"),
     BotCommand(command="adduser", description="Добавить пользователя"),
@@ -52,6 +55,17 @@ _ADMIN_HELP = """
 /cancel_price — прекратить работу с текущим прайсом
 /mappings — какие форматы прайсов я уже разбираю без вопросов
 /mapping_forget &lt;номер&gt; — забыть формат, чтобы снова спросил про колонки
+(трактовка запоминается по каждому листу отдельно — мультилистовой прайс
+разбирается целиком, а не только тем листом, что запомнился первым)
+
+<b>Категории товаров</b>
+Список задаётся один раз и действует для всех прайсов. Разделы других категорий —
+плинтус, подложка, аксессуары, стеновые панели — агент не разбирает, а только
+коротко упоминает, что они в прайсе есть. Пустой список означает «анализируем всё».
+
+/categories — текущий список
+/category_add ламинат, керамическая плитка — добавить
+/category_remove плинтус — убрать
 
 <b>Эксклюзивы поставщиков</b>
 Если в прайсе написано «эксклюзив», я это запомню и буду добавлять пометку после

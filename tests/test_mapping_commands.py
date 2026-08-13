@@ -62,14 +62,14 @@ class MappingCommandsTest(unittest.IsolatedAsyncioTestCase):
         msg = FakeMessage()
         await ph.cmd_mapping_forget(msg, Args("1"), self.store, is_admin=True)
         self.assertIn("Забыл формат", msg.text)
-        self.assertIsNone(await self.store.get_mapping(first))
+        self.assertEqual(await self.store.get_mappings(first), [])
         self.assertEqual(len(await self.store.list_mappings()), 1)
 
     async def test_forget_by_signature_prefix(self):
         await self._seed()
         msg = FakeMessage()
         await ph.cmd_mapping_forget(msg, Args("aaa1"), self.store, is_admin=True)
-        self.assertIsNone(await self.store.get_mapping("aaa111"))
+        self.assertEqual(await self.store.get_mappings("aaa111"), [])
 
     async def test_forget_unknown(self):
         await self._seed()

@@ -130,7 +130,9 @@ class PricingFlowTest(unittest.IsolatedAsyncioTestCase):
         text = await later.execute("read_price_file", {})
         self.assertIn("ЗАПОМНЕННЫЙ МАППИНГ", text)
         self.assertIn("самовывоз", text)
-        self.assertIn("НЕ переспрашивай", text)
+        self.assertIn("МОЛЧА", text)
+        # запомненный лист не должен отменять разбор остальных листов
+        self.assertIn("ОСТАЛЬНЫЕ листы", text)
 
     async def test_mapping_is_overwritten_when_admin_changes_mind(self):
         self.tools.set_file("p.xlsx", self._xlsx("Прайс"))

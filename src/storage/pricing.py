@@ -6,11 +6,29 @@
 на кнопку уходит ровно то, что админ видел в предложении.
 """
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
+
+logger = logging.getLogger(__name__)
+
+# Ключ — (сигнатура, ЛИСТ). У мультилистового прайса («Плинтус», «LA», «SPC LVT») колонки
+# на каждом листе свои, и одна строка на файл означала бы, что запоминается только
+# последний разобранный лист, а остальные молча выпадают из обработки.
+_MAPPINGS_TABLE = """
+CREATE TABLE IF NOT EXISTS price_mappings (
+    signature  TEXT NOT NULL,           -- сигнатура структуры прайса (§6.5.2)
+    sheet      TEXT NOT NULL DEFAULT '',-- имя листа; '' — прайс из одного листа
+    supplier   TEXT,                    -- как назывался поставщик — для показа админу
+    mapping    TEXT NOT NULL,           -- JSON: колонки цен, база
+    updated_at TEXT NOT NULL,
+    uses       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (signature, sheet)
+);
+"""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS dialog_state (
@@ -29,12 +47,13 @@ CREATE TABLE IF NOT EXISTS pending_proposal (
     status      TEXT NOT NULL DEFAULT 'pending'   -- pending | applied | rejected
 );
 CREATE INDEX IF NOT EXISTS ix_pending_user ON pending_proposal (user_id, status);
-CREATE TABLE IF NOT EXISTS price_mappings (
-    signature  TEXT PRIMARY KEY,        -- сигнатура структуры прайса (§6.5.2)
-    supplier   TEXT,                    -- как назывался поставщик — для показа админу
-    mapping    TEXT NOT NULL,           -- JSON: колонки цен, база, лист
-    updated_at TEXT NOT NULL,
-    uses       INTEGER NOT NULL DEFAULT 0
+{mappings}
+-- Категории товаров, которые вообще анализируем (§6.8). Пусто = ограничений нет.
+-- Задаётся один раз на все прайсы, а не на каждый файл.
+CREATE TABLE IF NOT EXISTS product_scope (
+    category_norm TEXT PRIMARY KEY,     -- нормализованное имя — по нему сравниваем
+    category      TEXT NOT NULL,        -- как показывать админу
+    added_at      TEXT NOT NULL
 );
 -- Журнал наших записей цен: 1С хранит дату изменения, но не источник. Только отсюда
 -- известно, из какого прайса цена взялась (dev_tasks п.6).
@@ -86,7 +105,7 @@ CREATE TABLE IF NOT EXISTS exclusive_decisions (
     note           TEXT,
     PRIMARY KEY (tm_code, collection_ref, item_ref)
 );
-"""
+""".replace("{mappings}", _MAPPINGS_TABLE)
 
 DIALOG_TTL_MINUTES = 60
 
@@ -118,7 +137,35 @@ class PricingStore:
             columns = {row[1] for row in await cur.fetchall()}
             if "digest" not in columns:
                 await db.execute("ALTER TABLE pending_proposal ADD COLUMN digest TEXT")
+            await self._migrate_mappings(db)
             await db.commit()
+
+    @staticmethod
+    async def _migrate_mappings(db) -> None:
+        """Ключ маппинга: сигнатура → (сигнатура, лист).
+
+        В старой схеме на файл приходилась одна строка, а имя листа лежало внутри JSON.
+        Переносим его в колонку: мультилистовой прайс должен помнить каждый лист отдельно.
+        """
+        cur = await db.execute("PRAGMA table_info(price_mappings)")
+        columns = {row[1] for row in await cur.fetchall()}
+        if not columns or "sheet" in columns:
+            return
+        cur = await db.execute(
+            "SELECT signature, supplier, mapping, updated_at, uses FROM price_mappings")
+        rows = await cur.fetchall()
+        await db.execute("DROP TABLE price_mappings")
+        await db.executescript(_MAPPINGS_TABLE)
+        for signature, supplier, mapping, updated_at, uses in rows:
+            try:
+                sheet = (json.loads(mapping) or {}).get("sheet") or ""
+            except (ValueError, AttributeError):
+                sheet = ""
+            await db.execute(
+                "INSERT OR IGNORE INTO price_mappings (signature, sheet, supplier, mapping, "
+                "updated_at, uses) VALUES (?, ?, ?, ?, ?, ?)",
+                (signature, sheet, supplier, mapping, updated_at, uses))
+        logger.info("Маппинги колонок переведены на ключ (сигнатура, лист): %d", len(rows))
 
     # ------------------------------------------------------------------ диалог
 
@@ -331,52 +378,98 @@ class PricingStore:
 
     # ------------------------------------------------------- маппинг колонок (§6.5)
 
-    async def get_mapping(self, signature: str) -> dict | None:
-        """Запомненная трактовка колонок для этого формата прайса."""
+    async def get_mappings(self, signature: str) -> list[dict]:
+        """ВСЕ запомненные трактовки этого формата — по одной на лист.
+
+        Возвращается список, а не одна запись: у мультилистового прайса каждый лист
+        разбирается своими колонками, и отдать только один значило бы сузить работу
+        агента до него одного.
+        """
         if not signature:
-            return None
+            return []
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT supplier, mapping, updated_at, uses FROM price_mappings "
-                "WHERE signature = ?", (signature,))
-            row = await cur.fetchone()
-            if row:
+                "SELECT sheet, supplier, mapping, updated_at, uses FROM price_mappings "
+                "WHERE signature = ? ORDER BY sheet", (signature,))
+            rows = await cur.fetchall()
+            if rows:
                 await db.execute("UPDATE price_mappings SET uses = uses + 1 "
                                  "WHERE signature = ?", (signature,))
                 await db.commit()
-        if not row:
-            return None
-        return {"supplier": row[0], "mapping": json.loads(row[1]),
-                "updated_at": row[2], "uses": row[3]}
+        return [{"sheet": r[0], "supplier": r[1], "mapping": json.loads(r[2]),
+                 "updated_at": r[3], "uses": r[4]} for r in rows]
 
     async def list_mappings(self) -> list[dict]:
         """Все запомненные форматы, свежие сверху — для команды /mappings."""
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT signature, supplier, mapping, updated_at, uses FROM price_mappings "
-                "ORDER BY updated_at DESC")
+                "SELECT signature, sheet, supplier, mapping, updated_at, uses "
+                "FROM price_mappings ORDER BY updated_at DESC, sheet")
             rows = await cur.fetchall()
-        return [{"signature": r[0], "supplier": r[1], "mapping": json.loads(r[2]),
-                 "updated_at": r[3], "uses": r[4]} for r in rows]
+        return [{"signature": r[0], "sheet": r[1], "supplier": r[2],
+                 "mapping": json.loads(r[3]), "updated_at": r[4], "uses": r[5]} for r in rows]
 
-    async def forget_mapping(self, signature: str) -> bool:
+    async def forget_mapping(self, signature: str, sheet: str = "") -> bool:
+        """Забыть трактовку одного листа — остальные листы того же файла остаются."""
         async with aiosqlite.connect(self._db_path) as db:
-            cur = await db.execute("DELETE FROM price_mappings WHERE signature = ?", (signature,))
+            cur = await db.execute(
+                "DELETE FROM price_mappings WHERE signature = ? AND sheet = ?",
+                (signature, sheet or ""))
             await db.commit()
             return cur.rowcount > 0
 
-    async def save_mapping(self, signature: str, supplier: str | None, mapping: dict) -> None:
-        """Upsert: ответ админа перекрывает прежнюю трактовку того же формата."""
+    async def save_mapping(self, signature: str, supplier: str | None, mapping: dict,
+                           sheet: str = "") -> None:
+        """Upsert по (сигнатура, лист): трактовка одного листа не трогает остальные."""
         if not signature:
             return
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "INSERT INTO price_mappings (signature, supplier, mapping, updated_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(signature) DO UPDATE SET "
+                "INSERT INTO price_mappings (signature, sheet, supplier, mapping, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(signature, sheet) DO UPDATE SET "
                 "supplier = excluded.supplier, mapping = excluded.mapping, "
                 "updated_at = excluded.updated_at",
-                (signature, supplier, json.dumps(mapping, ensure_ascii=False), _now()))
+                (signature, sheet or "", supplier, json.dumps(mapping, ensure_ascii=False),
+                 _now()))
             await db.commit()
+
+    # -------------------------------------------------- категории товаров (§6.8)
+
+    async def list_scope(self) -> list[dict]:
+        """Категории, которые анализируем. Пустой список = ограничений нет."""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT category, category_norm, added_at FROM product_scope ORDER BY category")
+            return [{"category": r[0], "norm": r[1], "added_at": r[2]}
+                    for r in await cur.fetchall()]
+
+    async def add_scope(self, categories: list[str]) -> list[str]:
+        """Добавить категории; возвращает те, которых ещё не было."""
+        from src.price_tool.scope import normalize
+
+        added = []
+        async with aiosqlite.connect(self._db_path) as db:
+            for raw in categories:
+                name = (raw or "").strip()
+                norm = normalize(name)
+                if not norm:
+                    continue
+                cur = await db.execute(
+                    "INSERT OR IGNORE INTO product_scope (category_norm, category, added_at) "
+                    "VALUES (?, ?, ?)", (norm, name, _now()))
+                if cur.rowcount:
+                    added.append(name)
+            await db.commit()
+        return added
+
+    async def remove_scope(self, category: str) -> bool:
+        from src.price_tool.scope import normalize
+
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute("DELETE FROM product_scope WHERE category_norm = ?",
+                                   (normalize(category),))
+            await db.commit()
+            return cur.rowcount > 0
 
     async def reject(self, user_id: int, proposal_id: int) -> bool:
         async with aiosqlite.connect(self._db_path) as db:

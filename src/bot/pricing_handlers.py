@@ -30,6 +30,7 @@ MAX_FILE_BYTES = 20 * 1024 * 1024
 
 _STATUS = {
     "read_price_file": "Читаю прайс...",
+    "get_product_scope": "Смотрю, какие категории анализируем...",
     "save_price_mapping": "Запоминаю формат прайса...",
     "get_selling_tm": "Проверяю выгрузку ТМ в 1С...",
     "get_1c_nomenclature": "Загружаю номенклатуру из 1С...",
@@ -133,13 +134,14 @@ async def cmd_cancel(message: Message, pricing_store: PricingStore) -> None:
 
 def _describe(entry: dict) -> str:
     m = entry["mapping"]
-    parts = [f"закупка «{m.get('purchase_column')}»"]
+    parts = []
+    if entry.get("sheet"):
+        parts.append(f"лист «{entry['sheet']}»")
+    parts.append(f"закупка «{m.get('purchase_column')}»")
     if m.get("rrc_column"):
         parts.append(f"РРЦ «{m['rrc_column']}»")
     if m.get("basis") and m["basis"] != "base_unit":
         parts.append(f"база: {m['basis']}")
-    if m.get("sheet"):
-        parts.append(f"лист «{m['sheet']}»")
     return ", ".join(parts)
 
 
@@ -187,10 +189,84 @@ async def cmd_mapping_forget(message: Message, command: CommandObject,
         await message.answer("Не нашёл такой записи. Посмотрите список: /mappings")
         return
 
-    await pricing_store.forget_mapping(target["signature"])
+    await pricing_store.forget_mapping(target["signature"], target.get("sheet", ""))
     await message.answer(
         f"Забыл формат «{target['supplier'] or 'без названия'}» ({_describe(target)}).\n"
-        "Следующий прайс этого формата снова спросит, какую колонку считать закупкой.")
+        "Трактовки других листов этого прайса остались. Следующий прайс этого формата "
+        "снова спросит, какую колонку считать закупкой на этом листе.")
+
+
+_SCOPE_HELP = ("\nДобавить: /category_add ламинат, керамическая плитка\n"
+               "Убрать: /category_remove плинтус\n"
+               "Список действует для всех прайсов сразу, повторять его в каждом файле "
+               "не нужно. Названия сверяются нестрого: «плитка» покроет «Керамическая "
+               "плитка» из 1С.")
+
+
+@router.message(Command("categories"))
+async def cmd_categories(message: Message, pricing_store: PricingStore, is_admin: bool) -> None:
+    """Категории товаров, которые агент вообще анализирует (§6.8)."""
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+    scope = await pricing_store.list_scope()
+    if not scope:
+        await message.answer(
+            "Ограничений по категориям нет — агент разбирает все разделы прайса.\n"
+            "Чтобы он не тратил время на плинтус, подложку, аксессуары и стеновые "
+            "панели, перечислите то, что вам нужно." + _SCOPE_HELP)
+        return
+    lines = ["Анализируем только эти категории:"]
+    lines += [f"{i}. {c['category']}" for i, c in enumerate(scope, 1)]
+    lines.append("\nОстальные разделы прайса агент не разбирает — только коротко "
+                 "перечисляет, что они в прайсе есть." + _SCOPE_HELP)
+    await _send(message, "\n".join(lines))
+
+
+@router.message(Command("category_add"))
+async def cmd_category_add(message: Message, command: CommandObject,
+                           pricing_store: PricingStore, is_admin: bool) -> None:
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+    raw = (command.args or "").strip()
+    if not raw:
+        await message.answer("Укажите категории через запятую, например:\n"
+                             "/category_add ламинат, керамическая плитка, обои")
+        return
+    names = [p.strip() for p in raw.split(",") if p.strip()]
+    was_empty = not await pricing_store.list_scope()
+    added = await pricing_store.add_scope(names)
+    if not added:
+        await message.answer("Эти категории уже в списке — /categories покажет текущий.")
+        return
+    text = f"Добавил: {', '.join(added)}."
+    if was_empty:
+        text += ("\n⚠️ Список был пуст, а это значило «анализируем всё». Теперь агент "
+                 "разбирает ТОЛЬКО перечисленное — проверьте /categories, чтобы не "
+                 "потерять нужный вид товара.")
+    await message.answer(text)
+
+
+@router.message(Command("category_remove"))
+async def cmd_category_remove(message: Message, command: CommandObject,
+                              pricing_store: PricingStore, is_admin: bool) -> None:
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+    name = (command.args or "").strip()
+    if not name:
+        await message.answer("Укажите категорию, например: /category_remove плинтус")
+        return
+    if not await pricing_store.remove_scope(name):
+        await message.answer(f"Категории «{name}» в списке нет — посмотрите /categories.")
+        return
+    left = await pricing_store.list_scope()
+    text = f"Убрал «{name}»."
+    if not left:
+        text += ("\n⚠️ Список опустел — это снова означает «анализируем всё», а не "
+                 "«ничего не анализируем».")
+    await message.answer(text)
 
 
 async def _exclusive_entries(store: PricingStore) -> list[dict]:

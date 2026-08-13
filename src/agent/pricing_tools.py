@@ -21,6 +21,7 @@ from src.price_tool.exclusive import (
     HINT_WORDS, WHERE_FOUND, annotate, find, resolve,
 )
 from src.price_tool.parser import extract_images, parse_price_table, render_preview
+from src.price_tool.scope import describe, in_scope
 from src.price_tool.signature import price_signature
 from src.storage.pricing import PricingStore
 
@@ -61,11 +62,14 @@ PRICING_TOOLS = [
     {
         "name": "save_price_mapping",
         "description": (
-            "Запомнить трактовку колонок этого формата прайса, чтобы в следующий раз не "
+            "Запомнить трактовку колонок ОДНОГО ЛИСТА прайса, чтобы в следующий раз не "
             "спрашивать админа заново. Вызывай СРАЗУ ПОСЛЕ того, как админ ответил на "
             "вопрос о колонках (какая закупка, какая РРЦ, цена за м² или за упаковку). "
             "Привязка идёт к структуре файла, а не к имени файла: следующий прайс того же "
-            "поставщика в том же формате подхватит её автоматически."
+            "поставщика в том же формате подхватит её автоматически.\n"
+            "У мультилистового прайса вызывай по разу НА КАЖДЫЙ лист с ценами, указывая "
+            "sheet: трактовки листов хранятся отдельно и друг друга не затирают. "
+            "Сохранение одного листа НЕ означает, что остальные обрабатывать не надо."
         ),
         "input_schema": {
             "type": "object",
@@ -74,12 +78,23 @@ PRICING_TOOLS = [
                 "purchase_column": {"type": "string", "description": "заголовок колонки закупки, дословно"},
                 "rrc_column": {"type": "string", "description": "заголовок колонки РРЦ; опустить, если её нет"},
                 "basis": {"type": "string", "description": "base_unit (цена за базовую ЕИ) или package (за упаковку)"},
-                "sheet": {"type": "string", "description": "лист с таблицей цен, если листов несколько"},
+                "sheet": {"type": "string", "description": "ИМЯ ЛИСТА, к которому относится трактовка. Обязательно, если листов несколько: у каждого листа своя запись, вызывай инструмент по разу на лист"},
                 "note": {"type": "string", "description": "чем именно был обусловлен выбор (слова админа)"},
             },
             "required": ["purchase_column"],
             "additionalProperties": False,
         },
+    },
+    {
+        "name": "get_product_scope",
+        "description": (
+            "Категории товаров, которые админ разрешил анализировать (задаются один раз "
+            "на все прайсы, а не на каждый файл). Разделы прайса других категорий "
+            "разбирать не нужно — их достаточно перечислить одной строкой в "
+            "предупреждениях. Пустой список означает, что ограничений нет. "
+            "Вызывай в начале работы с прайсом, до сопоставления. Без параметров."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "get_selling_tm",
@@ -273,6 +288,8 @@ class PricingTools:
                 return await self._read_with_mapping(inp)
             if name == "save_price_mapping":
                 return await self._save_mapping(inp)
+            if name == "get_product_scope":
+                return await self._product_scope()
             if name == "get_selling_tm":
                 return await asyncio.to_thread(self._selling_tm)
             if name == "get_1c_nomenclature":
@@ -301,41 +318,68 @@ class PricingTools:
         from src.email_tool.attachments import extract_text
         return price_signature([], extract_text(filename, content))
 
-    async def _read_with_mapping(self, inp: dict) -> str | list[dict]:
-        text = await asyncio.to_thread(self._read_price_file, inp)
-        signature = await asyncio.to_thread(self._signature)
-        if not signature:
-            return self._attach(text)
-        known = await self._store.get_mapping(signature)
-        if not known:
-            return self._attach(
-                text + "\n\n[Формат прайса встречается впервые: трактовку колонок нужно "
-                "определить, при неоднозначности — спросить админа и сохранить "
-                "через save_price_mapping.]")
+    @staticmethod
+    def _mapping_line(known: dict) -> str:
         m = known["mapping"]
         parts = [f"закупка = «{m.get('purchase_column')}»"]
         if m.get("rrc_column"):
             parts.append(f"РРЦ = «{m['rrc_column']}»")
         if m.get("basis"):
             parts.append(f"база цены: {m['basis']}")
-        if m.get("sheet"):
-            parts.append(f"лист: «{m['sheet']}»")
         note = f" Основание: {m['note']}." if m.get("note") else ""
-        return self._attach(text + "\n\n[ЗАПОМНЕННЫЙ МАППИНГ этого формата прайса"
-                + (f" (поставщик: {known['supplier']}" if known.get("supplier") else "")
-                + f", сохранён {known['updated_at'][:10]}): "
-                + "; ".join(parts) + f".{note} "
-                "Применяй его и НЕ переспрашивай админа. Если админ явно скажет иначе — "
-                "сохрани новую трактовку через save_price_mapping.]")
+        where = f"лист «{known['sheet']}»" if known.get("sheet") else "весь файл"
+        return f"— {where}: " + "; ".join(parts) + f".{note}"
+
+    async def _read_with_mapping(self, inp: dict) -> str | list[dict]:
+        text = await asyncio.to_thread(self._read_price_file, inp)
+        scope = await self._scope_note()
+        signature = await asyncio.to_thread(self._signature)
+        if not signature:
+            return self._attach(text + scope)
+        known = await self._store.get_mappings(signature)
+        if not known:
+            return self._attach(
+                text + scope
+                + "\n\n[Формат прайса встречается впервые: трактовку колонок нужно "
+                "определить, при неоднозначности — спросить админа и сохранить "
+                "через save_price_mapping (по одному вызову на КАЖДЫЙ лист с ценами).]")
+
+        supplier = next((k["supplier"] for k in known if k.get("supplier")), None)
+        covered = [k["sheet"] for k in known if k.get("sheet")]
+        block = ["\n\n[ЗАПОМНЕННЫЙ МАППИНГ этого формата прайса"
+                 + (f" (поставщик: {supplier})" if supplier else "") + ":"]
+        block += [self._mapping_line(k) for k in known]
+        # Раньше маппинг хранился один на файл, и агент сужал работу до его листа: у
+        # мультилистового прайса остальные листы молча выпадали (см. §6.5.1).
+        block.append(
+            "Применяй эти трактовки МОЛЧА, вопрос о колонках по ним не повторяй."
+            + (f" Запомнены только листы: {', '.join(covered)}. " if covered else " ")
+            + "ОСТАЛЬНЫЕ листы прайса это НЕ отменяет: разбери и их — определи колонки "
+              "сам, а при неоднозначности спроси админа и сохрани через "
+              "save_price_mapping с указанием листа. Пропускать лист можно только "
+              "потому, что его категория товара вне анализа, или потому, что так сказал "
+              "админ — но об этом всё равно скажи в предложении.]")
+        return self._attach(text + scope + "\n".join(block))
+
+    async def _product_scope(self) -> str:
+        scope = [c["category"] for c in await self._store.list_scope()]
+        return json.dumps({"categories": scope, "instruction": describe(scope)},
+                          ensure_ascii=False)
+
+    async def _scope_note(self) -> str:
+        scope = [c["category"] for c in await self._store.list_scope()]
+        return "\n\n[КАТЕГОРИИ ТОВАРОВ. " + describe(scope) + "]"
 
     async def _save_mapping(self, inp: dict) -> str:
         signature = await asyncio.to_thread(self._signature)
         if not signature:
             return "Не удалось вычислить сигнатуру прайса — маппинг не сохранён."
-        mapping = {k: v for k, v in inp.items() if k != "supplier" and v}
-        await self._store.save_mapping(signature, inp.get("supplier"), mapping)
-        return ("Маппинг сохранён: следующий прайс этого формата будет разобран без "
-                "вопросов о колонках.")
+        sheet = (inp.get("sheet") or "").strip()
+        mapping = {k: v for k, v in inp.items() if k not in ("supplier", "sheet") and v}
+        await self._store.save_mapping(signature, inp.get("supplier"), mapping, sheet)
+        where = f"листа «{sheet}»" if sheet else "этого прайса"
+        return (f"Маппинг {where} сохранён — трактовки других листов не затронуты. "
+                "Если в прайсе есть ещё листы с ценами, сохрани и их отдельными вызовами.")
 
     # -------------------------------------------------------------- эксклюзивы (§9.5)
 
@@ -542,10 +586,34 @@ class PricingTools:
 
     # -------------------------------------------------------------- предложение
 
+    def _unproposed(self, inp: dict, scope: list[str]) -> list[str]:
+        """ТМ, чью номенклатуру агент грузил, но в предложение не передал.
+
+        Ловит молчаливую потерю целого бренда: в прайсе Монарха так выпал весь лист
+        ламината вместе с AGT, и заметить это было нечем — `propose_prices` видит только
+        то, что модель ему передала.
+        """
+        proposed = {g.get("tm_code") for g in inp.get("groups") or []}
+        out = []
+        for tm_code, (_, nom) in _NOM_CACHE.items():
+            if tm_code in proposed or not nom.items:
+                continue
+            kinds = {i.product_type for i in nom.items if i.product_type}
+            if kinds and not any(in_scope(scope, k) for k in kinds):
+                continue                    # вся ТМ вне анализируемых категорий — так и надо
+            colls = {i.collection or i.parent for i in nom.items}
+            name = next((i.name.split()[0] for i in nom.items if i.name), tm_code)
+            out.append(
+                f"⚠️ Номенклатуру ТМ {name} ({tm_code}) я загружал — {len(nom.items)} поз., "
+                f"{len(colls)} коллекций, — но в предложение не попало ни одной. "
+                "Если это из-за необработанного листа прайса, скажите какого.")
+        return out
+
     async def _propose(self, inp: dict) -> str:
         today = date.today()
         results: list[GroupResult] = []
         problems: list[str] = []
+        scope = [c["category"] for c in await self._store.list_scope()]
 
         seen_tm: set[str] = set()
         for g in inp.get("groups", []):
@@ -564,11 +632,29 @@ class PricingTools:
             if not sel:
                 problems.append(f"коллекция {g.get('collection_ref')} не найдена у ТМ {g['tm_code']}")
                 continue
+            # категория вне анализа — не пишем, даже если модель коллекцию передала (§6.8)
+            kind = next((i.product_type for i in sel if i.product_type), None)
+            if not in_scope(scope, kind):
+                problems.append(
+                    f"⚠️ {sel[0].collection or g.get('collection_ref')} ({kind}) — категория "
+                    "не в списке анализируемых, цены не трогаю. Изменить: /categories")
+                continue
             results.append(plan_collection(
                 sel, g["tm_code"], g.get("tm_name", ""),
                 _dec(g.get("purchase")), _dec(g.get("rrc")), today))
 
+        problems += self._unproposed(inp, scope)
         payload = build_payload(results)
+        # новое предложение отменяет прежнее неподтверждённое, и старая кнопка перестаёт
+        # работать — молчать об этом нельзя, админ решит, что запись просто сломалась
+        if payload:
+            previous = await self._store.get_pending(self._user_id)
+            if previous:
+                problems.append(
+                    f"⚠️ Прежнее предложение ({previous.item_count} поз.) отменяется — "
+                    "кнопка под ним больше не сработает. Если его нужно было записать, "
+                    "скажите: соберу заново.")
+
         active, _ = resolve(*await self._store.load_exclusives())
         summary = self._render(inp, results, problems, payload, active)
         self.last_summary = summary
