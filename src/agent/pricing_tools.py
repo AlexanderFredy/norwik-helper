@@ -17,6 +17,9 @@ from decimal import Decimal, InvalidOperation
 
 from src.onec.client import NomItem, Nomenclature, OnecClient
 from src.price_tool.changes import GroupResult, build_payload, plan_collection
+from src.price_tool.exclusive import (
+    HINT_WORDS, WHERE_FOUND, annotate, find, resolve,
+)
 from src.price_tool.parser import extract_images, parse_price_table, render_preview
 from src.price_tool.signature import price_signature
 from src.storage.pricing import PricingStore
@@ -101,6 +104,67 @@ PRICING_TOOLS = [
                 "size": {"type": "integer"},
             },
             "required": ["tm_code"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "record_exclusives",
+        "description": (
+            "Запомнить, что поставщик заявил в прайсе ЭКСКЛЮЗИВ на коллекцию или товар "
+            "(«эксклюзив», «эксклюзивный дистрибьютор», «только у нас», «exclusive»). "
+            "Вызывай ПОСЛЕ сопоставления с 1С и ДО propose_prices, если такие надписи в "
+            "прайсе есть. Пометка чисто справочная — на цены она не влияет.\n"
+            "ВАЖНО: слово, входящее в САМО НАЗВАНИЕ товара или коллекции (коллекция "
+            "«Exclusive», «Kronotex Exclusive»), заявкой НЕ является — это имя, а не "
+            "заявление о правах. Засчитывай, только если надпись стоит ОТДЕЛЬНО: в "
+            "колонке-примечании, в строке-заголовке раздела, в имени листа или файла."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "supplier": {"type": "string", "description": "поставщик, чей это прайс"},
+                "price_date": {"type": "string", "description": "дата прайса ГГГГ-ММ-ДД; без неё — сегодняшняя"},
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tm_code": {"type": "string"},
+                            "tm_name": {"type": "string"},
+                            "collection_ref": {"type": "string", "description": "код папки-коллекции; опустить, если эксклюзив на всю ТМ"},
+                            "collection": {"type": "string"},
+                            "item_ref": {"type": "string", "description": "код товара, если эксклюзив на одну позицию"},
+                            "item_name": {"type": "string"},
+                            "phrase": {"type": "string", "description": "надпись из прайса ДОСЛОВНО"},
+                            "where_found": {"type": "string", "description": "column | header | sheet | filename | admin"},
+                        },
+                        "required": ["tm_code", "phrase", "where_found"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["supplier", "items"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "set_exclusive",
+        "description": (
+            "Записать решение админа по спорному эксклюзиву (когда несколько поставщиков "
+            "заявили его на одно и то же). Вызывай ТОЛЬКО после явного ответа админа. "
+            "supplier — кого он выбрал; чтобы снять пометку совсем, передай supplier = "
+            "\"none\"."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tm_code": {"type": "string"},
+                "collection_ref": {"type": "string"},
+                "item_ref": {"type": "string"},
+                "supplier": {"type": "string", "description": "выбранный поставщик либо \"none\""},
+                "note": {"type": "string", "description": "причина словами админа, если назвал"},
+            },
+            "required": ["tm_code", "supplier"],
             "additionalProperties": False,
         },
     },
@@ -213,6 +277,10 @@ class PricingTools:
                 return await asyncio.to_thread(self._selling_tm)
             if name == "get_1c_nomenclature":
                 return await asyncio.to_thread(self._nomenclature, inp)
+            if name == "record_exclusives":
+                return await self._record_exclusives(inp)
+            if name == "set_exclusive":
+                return await self._set_exclusive(inp)
             if name == "propose_prices":
                 return await self._propose(inp)
             return f"Неизвестный инструмент: {name}"
@@ -268,6 +336,63 @@ class PricingTools:
         await self._store.save_mapping(signature, inp.get("supplier"), mapping)
         return ("Маппинг сохранён: следующий прайс этого формата будет разобран без "
                 "вопросов о колонках.")
+
+    # -------------------------------------------------------------- эксклюзивы (§9.5)
+
+    async def _record_exclusives(self, inp: dict) -> str:
+        """Заявки об эксклюзиве из прайса + сообщение о спорах, если они возникли."""
+        supplier = (inp.get("supplier") or "").strip()
+        if not supplier:
+            return "Не указан поставщик — заявка об эксклюзиве не записана."
+        price_date = (inp.get("price_date") or "")[:10] or date.today().isoformat()
+
+        claims, in_name, bad_place = [], [], []
+        for item in inp.get("items") or []:
+            name = f"{item.get('collection') or ''} {item.get('item_name') or ''}".lower()
+            if any(word in name for word in HINT_WORDS):
+                # «Kronotex Exclusive» — это имя коллекции, а не заявление о правах;
+                # принять такую заявку значит навесить ложный эксклюзив на весь бренд
+                in_name.append(item.get("item_name") or item.get("collection") or "?")
+                continue
+            if item.get("where_found") not in WHERE_FOUND:
+                bad_place.append(item.get("item_name") or item.get("collection") or "?")
+                continue
+            claims.append({**item, "supplier": supplier, "price_date": price_date})
+
+        saved = await self._store.record_exclusive_claims(claims)
+        active, disputes = resolve(*await self._store.load_exclusives())
+
+        lines = [f"Заявки об эксклюзиве записаны: {saved} (из {len(inp.get('items') or [])})."]
+        if in_name:
+            lines.append(f"Пропущено — слово входит в само название ({len(in_name)}): "
+                         + ", ".join(in_name[:5])
+                         + ". Это имя коллекции, а не заявка. Если надпись всё-таки "
+                           "стоит отдельно, спроси админа и вызови set_exclusive.")
+        if bad_place:
+            lines.append(f"Пропущено — не указано, где найдена надпись ({len(bad_place)}): "
+                         + ", ".join(bad_place[:5]) + f". Ожидается одно из: {', '.join(WHERE_FOUND)}.")
+        for d in disputes:
+            lines.append(
+                f"⚠️ СПОР: на «{d.title}» эксклюзив заявили несколько поставщиков — "
+                + ", ".join(d.suppliers)
+                + ". Пометка не показывается, пока админ не выберет. Процитируй ему "
+                  "надписи из прайсов ("
+                + "; ".join(f"{c.supplier}: «{c.phrase}»" for c in d.claims)
+                + f"), спроси, за кем эксклюзив, и вызови set_exclusive (tm_code="
+                + f"{d.tm_code}, collection_ref={d.collection_ref or '—'}).")
+        if not disputes and saved:
+            lines.append("Спорных нет — пометка будет показываться в отчётах.")
+        return "\n".join(lines)
+
+    async def _set_exclusive(self, inp: dict) -> str:
+        raw = (inp.get("supplier") or "").strip()
+        supplier = None if raw.lower() in {"none", "нет", "-", ""} else raw
+        await self._store.set_exclusive_decision(
+            inp["tm_code"], inp.get("collection_ref") or "", inp.get("item_ref") or "",
+            supplier, inp.get("note"))
+        if supplier:
+            return f"Записано: эксклюзив за «{supplier}». Спрашивать об этом больше не буду."
+        return "Записано: эксклюзива нет, пометка снята."
 
     def _read_price_file(self, inp: dict) -> str:
         """Текст прайса; найденные картинки складывает в self._images (см. _attach)."""
@@ -444,7 +569,8 @@ class PricingTools:
                 _dec(g.get("purchase")), _dec(g.get("rrc")), today))
 
         payload = build_payload(results)
-        summary = self._render(inp, results, problems, payload)
+        active, _ = resolve(*await self._store.load_exclusives())
+        summary = self._render(inp, results, problems, payload, active)
         self.last_summary = summary
 
         if payload:
@@ -476,7 +602,7 @@ class PricingTools:
         }
 
     def _render(self, inp: dict, results: list[GroupResult], problems: list[str],
-                payload: list[dict]) -> str:
+                payload: list[dict], exclusives: dict | None = None) -> str:
         supplier = inp.get("supplier") or "поставщика"
         lines = [f"Обновляем цены от {supplier} на:"]
         by_tm: dict[str, list[GroupResult]] = {}
@@ -497,7 +623,9 @@ class PricingTools:
                     untouched.append(g.collection)
                     continue
                 total_items += len(g.to_write)
-                lines.append(f"  • {g.collection} — {len(g.plans)} поз.")
+                title = annotate(g.collection,
+                                 find(exclusives or {}, g.tm_code, g.collection_ref))
+                lines.append(f"  • {title} — {len(g.plans)} поз.")
                 for r in rows:
                     lines.append(f"      {r}")
             if untouched:

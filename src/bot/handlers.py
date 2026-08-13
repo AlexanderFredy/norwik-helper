@@ -7,8 +7,10 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
+from src.agent.prompts import build_system_prompt
 from src.bot.commands import build_help
 from src.bot.errors import describe_api_error
+from src.price_tool.exclusive import resolve
 from src.storage.users import UserStore
 
 logger = logging.getLogger(__name__)
@@ -107,7 +109,20 @@ async def cmd_help(message: Message, is_admin: bool, onec=None) -> None:
                          parse_mode="HTML")
 
 
-async def _process_query(message: Message, text: str, orchestrator, status_msg) -> None:
+async def _exclusives(pricing_store) -> dict:
+    """Пометки об эксклюзиве для промпта (§9.5). Сбой здесь не должен ронять ответ."""
+    if pricing_store is None:
+        return {}
+    try:
+        active, _ = resolve(*await pricing_store.load_exclusives())
+        return active
+    except Exception:                                  # noqa: BLE001
+        logger.exception("Не удалось прочитать эксклюзивы")
+        return {}
+
+
+async def _process_query(message: Message, text: str, orchestrator, status_msg,
+                         pricing_store=None) -> None:
     """Общая логика обработки запроса с обновлением статуса."""
 
     async def on_tool(name: str, _input: dict) -> None:
@@ -118,7 +133,9 @@ async def _process_query(message: Message, text: str, orchestrator, status_msg) 
             pass
 
     try:
-        answer = await orchestrator.handle_query(text, on_tool=on_tool)
+        answer = await orchestrator.handle_query(
+            text, on_tool=on_tool,
+            system=build_system_prompt(await _exclusives(pricing_store)))
     except Exception as exc:                           # noqa: BLE001
         logger.exception("Ошибка обработки запроса")
         await status_msg.edit_text(describe_api_error(
@@ -135,7 +152,8 @@ async def _process_query(message: Message, text: str, orchestrator, status_msg) 
 
 
 @router.message(F.voice)
-async def handle_voice(message: Message, orchestrator, openai_api_key: str | None) -> None:
+async def handle_voice(message: Message, orchestrator, openai_api_key: str | None,
+                       pricing_store=None) -> None:
     if not openai_api_key:
         await message.answer(
             "Транскрипция голосовых сообщений не настроена. "
@@ -171,13 +189,13 @@ async def handle_voice(message: Message, orchestrator, openai_api_key: str | Non
         return
 
     await status_msg.edit_text(f"Распознано: {text}\n\nОбрабатываю запрос...")
-    await _process_query(message, text, orchestrator, status_msg)
+    await _process_query(message, text, orchestrator, status_msg, pricing_store)
 
 
 @router.message()
-async def handle_query(message: Message, orchestrator) -> None:
+async def handle_query(message: Message, orchestrator, pricing_store=None) -> None:
     if not message.text:
         await message.answer("Пожалуйста, отправьте запрос текстом или голосовым сообщением")
         return
     status_msg = await message.answer("Обрабатываю запрос...")
-    await _process_query(message, message.text, orchestrator, status_msg)
+    await _process_query(message, message.text, orchestrator, status_msg, pricing_store)

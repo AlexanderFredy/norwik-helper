@@ -23,9 +23,11 @@ class Orchestrator:
         self,
         query: str,
         on_tool: Callable[[str, dict], Awaitable[None]] | None = None,
+        system: str | None = None,
     ) -> str:
         """Обрабатывает один запрос менеджера и возвращает текст ответа."""
-        text, _ = await self.handle_turn([{"role": "user", "content": query}], on_tool=on_tool)
+        text, _ = await self.handle_turn([{"role": "user", "content": query}],
+                                         on_tool=on_tool, system=system)
         return text
 
     async def handle_turn(

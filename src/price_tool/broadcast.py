@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+from src.price_tool.exclusive import annotate, find
 from src.price_tool.history import LABELS, ORDER, fmt_date, fmt_num
 
 
@@ -26,7 +27,7 @@ def _transition(rows: list[tuple[float | None, float]]) -> str | None:
     return f"у {len(rows)} поз."
 
 
-def _collection_line(group: dict, skip: set[str]) -> str | None:
+def _collection_line(group: dict, skip: set[str], exclusives: dict | None = None) -> str | None:
     items = [i for i in group.get("items", []) if i.get("ref") not in skip]
     by_kind: dict[str, list[tuple[float | None, float]]] = {}
     for item in items:
@@ -39,17 +40,20 @@ def _collection_line(group: dict, skip: set[str]) -> str | None:
         if kind in by_kind:
             parts.append(f"{LABELS[kind]} {_transition(by_kind[kind])}")
     touched = sum(1 for i in items if i.get("prices"))
-    return f"- {group.get('collection') or '?'} — {touched} товаров ({', '.join(parts)})"
+    title = annotate(group.get("collection") or "?",
+                     find(exclusives or {}, group.get("tm_code"), group.get("collection_ref")))
+    return f"- {title} — {touched} товаров ({', '.join(parts)})"
 
 
-def build_broadcast(digest: dict, failed_refs: set[str] | None = None) -> str | None:
+def build_broadcast(digest: dict, failed_refs: set[str] | None = None,
+                    exclusives: dict | None = None) -> str | None:
     """Сообщение менеджерам. None — если после отсева ошибок сообщать не о чем."""
     skip = failed_refs or set()
     by_tm: dict[str, list[str]] = {}
     counts: dict[str, int] = {}
 
     for group in digest.get("groups", []):
-        line = _collection_line(group, skip)
+        line = _collection_line(group, skip, exclusives)
         if not line:
             continue
         tm = group.get("tm_name") or group.get("tm_code") or "?"

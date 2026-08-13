@@ -20,6 +20,8 @@ ADMIN_COMMANDS = COMMON_COMMANDS + [
     BotCommand(command="cancel_price", description="Прекратить работу с прайсом"),
     BotCommand(command="mappings", description="Запомненные форматы прайсов"),
     BotCommand(command="mapping_forget", description="Забыть формат прайса"),
+    BotCommand(command="exclusives", description="Эксклюзивы поставщиков"),
+    BotCommand(command="exclusive_forget", description="Снять пометку эксклюзива"),
     BotCommand(command="adduser", description="Добавить пользователя"),
     BotCommand(command="removeuser", description="Удалить пользователя"),
     BotCommand(command="listusers", description="Список пользователей"),
@@ -50,6 +52,15 @@ _ADMIN_HELP = """
 /cancel_price — прекратить работу с текущим прайсом
 /mappings — какие форматы прайсов я уже разбираю без вопросов
 /mapping_forget &lt;номер&gt; — забыть формат, чтобы снова спросил про колонки
+
+<b>Эксклюзивы поставщиков</b>
+Если в прайсе написано «эксклюзив», я это запомню и буду добавлять пометку после
+названия в отчётах — например «Adventure (эксклюзив: Монарх Логистик)». На цены и
+выбор поставщика она не влияет. Если эксклюзив на одно и то же заявят двое, спрошу
+вас, за кем он, и до ответа показывать не буду.
+
+/exclusives — что помечено и что ждёт решения
+/exclusive_forget &lt;номер&gt; — снять пометку
 
 <b>Доступ к боту</b>
 /adduser &lt;id&gt; [имя] — добавить менеджера

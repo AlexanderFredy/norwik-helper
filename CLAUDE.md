@@ -54,6 +54,13 @@ Telegram (aiogram) → AuthMiddleware → handlers.py
 
 **NorwikClient** (`src/website_tool/norwik.py`) — поиск через `/search?query=`, цена из `itemprop="price" content="..."`. Один товар имеет несколько `<a href="item/...">` на странице (картинка + текст); выбирается лучший title через `_title_score()` (предпочтение кириллице и тексту с пробелами).
 
+**Эксклюзивы поставщиков** (`src/price_tool/exclusive.py`) — надпись «эксклюзив» в прайсе
+запоминается заявкой (`exclusive_claims`), действующая пометка **выводится** из заявок и
+решений админа (`exclusive_decisions`), а не хранится. Спор двух поставщиков в окне 2 мес →
+вопрос админу, пометка до ответа не показывается. Список эксклюзивов вкладывается в
+системный промпт (`build_system_prompt`), потому что у менеджерского агента нет кодов 1С,
+чтобы сопоставить свой ответ с БД. Функция справочная — на цены не влияет.
+
 **Авторизация** (`src/bot/auth.py`) — middleware проверяет whitelist в SQLite (`src/storage/users.py`). `ADMIN_TELEGRAM_ID` из конфига всегда проходит; добавляет `is_admin: bool` в данные обработчика.
 
 **Транскрипция голоса** (`src/bot/handlers.py`) — OpenAI Whisper API (`whisper-1`, `language="ru"`). Требует `OPENAI_API_KEY` в `.env`; без ключа возвращает пояснение пользователю.

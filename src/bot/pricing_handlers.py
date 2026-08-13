@@ -17,6 +17,7 @@ from src.agent.pricing_tools import PRICING_TOOLS, PricingTools, clear_nomenclat
 from src.agent.prompts import PRICING_PROMPT
 from src.bot.errors import describe_api_error
 from src.price_tool.broadcast import build_broadcast, journal_rows
+from src.price_tool.exclusive import resolve
 from src.storage.pricing import PricingStore
 from src.storage.users import UserStore
 
@@ -33,6 +34,8 @@ _STATUS = {
     "get_selling_tm": "Проверяю выгрузку ТМ в 1С...",
     "get_1c_nomenclature": "Загружаю номенклатуру из 1С...",
     "propose_prices": "Считаю изменения и розницу...",
+    "record_exclusives": "Запоминаю эксклюзивы поставщика...",
+    "set_exclusive": "Запоминаю решение по эксклюзиву...",
 }
 
 # Файл прайса живёт в памяти процесса на время диалога: в БД его класть незачем,
@@ -190,6 +193,69 @@ async def cmd_mapping_forget(message: Message, command: CommandObject,
         "Следующий прайс этого формата снова спросит, какую колонку считать закупкой.")
 
 
+async def _exclusive_entries(store: PricingStore) -> list[dict]:
+    """Пометки и споры одним пронумерованным списком — для /exclusives и /exclusive_forget."""
+    active, disputes = resolve(*await store.load_exclusives())
+    entries = [{"key": (e.tm_code, e.collection_ref, e.item_ref), "exc": e, "dispute": None}
+               for e in sorted(active.values(),
+                               key=lambda e: (e.tm_name or e.tm_code, e.collection))]
+    entries += [{"key": (d.tm_code, d.collection_ref, d.item_ref), "exc": None, "dispute": d}
+                for d in disputes]
+    return entries
+
+
+@router.message(Command("exclusives"))
+async def cmd_exclusives(message: Message, pricing_store: PricingStore, is_admin: bool) -> None:
+    """Эксклюзивы поставщиков (§9.5): что помечено и что ждёт решения."""
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+    entries = await _exclusive_entries(pricing_store)
+    if not entries:
+        await message.answer(
+            "Эксклюзивов пока нет. Они появляются сами, когда в прайсе встречается "
+            "надпись «эксклюзив» — отдельной колонкой, заголовком раздела или в имени листа.")
+        return
+
+    lines = ["Эксклюзивы поставщиков (пометка справочная, на цены не влияет):"]
+    for i, entry in enumerate(entries, 1):
+        if entry["dispute"]:
+            d = entry["dispute"]
+            lines.append(f"{i}. ⚠️ {d.title} — спорят: {', '.join(d.suppliers)}. "
+                         "Пометка не показывается, пока не решено.")
+            for c in d.claims:
+                lines.append(f"     {c.supplier}: «{c.phrase}» (прайс от {c.price_date})")
+            continue
+        e = entry["exc"]
+        title = e.item_name or " / ".join(p for p in (e.tm_name or e.tm_code, e.collection) if p)
+        how = "решение админа" if e.by_admin else f"прайс от {e.since}"
+        lines.append(f"{i}. {title} — {e.supplier} ({how})")
+    lines.append("\nСнять пометку: /exclusive_forget <номер>. Чтобы назначить эксклюзив "
+                 "или разрешить спор, скажите об этом при разборе прайса.")
+    await _send(message, "\n".join(lines))
+
+
+@router.message(Command("exclusive_forget"))
+async def cmd_exclusive_forget(message: Message, command: CommandObject,
+                               pricing_store: PricingStore, is_admin: bool) -> None:
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+    arg = (command.args or "").strip()
+    entries = await _exclusive_entries(pricing_store)
+    if not arg.isdigit() or not 1 <= int(arg) <= len(entries):
+        await message.answer("Укажите номер из /exclusives, например: /exclusive_forget 1")
+        return
+
+    tm_code, collection_ref, item_ref = entries[int(arg) - 1]["key"]
+    # решение «эксклюзива нет», а не удаление заявок: иначе следующий прайс с той же
+    # надписью вернёт пометку обратно
+    await pricing_store.set_exclusive_decision(tm_code, collection_ref, item_ref,
+                                               supplier=None, note="снято админом")
+    await message.answer("Пометка снята. Заявки поставщиков в прайсах на неё больше не влияют "
+                         "— вернуть можно, сказав об этом при разборе прайса.")
+
+
 def _is_price_reply(message: Message) -> bool:
     """Текст внутри открытого диалога по прайсу.
 
@@ -218,14 +284,14 @@ def _written_on(result: dict) -> str:
 
 
 async def _notify_managers(bot, store: UserStore, digest: dict, result: dict,
-                           admin_id: int) -> int:
+                           admin_id: int, exclusives: dict | None = None) -> int:
     """Короткое уведомление менеджерам (п.6 ТЗ). Админ его не получает — у него отчёт.
 
     Позиции с ошибками 1С исключаются: сообщить об изменении цены, которая не записалась,
     хуже, чем не сообщить вовсе.
     """
     failed = {e.get("ref") for e in (result.get("errors") or []) if e.get("ref")}
-    text = build_broadcast(digest, failed)
+    text = build_broadcast(digest, failed, exclusives)
     if not text:
         return 0
     sent = 0
@@ -290,8 +356,9 @@ async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: Pr
                 journal_rows(proposal.digest, _written_on(result), failed))
         except Exception:
             logger.exception("Не удалось записать журнал цен")   # цены в 1С уже записаны
+        active, _ = resolve(*await pricing_store.load_exclusives())
         sent = await _notify_managers(callback.message.bot, store, proposal.digest,
-                                      result, user_id)
+                                      result, user_id, active)
         if sent:
             report += f"\n\nМенеджерам отправлено уведомление: {sent}."
 

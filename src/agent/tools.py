@@ -12,6 +12,7 @@ from datetime import date
 from src.email_tool.attachments import excel_sheet_names, extract_text
 from src.email_tool.classifier import classify, parse_signature
 from src.email_tool.client import MailClient
+from src.price_tool.exclusive import find, resolve
 from src.price_tool.history import describe_group, describe_product
 from src.website_tool.norwik import NorwikClient
 
@@ -249,6 +250,13 @@ class ToolExecutor:
                     dates.append(price.date)
         return await self._pricing_store.price_sources(refs, dates)
 
+    async def _exclusives(self) -> dict:
+        """Действующие пометки об эксклюзиве (§9.5) — справочно, к ценам отношения не имеют."""
+        if self._pricing_store is None:
+            return {}
+        active, _ = resolve(*await self._pricing_store.load_exclusives())
+        return active
+
     async def _price_history(self, inp: dict) -> str:
         if self._onec is None:
             return "История цен недоступна: интеграция с 1С не настроена."
@@ -262,6 +270,10 @@ class ToolExecutor:
 
         nom = await asyncio.to_thread(self._onec.by_tm_all, tm.code)
         items = nom.items
+        active = await self._exclusives()
+
+        def exc_of(sample) -> object | None:
+            return find(active, tm.code, sample.collection_ref, sample.ref)
 
         def finish(text: str) -> str:
             """1С могла не отдать часть позиций — тогда ответ неполный, и это надо сказать."""
@@ -287,15 +299,17 @@ class ToolExecutor:
             if not found:
                 return finish(f"Товар «{product}» не найден у ТМ {tm.name}.")
             if len(found) == 1:
-                return finish(describe_product(found[0], sources))
+                return finish(describe_product(found[0], sources, exc_of(found[0])))
             if len(found) <= 5:
                 return finish("Подходит несколько товаров:\n" + "\n".join(
-                    describe_product(i, sources) for i in found))
-            return finish(describe_group(f"«{product}» у {tm.name}", found, sources))
+                    describe_product(i, sources, exc_of(i)) for i in found))
+            return finish(describe_group(f"«{product}» у {tm.name}", found, sources,
+                                        exc_of(found[0])))
 
         if collection:
             title = items[0].collection or items[0].parent or collection
-            return finish(describe_group(f"{tm.name} {title}", items, sources))
+            return finish(describe_group(f"{tm.name} {title}", items, sources,
+                                        exc_of(items[0])))
 
         # запрос по ТМ целиком — разбираем по коллекциям в той же логике (п.6 ТЗ)
         groups: dict[str, list] = {}
@@ -305,7 +319,7 @@ class ToolExecutor:
         ordered = sorted(groups.values(), key=lambda g: (g[0].collection or g[0].parent or ""))
         for group in ordered[:40]:
             title = group[0].collection or group[0].parent or "без коллекции"
-            lines.append("• " + describe_group(title, group, sources))
+            lines.append("• " + describe_group(title, group, sources, exc_of(group[0])))
         if len(ordered) > 40:
             lines.append(f"... и ещё {len(ordered) - 40} коллекций — уточни, какая нужна.")
         return finish("\n".join(lines))

@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections import Counter
 
 from src.onec.client import NomItem
+from src.price_tool.exclusive import annotate
 
 LABELS = {"purchase": "закуп", "rrc": "РРЦ", "retail": "наша роз."}
 ORDER = ["purchase", "rrc", "retail"]
@@ -86,17 +87,18 @@ def _body(prices: dict[str, tuple[float, str | None]], with_dates: bool) -> str:
     return ", ".join(f"{LABELS[k]} {fmt_num(v)}" for k, (v, _) in prices.items())
 
 
-def describe_product(item: NomItem, sources: dict) -> str:
+def describe_product(item: NomItem, sources: dict, exc=None) -> str:
     """Точечный товар: «закуп 1050, РРЦ 1550, наша роз. 1200 от 20.07.2026. Прайс …»."""
     prices = _prices(item)
+    name = annotate(item.name, exc)
     if not prices:
-        return f"{item.name}: цены в 1С не заданы."
+        return f"{name}: цены в 1С не заданы."
 
     dates = {d for _, d in prices.values()}
     if len(dates) == 1:
         date = next(iter(dates))
         tail = f" от {fmt_date(date)}." if date else "."
-        return f"{item.name}: {_body(prices, False)}{tail}{_source(item.ref, date, sources)}"
+        return f"{name}: {_body(prices, False)}{tail}{_source(item.ref, date, sources)}"
 
     # разные виды цен менялись в разные дни — дата у каждого, источники по всем датам
     seen, tails = set(), []
@@ -105,11 +107,12 @@ def describe_product(item: NomItem, sources: dict) -> str:
         if src and src not in seen:
             seen.add(src)
             tails.append(src)
-    return f"{item.name}: {_body(prices, True)}." + "".join(tails)
+    return f"{name}: {_body(prices, True)}." + "".join(tails)
 
 
-def describe_group(title: str, items: list[NomItem], sources: dict) -> str:
+def describe_group(title: str, items: list[NomItem], sources: dict, exc=None) -> str:
     """Коллекция или ТМ целиком — без перечисления товаров (п.6 ТЗ)."""
+    title = annotate(title, exc)
     priced = [i for i in items if _prices(i)]
     if not priced:
         return f"{title}: цены в 1С не заданы."
