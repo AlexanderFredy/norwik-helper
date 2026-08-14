@@ -89,10 +89,63 @@ class GroupResult:
     collection_ref: str
     collection: str
     plans: list[ItemPlan]
+    pack: Decimal | None = None      # коэффициент упаковки из alt_units — для проверки ЕИ
+    unit: str = ""                   # базовая ЕИ 1С (м2, шт.) — для текста предупреждения
 
     @property
     def to_write(self) -> list[ItemPlan]:
         return [p for p in self.plans if p.prices]
+
+
+# Скачок, за которым обычно стоит не движение рынка, а перепутанная колонка или единица
+# измерения. Порог намеренно высокий: настоящие подорожания на 20–30% бывают регулярно.
+JUMP_RATIO = Decimal("1.5")
+# Насколько отношение новой цены к старой должно совпасть с коэффициентом упаковки,
+# чтобы назвать причину прямо, а не ограничиться общим «проверьте».
+PACK_TOLERANCE = Decimal("0.08")
+
+_LABEL = {"purchase": "закупка", "rrc": "РРЦ", "retail": "розница"}
+
+
+def _num(value: Decimal) -> str:
+    return f"{value:,.0f}".replace(",", " ") if value == value.to_integral_value() \
+        else f"{value:,.2f}".replace(",", " ")
+
+
+def unit_warnings(group: GroupResult) -> list[str]:
+    """Подозрительные скачки цен по коллекции.
+
+    Главный случай — цена за упаковку, попавшая в поле цены за базовую ЕИ (§6.3): в 1С
+    закупка хранится за м², а в прайсе колонка бывает за упаковку. Ошибка не выглядит
+    ошибкой — просто цена вдвое выше, — но отношение новой цены к старой совпадает с
+    коэффициентом упаковки, и это можно назвать вслух.
+    """
+    seen: set[tuple] = set()
+    out: list[str] = []
+    for plan in group.plans:
+        for kind, new in plan.prices.items():
+            old = plan.before.get(kind)
+            if old is None or old <= 0 or new <= 0:
+                continue
+            ratio = new / old
+            if JUMP_RATIO > ratio > 1 / JUMP_RATIO:
+                continue
+            key = (kind, old, new)
+            if key in seen:
+                continue
+            seen.add(key)
+            pct = (ratio - 1) * Decimal("100")
+            head = (f"⚠️ {group.collection}: {_LABEL.get(kind, kind)} "
+                    f"{_num(old)} → {_num(new)} ({pct:+.0f}%)")
+            pack = group.pack
+            if pack and pack > 1 and abs(ratio - pack) / pack <= PACK_TOLERANCE:
+                out.append(
+                    f"{head}. Отношение {ratio:.2f} совпадает с упаковкой {pack} — похоже, "
+                    f"это цена ЗА УПАКОВКУ, а не за {group.unit or 'базовую ЕИ'}. "
+                    f"За единицу вышло бы {_num(new / pack)}. Проверьте колонку прайса.")
+            else:
+                out.append(f"{head} — проверьте колонку прайса и единицу измерения.")
+    return out
 
 
 def plan_collection(items: list[NomItem], tm_code: str, tm_name: str,
@@ -106,7 +159,19 @@ def plan_collection(items: list[NomItem], tm_code: str, tm_name: str,
                        collection_ref=first.collection_ref if first else "",
                        collection=(first.collection or first.parent or "без коллекции")
                        if first else "",
-                       plans=plans)
+                       plans=plans,
+                       pack=_pack(first), unit=first.unit if first else "")
+
+
+def _pack(item: NomItem | None) -> Decimal | None:
+    """Коэффициент упаковки: сколько базовых ЕИ в одной упаковке (alt_units)."""
+    if item is None or not item.alt_units:
+        return None
+    try:
+        value = Decimal(str(next(iter(item.alt_units.values()))))
+    except (StopIteration, ValueError, TypeError):
+        return None
+    return value if value > 0 else None
 
 
 def build_payload(groups: list[GroupResult]) -> list[dict]:

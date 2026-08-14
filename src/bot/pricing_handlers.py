@@ -32,6 +32,7 @@ MAX_FILE_BYTES = 20 * 1024 * 1024
 _STATUS = {
     "read_price_file": "Читаю прайс...",
     "get_product_scope": "Смотрю, какие категории анализируем...",
+    "start_price_run": "Составляю план по маркам...",
     "save_price_mapping": "Запоминаю формат прайса...",
     "get_selling_tm": "Проверяю выгрузку ТМ в 1С...",
     "get_1c_nomenclature": "Загружаю номенклатуру из 1С...",
@@ -88,8 +89,11 @@ async def _deliver(progress: Message, message: Message, text: str) -> None:
 
 
 async def _run(message: Message, user_text: str, orchestrator, onec, store: PricingStore,
-               status_msg: Message) -> None:
-    user_id = message.from_user.id
+               status_msg: Message, user_id: int | None = None) -> None:
+    # user_id передаётся явно, когда ход инициирует не админ, а мы сами — после нажатия
+    # кнопки (§9.6): там `message` это сообщение БОТА, и from_user в нём — бот, а не админ
+    if user_id is None:
+        user_id = message.from_user.id
     tools = PricingTools(onec, store, user_id)
     if user_id in _files:
         tools.set_file(*_files[user_id])
@@ -148,6 +152,7 @@ async def handle_price_document(message: Message, orchestrator, onec, pricing_st
     await message.bot.download_file(file_info.file_path, destination=buf)
     _files[message.from_user.id] = (doc.file_name, buf.getvalue())
     await pricing_store.reset(message.from_user.id)   # новый прайс — новый диалог
+    await pricing_store.clear_run(message.from_user.id)   # и новый план по маркам
     clear_nomenclature_cache()                        # и свежие цены из 1С
 
     caption = (message.caption or "").strip()
@@ -159,6 +164,7 @@ async def handle_price_document(message: Message, orchestrator, onec, pricing_st
 async def cmd_cancel(message: Message, pricing_store: PricingStore) -> None:
     _files.pop(message.from_user.id, None)
     await pricing_store.reset(message.from_user.id)
+    await pricing_store.clear_run(message.from_user.id)
     await message.answer("Работа с прайсом прекращена, предложение отменено.")
 
 
@@ -416,7 +422,7 @@ async def _notify_managers(bot, store: UserStore, digest: dict, result: dict,
 
 @router.callback_query(F.data.startswith("price:"))
 async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: PricingStore,
-                                store: UserStore, is_admin: bool) -> None:
+                                store: UserStore, is_admin: bool, orchestrator=None) -> None:
     _, action, raw_id = callback.data.split(":")
     user_id = callback.from_user.id
     if not is_admin:
@@ -480,15 +486,37 @@ async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: Pr
                   "Подробный отчёт собрать не удалось — смотрите логи. "
                   "Записанное можно проверить в 1С и через «когда меняли цены».")
 
+    tm_code = next((g.get("tm_code") for g in (proposal.digest or {}).get("groups") or []
+                    if g.get("tm_code")), None)
+    run = await pricing_store.mark_tm_done(user_id, tm_code) if tm_code else None
+    if run and run["remaining"]:
+        report += ("\n\nОсталось обработать: "
+                   + ", ".join(t["name"] for t in run["remaining"]) + ".")
     await _deliver(progress, callback.message, report)
 
-    # цены записаны — выходим из режима прайса, иначе следующий обычный вопрос
+    clear_nomenclature_cache()      # цены в 1С изменились — кэш устарел
+
+    if run and run["remaining"]:
+        # прайс разобран не весь: продолжаем тем же диалогом — файл и история на месте,
+        # иначе админу пришлось бы присылать файл заново на каждую марку (§9.6)
+        nxt = run["remaining"][0]
+        status = await callback.message.answer(f"Перехожу к марке {nxt['name']}...")
+        await _run(callback.message,
+                   f"Цены записаны. Продолжай со следующей марки: {nxt['name']} "
+                   f"(код {nxt['code']}). Сопоставь её коллекции и вызови propose_prices "
+                   "только по ней.",
+                   orchestrator, onec, pricing_store, status, user_id=user_id)
+        return
+
+    # прайс пройден целиком — выходим из режима, иначе следующий обычный вопрос
     # админа будет истолкован как ответ по прайсу
+    doc = (run or {}).get("price_doc") or (run or {}).get("supplier")
     _files.pop(user_id, None)
     await pricing_store.reset(user_id)
-    clear_nomenclature_cache()      # цены в 1С изменились — кэш устарел
+    await pricing_store.clear_run(user_id)
     await callback.message.answer(
-        "Работа с прайсом завершена. Пришлите следующий файл, когда понадобится.")
+        (f"Прайс «{doc}» обработан полностью." if doc else "Работа с прайсом завершена.")
+        + " Пришлите следующий файл, когда понадобится.")
 
 
 def _price_label(kind: str) -> str:

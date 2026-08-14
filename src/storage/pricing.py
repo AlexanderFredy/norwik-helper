@@ -48,6 +48,16 @@ CREATE TABLE IF NOT EXISTS pending_proposal (
 );
 CREATE INDEX IF NOT EXISTS ix_pending_user ON pending_proposal (user_id, status);
 {mappings}
+-- Прогон прайса по маркам (§9.6): что запланировали и что уже записали. Живёт между
+-- ходами диалога И нажатиями кнопки, поэтому в БД, а не в памяти процесса.
+CREATE TABLE IF NOT EXISTS price_run (
+    user_id    INTEGER PRIMARY KEY,
+    supplier   TEXT,
+    price_doc  TEXT,
+    planned    TEXT NOT NULL,       -- JSON: [{code, name}] в порядке обработки
+    done       TEXT NOT NULL,       -- JSON: [code] уже обработанных
+    started_at TEXT NOT NULL
+);
 -- Категории товаров, которые вообще анализируем (§6.8). Пусто = ограничений нет.
 -- Задаётся один раз на все прайсы, а не на каждый файл.
 CREATE TABLE IF NOT EXISTS product_scope (
@@ -431,6 +441,51 @@ class PricingStore:
                 "updated_at = excluded.updated_at",
                 (signature, sheet or "", supplier, json.dumps(mapping, ensure_ascii=False),
                  _now()))
+            await db.commit()
+
+    # ----------------------------------------------- прогон прайса по маркам (§9.6)
+
+    async def start_run(self, user_id: int, supplier: str | None, price_doc: str | None,
+                        trademarks: list[dict]) -> None:
+        """Новый прогон заменяет прежний: один прайс у админа в работе за раз."""
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO price_run (user_id, supplier, price_doc, planned, done, "
+                "started_at) VALUES (?, ?, ?, ?, '[]', ?) ON CONFLICT(user_id) DO UPDATE SET "
+                "supplier = excluded.supplier, price_doc = excluded.price_doc, "
+                "planned = excluded.planned, done = '[]', started_at = excluded.started_at",
+                (user_id, supplier, price_doc,
+                 json.dumps(trademarks, ensure_ascii=False), _now()))
+            await db.commit()
+
+    async def get_run(self, user_id: int) -> dict | None:
+        """{supplier, price_doc, planned, done, remaining} либо None."""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT supplier, price_doc, planned, done FROM price_run WHERE user_id = ?",
+                (user_id,))
+            row = await cur.fetchone()
+        if not row:
+            return None
+        planned, done = json.loads(row[2]), set(json.loads(row[3]))
+        return {"supplier": row[0], "price_doc": row[1], "planned": planned, "done": done,
+                "remaining": [t for t in planned if t.get("code") not in done]}
+
+    async def mark_tm_done(self, user_id: int, tm_code: str) -> dict | None:
+        """Отметить марку обработанной; возвращает обновлённое состояние прогона."""
+        run = await self.get_run(user_id)
+        if run is None:
+            return None
+        done = sorted(run["done"] | {tm_code})
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("UPDATE price_run SET done = ? WHERE user_id = ?",
+                             (json.dumps(done, ensure_ascii=False), user_id))
+            await db.commit()
+        return await self.get_run(user_id)
+
+    async def clear_run(self, user_id: int) -> None:
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("DELETE FROM price_run WHERE user_id = ?", (user_id,))
             await db.commit()
 
     # -------------------------------------------------- категории товаров (§6.8)

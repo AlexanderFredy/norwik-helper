@@ -16,7 +16,9 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from src.onec.client import NomItem, Nomenclature, OnecClient
-from src.price_tool.changes import GroupResult, build_payload, plan_collection
+from src.price_tool.changes import (
+    GroupResult, build_payload, plan_collection, unit_warnings,
+)
 from src.price_tool.exclusive import (
     HINT_WORDS, WHERE_FOUND, annotate, find, resolve,
 )
@@ -82,6 +84,38 @@ PRICING_TOOLS = [
                 "note": {"type": "string", "description": "чем именно был обусловлен выбор (слова админа)"},
             },
             "required": ["purchase_column"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "start_price_run",
+        "description": (
+            "Объявить план работы: какие торговые марки прайса ты будешь обрабатывать. "
+            "Вызывай ОДИН раз, после get_selling_tm и определения брендов, до первого "
+            "сопоставления. Перечисли только те ТМ, что есть в выгрузке и подходят по "
+            "категориям товаров. Дальше марки обрабатываются ПО ОДНОЙ: сопоставил → "
+            "propose_prices по этой марке → админ нажал кнопку → переходишь к следующей."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "supplier": {"type": "string"},
+                "price_doc": {"type": "string", "description": "как называть прайс в отчётах"},
+                "trademarks": {
+                    "type": "array",
+                    "description": "в порядке обработки",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "code": {"type": "string", "description": "код ТМ из get_selling_tm"},
+                            "name": {"type": "string"},
+                        },
+                        "required": ["code", "name"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["trademarks"],
             "additionalProperties": False,
         },
     },
@@ -288,6 +322,8 @@ class PricingTools:
                 return await self._read_with_mapping(inp)
             if name == "save_price_mapping":
                 return await self._save_mapping(inp)
+            if name == "start_price_run":
+                return await self._start_run(inp)
             if name == "get_product_scope":
                 return await self._product_scope()
             if name == "get_selling_tm":
@@ -360,6 +396,30 @@ class PricingTools:
               "потому, что его категория товара вне анализа, или потому, что так сказал "
               "админ — но об этом всё равно скажи в предложении.]")
         return self._attach(text + scope + "\n".join(block))
+
+    async def _start_run(self, inp: dict) -> str:
+        tms = [{"code": t["code"], "name": t.get("name") or t["code"]}
+               for t in inp.get("trademarks") or [] if t.get("code")]
+        if not tms:
+            return "Не переданы торговые марки — план не принят."
+        doc = inp.get("price_doc") or (self._file[0] if self._file else None)
+        await self._store.start_run(self._user_id, inp.get("supplier"), doc, tms)
+        names = ", ".join(t["name"] for t in tms)
+        return (f"План принят: {len(tms)} марок — {names}.\n"
+                f"Обрабатывай ПО ОДНОЙ, начни с «{tms[0]['name']}»: сопоставь её коллекции "
+                "и вызови propose_prices только по ней. К следующей переходи после того, "
+                "как админ нажмёт кнопку.")
+
+    @staticmethod
+    def _remaining_line(run: dict | None) -> str:
+        """Хвост сообщения: что ещё предстоит. Пустой прогон — без хвоста."""
+        if not run:
+            return ""
+        left = [t["name"] for t in run["remaining"]]
+        if not left:
+            doc = run.get("price_doc") or run.get("supplier") or "прайс"
+            return f"\n\nПрайс «{doc}» обработан полностью."
+        return f"\n\nОсталось обработать: {', '.join(left)}."
 
     async def _product_scope(self) -> str:
         scope = [c["category"] for c in await self._store.list_scope()]
@@ -615,6 +675,15 @@ class PricingTools:
         problems: list[str] = []
         scope = [c["category"] for c in await self._store.list_scope()]
 
+        # Одна марка за вызов (§9.6): админ смотрит и подтверждает бренд целиком, а не
+        # простыню по всему прайсу. Заодно короче отчёт и понятнее, что осталось.
+        tms = {g.get("tm_code") for g in inp.get("groups") or [] if g.get("tm_code")}
+        if len(tms) > 1:
+            names = ", ".join(sorted(tms))
+            return (f"Передано несколько ТМ сразу ({names}). Обрабатывай по одной: вызови "
+                    "propose_prices только по первой марке, а к следующей переходи после "
+                    "того, как админ нажмёт кнопку по этой.")
+
         seen_tm: set[str] = set()
         for g in inp.get("groups", []):
             nom = await asyncio.to_thread(self._nom, g["tm_code"])
@@ -659,11 +728,25 @@ class PricingTools:
         summary = self._render(inp, results, problems, payload, active)
         self.last_summary = summary
 
+        tm_code = next(iter(tms), None)
         if payload:
             await self._store.save_proposal(self._user_id, payload, summary,
                                             digest=self._digest(inp, results))
-            return (summary + "\n\n[Предложение сохранено. Покажи этот текст админу дословно "
-                    "и жди нажатия кнопки — сам ничего не записывай.]")
+            run = await self._store.get_run(self._user_id)
+            left = [t["name"] for t in run["remaining"] if t["code"] != tm_code] if run else []
+            tail = f"\n\nОсталось обработать: {', '.join(left)}." if left else ""
+            return (summary + tail
+                    + "\n\n[Предложение сохранено. Покажи этот текст админу дословно "
+                      "и жди нажатия кнопки — сам ничего не записывай и к следующей марке "
+                      "НЕ переходи: я сам скажу, когда админ подтвердит.]")
+
+        # писать нечего — подтверждать нечего, марку закрываем сразу и идём дальше
+        run = await self._store.mark_tm_done(self._user_id, tm_code) if tm_code else None
+        summary += self._remaining_line(run)
+        if run and run["remaining"]:
+            nxt = run["remaining"][0]["name"]
+            return (summary + f"\n\n[Записывать нечего, кнопки не будет. Покажи текст админу "
+                    f"и сразу продолжай со следующей марки: {nxt}.]")
         return summary + "\n\n[Записывать нечего — кнопка подтверждения не появится.]"
 
     def _digest(self, inp: dict, results: list[GroupResult]) -> dict:
@@ -720,7 +803,12 @@ class PricingTools:
                 lines.append(f"  • без изменений ({len(untouched)}): {shown}{tail}")
         lines.append("?")
 
-        warns = list(inp.get("warnings") or []) + problems
+        # скачки, похожие на перепутанную ЕИ, идут ПЕРВЫМИ: среди трёх десятков строк
+        # «+102%» теряется, а это самая дорогая ошибка режима (§9.1.1)
+        suspicious: list[str] = []
+        for g in results:
+            suspicious += unit_warnings(g)
+        warns = suspicious + list(inp.get("warnings") or []) + problems
         for g in results:
             below_p = [p for p in g.plans if p.warning == "rrc_below_purchase"]
             below_r = [p for p in g.plans if p.warning == "rrc_below_retail"]
