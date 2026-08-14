@@ -120,6 +120,29 @@ PRICING_TOOLS = [
         },
     },
     {
+        "name": "add_final_note",
+        "description": (
+            "Отложить замечание, которое относится к ПРАЙСУ ЦЕЛИКОМ, а не к текущей марке. "
+            "Оно будет показано админу ОДИН раз, в самом конце, перед «прайс обработан "
+            "полностью». Повторы отсеиваются автоматически.\n"
+            "Сюда: бренды прайса не из выгрузки на сайт; листы других категорий товаров; "
+            "листы, которые не разбирались, и почему; общие замечания по файлу.\n"
+            "НЕ сюда (это в warnings текущего предложения): несопоставленные коллекции "
+            "разбираемой марки, её коллекции из 1С без строк в прайсе, вопросы и "
+            "расхождения по ней. Правило простое: относится к одной марке — в предложение, "
+            "ко всему файлу — сюда."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "notes": {"type": "array", "items": {"type": "string"},
+                          "description": "по одной законченной формулировке на элемент"},
+            },
+            "required": ["notes"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "get_product_scope",
         "description": (
             "Категории товаров, которые админ разрешил анализировать (задаются один раз "
@@ -324,6 +347,8 @@ class PricingTools:
                 return await self._save_mapping(inp)
             if name == "start_price_run":
                 return await self._start_run(inp)
+            if name == "add_final_note":
+                return await self._add_note(inp)
             if name == "get_product_scope":
                 return await self._product_scope()
             if name == "get_selling_tm":
@@ -410,16 +435,13 @@ class PricingTools:
                 "и вызови propose_prices только по ней. К следующей переходи после того, "
                 "как админ нажмёт кнопку.")
 
-    @staticmethod
-    def _remaining_line(run: dict | None) -> str:
-        """Хвост сообщения: что ещё предстоит. Пустой прогон — без хвоста."""
-        if not run:
-            return ""
-        left = [t["name"] for t in run["remaining"]]
-        if not left:
-            doc = run.get("price_doc") or run.get("supplier") or "прайс"
-            return f"\n\nПрайс «{doc}» обработан полностью."
-        return f"\n\nОсталось обработать: {', '.join(left)}."
+    async def _add_note(self, inp: dict) -> str:
+        added = await self._store.add_run_notes(self._user_id, inp.get("notes") or [])
+        if not added:
+            return ("Замечание уже записано (или прогон не начат) — повторять его в тексте "
+                    "предложения не нужно.")
+        return (f"Отложено до конца прайса: {added}. В предложение по текущей марке это "
+                "НЕ включай — админ увидит всё разом после последней марки.")
 
     async def _product_scope(self) -> str:
         scope = [c["category"] for c in await self._store.list_scope()]
@@ -742,11 +764,13 @@ class PricingTools:
 
         # писать нечего — подтверждать нечего, марку закрываем сразу и идём дальше
         run = await self._store.mark_tm_done(self._user_id, tm_code) if tm_code else None
-        summary += self._remaining_line(run)
         if run and run["remaining"]:
             nxt = run["remaining"][0]["name"]
-            return (summary + f"\n\n[Записывать нечего, кнопки не будет. Покажи текст админу "
-                    f"и сразу продолжай со следующей марки: {nxt}.]")
+            return (summary + "\n\nОсталось обработать: "
+                    + ", ".join(t["name"] for t in run["remaining"])
+                    + f".\n\n[Записывать нечего, кнопки не будет. Покажи текст админу "
+                      f"и сразу продолжай со следующей марки: {nxt}.]")
+        # итоговый блок и выход из режима печатает обработчик — он один на оба пути
         return summary + "\n\n[Записывать нечего — кнопка подтверждения не появится.]"
 
     def _digest(self, inp: dict, results: list[GroupResult]) -> dict:

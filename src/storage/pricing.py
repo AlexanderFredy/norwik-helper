@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS price_run (
     price_doc  TEXT,
     planned    TEXT NOT NULL,       -- JSON: [{code, name}] в порядке обработки
     done       TEXT NOT NULL,       -- JSON: [code] уже обработанных
+    notes      TEXT NOT NULL DEFAULT '[]',  -- замечания по прайсу в целом: показать в конце
     started_at TEXT NOT NULL
 );
 -- Категории товаров, которые вообще анализируем (§6.8). Пусто = ограничений нет.
@@ -147,6 +148,10 @@ class PricingStore:
             columns = {row[1] for row in await cur.fetchall()}
             if "digest" not in columns:
                 await db.execute("ALTER TABLE pending_proposal ADD COLUMN digest TEXT")
+            cur = await db.execute("PRAGMA table_info(price_run)")
+            if "notes" not in {row[1] for row in await cur.fetchall()}:
+                await db.execute("ALTER TABLE price_run ADD COLUMN notes TEXT "
+                                 "NOT NULL DEFAULT '[]'")
             await self._migrate_mappings(db)
             await db.commit()
 
@@ -462,14 +467,37 @@ class PricingStore:
         """{supplier, price_doc, planned, done, remaining} либо None."""
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT supplier, price_doc, planned, done FROM price_run WHERE user_id = ?",
-                (user_id,))
+                "SELECT supplier, price_doc, planned, done, notes FROM price_run "
+                "WHERE user_id = ?", (user_id,))
             row = await cur.fetchone()
         if not row:
             return None
         planned, done = json.loads(row[2]), set(json.loads(row[3]))
         return {"supplier": row[0], "price_doc": row[1], "planned": planned, "done": done,
+                "notes": json.loads(row[4] or "[]"),
                 "remaining": [t for t in planned if t.get("code") not in done]}
+
+    async def add_run_notes(self, user_id: int, notes: list[str]) -> int:
+        """Замечания по прайсу в целом — копятся и показываются один раз, в конце (§9.6).
+
+        Повторы отсеиваются: одно и то же наблюдение («бренд не в выгрузке») агент делает
+        при разборе каждой марки, а админу оно нужно однажды.
+        """
+        run = await self.get_run(user_id)
+        if run is None:
+            return 0
+        merged = list(run["notes"])
+        seen = {n.strip().lower() for n in merged}
+        for note in notes:
+            text = (note or "").strip()
+            if text and text.lower() not in seen:
+                seen.add(text.lower())
+                merged.append(text)
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("UPDATE price_run SET notes = ? WHERE user_id = ?",
+                             (json.dumps(merged, ensure_ascii=False), user_id))
+            await db.commit()
+        return len(merged) - len(run["notes"])
 
     async def mark_tm_done(self, user_id: int, tm_code: str) -> dict | None:
         """Отметить марку обработанной; возвращает обновлённое состояние прогона."""

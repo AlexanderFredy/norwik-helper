@@ -98,12 +98,14 @@ class ProposePerTmTest(unittest.IsolatedAsyncioTestCase):
         run = await self.store.get_run(42)
         self.assertEqual([t["name"] for t in run["remaining"]], ["Classen", "AGT"])
 
-    async def test_last_tm_without_changes_finishes_the_run(self):
+    async def test_last_tm_without_changes_closes_the_plan(self):
+        """Итог печатает обработчик — инструмент только закрывает марку."""
         for code in ("T1", "T2"):
             await self.store.mark_tm_done(42, code)
         text = await self.tools.execute("propose_prices",
                                         {"groups": [self._group("T3", purchase=949)]})
-        self.assertIn("Прайс «Монарх-логистик» обработан полностью", text)
+        self.assertNotIn("Осталось обработать", text)
+        self.assertEqual((await self.store.get_run(42))["remaining"], [])
 
     async def test_works_without_a_run(self):
         """Прогон мог не стартовать (простой однобрендовый прайс) — не падаем."""
@@ -111,6 +113,79 @@ class ProposePerTmTest(unittest.IsolatedAsyncioTestCase):
         text = await self.tools.execute("propose_prices", {"groups": [self._group("T1")]})
         self.assertNotIn("Осталось обработать", text)
         self.assertIn("К записи:", text)
+
+
+class FinalNotesTest(unittest.IsolatedAsyncioTestCase):
+    """Замечания по прайсу целиком: копятся молча, показываются один раз в конце (§9.6)."""
+
+    async def asyncSetUp(self):
+        clear_nomenclature_cache()
+        self._dir = tempfile.TemporaryDirectory()
+        self.store = PricingStore(Path(self._dir.name) / "t.db")
+        await self.store.init()
+        self.tools = PricingTools(FakeOnec([item("YO-1", 949)]), self.store, user_id=42)
+        await self.store.start_run(42, "Монарх", "Монарх-логистик", TMS)
+        self.chat = FakeChat()
+
+    async def asyncTearDown(self):
+        self._dir.cleanup()
+        ph._files.pop(42, None)
+
+    async def _note(self, *notes):
+        return await self.tools.execute("add_final_note", {"notes": list(notes)})
+
+    async def test_notes_are_kept_out_of_the_current_proposal(self):
+        text = await self._note("Бренды не в выгрузке: Betta, Aura")
+        self.assertIn("Отложено до конца прайса: 1", text)
+        proposal = await self.tools.execute("propose_prices", {"groups": [
+            {"tm_code": "T1", "tm_name": "Egger", "collection_ref": "YO-C",
+             "purchase": 999}]})
+        self.assertNotIn("Betta", proposal)
+
+    async def test_repeats_are_dropped(self):
+        """Одно и то же наблюдение агент делает на каждой марке — админу оно нужно раз."""
+        await self._note("Листы «Плинтус», «Подложка» — другие категории")
+        text = await self._note("листы «Плинтус», «Подложка» — другие категории  ")
+        self.assertIn("уже записано", text)
+        self.assertEqual(len((await self.store.get_run(42))["notes"]), 1)
+
+    async def test_shown_once_at_the_end(self):
+        await self._note("Бренды не в выгрузке: Betta, Aura",
+                         "Лист «HDF Паркет» не разбирал — там нет брендов из выгрузки")
+        for code in ("T1", "T2", "T3"):
+            await self.store.mark_tm_done(42, code)
+        self.assertTrue(await ph._finish_run(self.chat, self.store, 42))
+        text = "\n".join(self.chat.sent)
+        self.assertIn("Осталось за рамками разбора:", text)
+        self.assertIn("— Бренды не в выгрузке: Betta, Aura", text)
+        self.assertIn("— Лист «HDF Паркет»", text)
+        self.assertIn("Прайс «Монарх-логистик» обработан полностью.", text)
+
+    async def test_not_shown_while_marks_remain(self):
+        await self._note("что-то про прайс")
+        await self.store.mark_tm_done(42, "T1")
+        self.assertFalse(await ph._finish_run(self.chat, self.store, 42))
+        self.assertEqual(self.chat.sent, [])
+
+    async def test_finish_clears_mode_and_plan(self):
+        ph._files[42] = ("monarh.xlsx", b"x")
+        for code in ("T1", "T2", "T3"):
+            await self.store.mark_tm_done(42, code)
+        await ph._finish_run(self.chat, self.store, 42)
+        self.assertNotIn(42, ph._files)
+        self.assertIsNone(await self.store.get_run(42))
+
+    async def test_note_without_a_run_is_not_lost_silently(self):
+        await self.store.clear_run(42)
+        self.assertIn("прогон не начат", await self._note("что-то"))
+
+    async def test_force_finishes_even_without_a_plan(self):
+        """Однобрендовый прайс: плана нет, но из режима выйти всё равно надо."""
+        await self.store.clear_run(42)
+        ph._files[42] = ("p.xlsx", b"x")
+        self.assertFalse(await ph._finish_run(self.chat, self.store, 42))
+        self.assertTrue(await ph._finish_run(self.chat, self.store, 42, force=True))
+        self.assertNotIn(42, ph._files)
 
 
 class FakeCallback:

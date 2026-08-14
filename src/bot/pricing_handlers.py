@@ -33,6 +33,7 @@ _STATUS = {
     "read_price_file": "Читаю прайс...",
     "get_product_scope": "Смотрю, какие категории анализируем...",
     "start_price_run": "Составляю план по маркам...",
+    "add_final_note": "Откладываю замечание к итогу...",
     "save_price_mapping": "Запоминаю формат прайса...",
     "get_selling_tm": "Проверяю выгрузку ТМ в 1С...",
     "get_1c_nomenclature": "Загружаю номенклатуру из 1С...",
@@ -88,6 +89,40 @@ async def _deliver(progress: Message, message: Message, text: str) -> None:
             logger.exception("Не доставлена часть отчёта о записи цен")
 
 
+async def _finish_run(message: Message, store: PricingStore, user_id: int,
+                      force: bool = False) -> bool:
+    """Завершить прогон: отложенные замечания, итог, выход из режима прайса.
+
+    Один выход на оба пути — и когда последняя марка записана кнопкой, и когда по ней
+    нечего было писать. Замечания по прайсу целиком (§9.6) показываются здесь и только
+    здесь: повторять их в предложении по каждой марке — шум, админ читает их один раз.
+
+    `force` — для пути кнопки: там прогон мог не начинаться вовсе (однобрендовый прайс),
+    но выйти из режима всё равно надо.
+    """
+    run = await store.get_run(user_id)
+    if run is not None and run["remaining"]:
+        return False
+    if run is None and not force:
+        return False
+
+    lines: list[str] = []
+    if run and run.get("notes"):
+        lines.append("Осталось за рамками разбора:")
+        lines += [f"— {n}" for n in run["notes"]]
+        lines.append("")
+    doc = (run or {}).get("price_doc") or (run or {}).get("supplier")
+    lines.append(f"Прайс «{doc}» обработан полностью." if doc
+                 else "Работа с прайсом завершена.")
+    lines.append("Пришлите следующий файл, когда понадобится.")
+
+    _files.pop(user_id, None)
+    await store.reset(user_id)
+    await store.clear_run(user_id)
+    await _send(message, "\n".join(lines))
+    return True
+
+
 async def _run(message: Message, user_text: str, orchestrator, onec, store: PricingStore,
                status_msg: Message, user_id: int | None = None) -> None:
     # user_id передаётся явно, когда ход инициирует не админ, а мы сами — после нажатия
@@ -125,6 +160,11 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
 
     pending = await store.get_pending(user_id)
     await _send(message, answer, _keyboard(pending.proposal_id) if pending else None)
+
+    # последняя марка могла закрыться без кнопки (писать было нечего) — тогда прогон
+    # окончен прямо здесь, и выйти из режима больше некому
+    if pending is None:
+        await _finish_run(message, store, user_id)
 
 
 @router.message(F.document)
@@ -510,13 +550,7 @@ async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: Pr
 
     # прайс пройден целиком — выходим из режима, иначе следующий обычный вопрос
     # админа будет истолкован как ответ по прайсу
-    doc = (run or {}).get("price_doc") or (run or {}).get("supplier")
-    _files.pop(user_id, None)
-    await pricing_store.reset(user_id)
-    await pricing_store.clear_run(user_id)
-    await callback.message.answer(
-        (f"Прайс «{doc}» обработан полностью." if doc else "Работа с прайсом завершена.")
-        + " Пришлите следующий файл, когда понадобится.")
+    await _finish_run(callback.message, pricing_store, user_id, force=True)
 
 
 def _price_label(kind: str) -> str:
