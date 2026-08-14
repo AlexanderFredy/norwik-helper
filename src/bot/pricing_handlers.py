@@ -18,6 +18,7 @@ from src.agent.prompts import PRICING_PROMPT
 from src.bot.errors import describe_api_error
 from src.price_tool.broadcast import build_broadcast, journal_rows
 from src.price_tool.exclusive import resolve
+from src.price_tool.history import LABELS
 from src.storage.pricing import PricingStore
 from src.storage.users import UserStore
 
@@ -51,10 +52,39 @@ def _keyboard(proposal_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+def _chunks(text: str) -> list[str]:
+    """Разбивка под лимит сообщения Telegram (4096)."""
+    return [text[i:i + 4096] for i in range(0, len(text), 4096)] or [""]
+
+
 async def _send(message: Message, text: str, markup=None) -> None:
-    chunks = [text[i:i + 4096] for i in range(0, len(text), 4096)] or [""]
-    for i, chunk in enumerate(chunks):
-        await message.answer(chunk, reply_markup=markup if i == len(chunks) - 1 else None)
+    parts = _chunks(text)
+    for i, chunk in enumerate(parts):
+        await message.answer(chunk, reply_markup=markup if i == len(parts) - 1 else None)
+
+
+async def _deliver(progress: Message, message: Message, text: str) -> None:
+    """Показать отчёт админу, чего бы это ни стоило.
+
+    Вызывается ПОСЛЕ записи цен в 1С, то есть после необратимого действия. Любая ошибка
+    доставки здесь — молчание бота при уже изменённых ценах: админ не знает ни что
+    записалось, ни было ли вообще. Поэтому каждый шаг обёрнут, а длинный отчёт режется
+    (боевой прайс дал 10 000 символов при лимите 4096, и сообщение просто не ушло).
+    """
+    parts = _chunks(text)
+    try:
+        await progress.edit_text(parts[0])
+    except Exception:                                   # noqa: BLE001
+        logger.exception("Не удалось отредактировать статус — шлём отдельным сообщением")
+        try:
+            await message.answer(parts[0])
+        except Exception:                               # noqa: BLE001
+            logger.exception("Отчёт о записи цен не доставлен админу")
+    for chunk in parts[1:]:
+        try:
+            await message.answer(chunk)
+        except Exception:                               # noqa: BLE001
+            logger.exception("Не доставлена часть отчёта о записи цен")
 
 
 async def _run(message: Message, user_text: str, orchestrator, onec, store: PricingStore,
@@ -370,12 +400,14 @@ async def _notify_managers(bot, store: UserStore, digest: dict, result: dict,
     text = build_broadcast(digest, failed, exclusives)
     if not text:
         return 0
+    parts = _chunks(text)          # длинный прайс даёт сообщение длиннее лимита Telegram
     sent = 0
     for user in await store.list_all():
         if user.telegram_id == admin_id:
             continue
         try:
-            await bot.send_message(user.telegram_id, text)
+            for chunk in parts:
+                await bot.send_message(user.telegram_id, chunk)
             sent += 1
         except Exception:                          # заблокировал бота, удалил чат и т.п.
             logger.warning("Не доставлено менеджеру %s", user.telegram_id, exc_info=True)
@@ -421,24 +453,34 @@ async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: Pr
         return
 
     await pricing_store.mark_applied(proposal.proposal_id)
-    report = _format_result(result)
 
-    # журнал и рассылка (п.6): 1С хранит дату изменения, но не источник цены —
-    # «из какого прайса» знаем только мы, и только отсюда
-    if proposal.digest:
-        failed = {e.get("ref") for e in (result.get("errors") or []) if e.get("ref")}
-        try:
-            await pricing_store.record_writes(
-                journal_rows(proposal.digest, _written_on(result), failed))
-        except Exception:
-            logger.exception("Не удалось записать журнал цен")   # цены в 1С уже записаны
-        active, _ = resolve(*await pricing_store.load_exclusives())
-        sent = await _notify_managers(callback.message.bot, store, proposal.digest,
-                                      result, user_id, active)
-        if sent:
-            report += f"\n\nМенеджерам отправлено уведомление: {sent}."
+    # Цены в 1С уже изменены. Дальше НИЧТО не имеет права оставить админа без ответа:
+    # молчание бота после записи неотличимо от «ничего не произошло», а цены при этом
+    # стоят новые. Поэтому весь сбор отчёта под общим except с внятным запасным текстом.
+    try:
+        report = _format_result(result)
+        # журнал и рассылка (п.6): 1С хранит дату изменения, но не источник цены —
+        # «из какого прайса» знаем только мы, и только отсюда
+        if proposal.digest:
+            failed = {e.get("ref") for e in (result.get("errors") or []) if e.get("ref")}
+            try:
+                await pricing_store.record_writes(
+                    journal_rows(proposal.digest, _written_on(result), failed))
+            except Exception:
+                logger.exception("Не удалось записать журнал цен")   # цены уже записаны
+            active, _ = resolve(*await pricing_store.load_exclusives())
+            sent = await _notify_managers(callback.message.bot, store, proposal.digest,
+                                          result, user_id, active)
+            if sent:
+                report += f"\n\nМенеджерам отправлено уведомление: {sent}."
+    except Exception:                                   # noqa: BLE001
+        logger.exception("Ошибка при подготовке отчёта после записи цен")
+        report = (f"Цены записаны в 1С: обновлено {result.get('updated', 0)} поз. "
+                  f"({result.get('date', '')}).\n"
+                  "Подробный отчёт собрать не удалось — смотрите логи. "
+                  "Записанное можно проверить в 1С и через «когда меняли цены».")
 
-    await progress.edit_text(report)
+    await _deliver(progress, callback.message, report)
 
     # цены записаны — выходим из режима прайса, иначе следующий обычный вопрос
     # админа будет истолкован как ответ по прайсу
@@ -449,26 +491,44 @@ async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: Pr
         "Работа с прайсом завершена. Пришлите следующий файл, когда понадобится.")
 
 
+def _price_label(kind: str) -> str:
+    return LABELS.get(kind, kind)
+
+
 def _format_result(result: dict) -> str:
-    """Отчёт по ответу set-prices (§10.3): что записано, что пропущено, ошибки."""
+    """Отчёт по ответу set-prices (§10.3): что записано, что пропущено, ошибки.
+
+    Позиции, записанные по-товарно (форма «б»), сводятся по одинаковому переходу: на
+    боевом прайсе их было 43, и построчно отчёт вырастал до 10 000 символов — вдвое
+    больше, чем Telegram принимает в одном сообщении.
+    """
     lines = [f"Готово, {result.get('date', '')}: обновлено {result.get('updated', 0)} поз."]
     if result.get("unchanged"):
         lines.append(f"Без изменений: {result['unchanged']} поз.")
+
+    per_item: dict[tuple, list[str]] = {}
     for res in result.get("results", []):
         if "changes" in res:
-            head = f"• {res.get('tm_name', '')} / {res.get('collection', '')} — {res.get('count')} поз."
-            lines.append(head)
+            lines.append(f"• {res.get('tm_name', '')} / {res.get('collection', '')} "
+                         f"— {res.get('count')} поз.")
             for ch in res["changes"]:
                 mark = " (уже актуально)" if ch.get("skipped") else ""
                 old = ch.get("old")
-                lines.append(f"    {ch['price_type']}: "
+                lines.append(f"    {_price_label(ch['price_type'])}: "
                              f"{'нет' if old is None else old} → {ch.get('new')} "
                              f"— {ch.get('count')} поз.{mark}")
         else:
             for kind, det in (res.get("written") or {}).items():
-                old = det.get("old")
-                lines.append(f"• {res.get('name', res.get('ref'))} — {kind}: "
-                             f"{'нет' if old is None else old} → {det.get('new')}")
+                key = (kind, det.get("old"), det.get("new"))
+                per_item.setdefault(key, []).append(res.get("name") or res.get("ref") or "?")
+
+    if per_item:
+        lines.append(f"• по отдельным товарам ({sum(len(v) for v in per_item.values())}):")
+        for (kind, old, new), names in per_item.items():
+            who = names[0] if len(names) == 1 else f"{len(names)} поз."
+            lines.append(f"    {_price_label(kind)}: {'нет' if old is None else old} "
+                         f"→ {new} — {who}")
+
     errors = result.get("errors") or []
     if errors:
         lines.append(f"\nОшибки ({len(errors)}):")
