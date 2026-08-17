@@ -105,6 +105,7 @@ JUMP_RATIO = Decimal("1.5")
 PACK_TOLERANCE = Decimal("0.08")
 
 _LABEL = {"purchase": "закупка", "rrc": "РРЦ", "retail": "розница"}
+ORDER_KINDS = ("purchase", "rrc", "retail")
 
 
 def _num(value: Decimal) -> str:
@@ -112,40 +113,80 @@ def _num(value: Decimal) -> str:
         else f"{value:,.2f}".replace(",", " ")
 
 
-def unit_warnings(group: GroupResult) -> list[str]:
-    """Подозрительные скачки цен по коллекции.
+SAME_PRICE_PCT = Decimal("2")     # «уже стоит столько же» — в пределах порога значимости
 
-    Главный случай — цена за упаковку, попавшая в поле цены за базовую ЕИ (§6.3): в 1С
-    закупка хранится за м², а в прайсе колонка бывает за упаковку. Ошибка не выглядит
-    ошибкой — просто цена вдвое выше, — но отношение новой цены к старой совпадает с
-    коэффициентом упаковки, и это можно назвать вслух.
+
+def _near(a: Decimal, b: Decimal, pct: Decimal = SAME_PRICE_PCT) -> bool:
+    return b > 0 and abs(a - b) / b * Decimal("100") <= pct
+
+
+def unit_warnings(group: GroupResult) -> list[str]:
+    """Подозрительные скачки цен по коллекции — с попыткой назвать причину.
+
+    Из прайса приходит ОДНА цена на коллекцию, а в папке 1С могут лежать товары, которые
+    стоят по-разному: другая толщина, влагостойкая версия, остатки снятой позиции. Тогда
+    единая цена поднимет их в разы, и это не ошибка прайса, а ошибка охвата — товар просто
+    не относится к этой строке.
+
+    Отличить это от перепутанной единицы измерения можно по самой коллекции:
+
+    * часть позиций УЖЕ стоит новую цену → цена верна, выбиваются отдельные товары;
+    * цены внутри коллекции сильно разные → одной ценой её накрывать нельзя;
+    * коллекция однородна, а отношение совпало с коэффициентом упаковки → цена за
+      упаковку вместо цены за базовую ЕИ (§6.3).
+
+    Порядок важен: сначала то, что видно по данным, и только потом гипотеза про упаковку.
+    Иначе совпадение отношения с коэффициентом (2.02 против 1.974 на Classen Euphoria)
+    выдаётся за диагноз, хотя на деле цена была верной, а выбивалась одна позиция.
     """
-    seen: set[tuple] = set()
     out: list[str] = []
-    for plan in group.plans:
-        for kind, new in plan.prices.items():
-            old = plan.before.get(kind)
-            if old is None or old <= 0 or new <= 0:
-                continue
-            ratio = new / old
-            if JUMP_RATIO > ratio > 1 / JUMP_RATIO:
-                continue
-            key = (kind, old, new)
-            if key in seen:
-                continue
-            seen.add(key)
-            pct = (ratio - 1) * Decimal("100")
-            head = (f"⚠️ {group.collection}: {_LABEL.get(kind, kind)} "
-                    f"{_num(old)} → {_num(new)} ({pct:+.0f}%)")
-            pack = group.pack
-            if pack and pack > 1 and abs(ratio - pack) / pack <= PACK_TOLERANCE:
-                out.append(
-                    f"{head}. Отношение {ratio:.2f} совпадает с упаковкой {pack} — похоже, "
-                    f"это цена ЗА УПАКОВКУ, а не за {group.unit or 'базовую ЕИ'}. "
-                    f"За единицу вышло бы {_num(new / pack)}. Проверьте колонку прайса.")
-            else:
-                out.append(f"{head} — проверьте колонку прайса и единицу измерения.")
+    for kind in ORDER_KINDS:
+        news = {p.prices[kind] for p in group.plans if kind in p.prices}
+        if len(news) != 1:
+            continue                     # розница считается по-товарно — не наш случай
+        new = next(iter(news))
+        currents = [(p, p.before.get(kind)) for p in group.plans]
+        known = [(p, c) for p, c in currents if c is not None and c > 0]
+        if not known or new <= 0:
+            continue
+
+        movers = [(p, c) for p, c in known
+                  if not (JUMP_RATIO > new / c > 1 / JUMP_RATIO)]
+        if not movers:
+            continue
+
+        label = _LABEL.get(kind, kind)
+        at_new = [p for p, c in known if _near(c, new)]
+        values = sorted(c for _, c in known)
+        head = f"⚠️ {group.collection}: {label} → {_num(new)}"
+
+        if at_new:
+            names = ", ".join(f"{p.name} ({_num(c)})" for p, c in movers[:3])
+            tail = f" и ещё {len(movers) - 3}" if len(movers) > 3 else ""
+            out.append(
+                f"{head}. {len(at_new)} из {len(known)} поз. уже стоят столько же, а эти "
+                f"выбиваются: {names}{tail}. Похоже, в папке коллекции лежат РАЗНЫЕ товары "
+                "— проверьте, относится ли строка прайса к ним.")
+        elif values[-1] / values[0] >= JUMP_RATIO:
+            out.append(
+                f"{head}. В коллекции цены разные ({_num(values[0])}…{_num(values[-1])}), "
+                f"а из прайса пишем одну: {len(movers)} поз. изменятся более чем в "
+                f"{JUMP_RATIO} раза. Проверьте, все ли товары папки относятся к этой строке.")
+        elif group.pack and group.pack > 1 and _pack_like(new / values[0], group.pack):
+            out.append(
+                f"{head} (было {_num(values[0])}). Отношение {new / values[0]:.2f} совпадает "
+                f"с упаковкой {group.pack} — похоже, это цена ЗА УПАКОВКУ, а не за "
+                f"{group.unit or 'базовую ЕИ'}. За единицу вышло бы {_num(new / group.pack)}. "
+                "Проверьте колонку прайса.")
+        else:
+            pct = (new / values[0] - 1) * Decimal("100")
+            out.append(f"{head} (было {_num(values[0])}, {pct:+.0f}%) — проверьте колонку "
+                       "прайса и единицу измерения.")
     return out
+
+
+def _pack_like(ratio: Decimal, pack: Decimal) -> bool:
+    return abs(ratio - pack) / pack <= PACK_TOLERANCE
 
 
 def plan_collection(items: list[NomItem], tm_code: str, tm_name: str,

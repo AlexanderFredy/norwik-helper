@@ -1,8 +1,13 @@
-"""Подозрительные скачки цен и распознавание «цена за упаковку» (§9.1.1).
+"""Подозрительные скачки цен по коллекции и попытка назвать причину (§9.1.1).
 
-Боевой случай 14.08.2026: закупка Classen выросла с 880 до 1775 (+102%) — в 1С попала
-цена за упаковку вместо цены за м². Предложение это показывало обычной строкой среди трёх
-десятков коллекций, и ошибка прошла подтверждение.
+Боевой случай 14.08.2026 оказался НЕ ошибкой единицы измерения, хотя выглядел ею:
+закупка Classen Euphoria «выросла» с 880 до 1775, и отношение 2.02 почти совпало с
+коэффициентом упаковки 1.974. На деле 1775 стояло в 1С с 15.05 у пяти позиций из шести,
+а 880 было у одной — «Euphoria WR Дуб Саттон 58», другого товара в той же папке.
+
+Отсюда порядок проверок: сначала то, что видно по самой коллекции (часть позиций уже
+стоит новую цену; цены внутри разные), и только для однородной коллекции — гипотеза про
+упаковку. Иначе совпадение отношения выдаётся за диагноз.
 """
 import unittest
 from datetime import date
@@ -31,7 +36,7 @@ def warn(old, new, pack, unit="м2") -> list[str]:
 class PackMismatchTest(unittest.TestCase):
     def test_real_classen_case(self):
         [text] = warn(880, 1775, 1.974)
-        self.assertIn("880 → 1 775 (+102%)", text)
+        self.assertIn("было 880", text)
         self.assertIn("ЗА УПАКОВКУ", text)
         self.assertIn("1.974", text)
         self.assertIn("899", text)              # сколько вышло бы за м²
@@ -48,6 +53,47 @@ class PackMismatchTest(unittest.TestCase):
     def test_no_pack_data_is_generic(self):
         [text] = warn(700, 1500, None)
         self.assertNotIn("ЗА УПАКОВКУ", text)
+
+
+class MixedCollectionTest(unittest.TestCase):
+    """Разные товары в одной папке — реальный Classen, а не перепутанная ЕИ."""
+
+    def _euphoria(self):
+        items = [item(f"YO-7074{i}", 1775, 1.974) for i in range(5)]
+        items.append(item("YO-00076843", 880, 1.974))
+        items[-1].__dict__["name"] = "Ламинат Classen Euphoria WR Дуб Саттон FSC 58"
+        return plan_collection(items, "T", "Classen", Decimal("1775"), None,
+                               date(2026, 8, 14))
+
+    def test_outlier_named_not_blamed_on_packaging(self):
+        [text] = unit_warnings(self._euphoria())
+        self.assertIn("5 из 6 поз. уже стоят столько же", text)
+        self.assertIn("Дуб Саттон", text)
+        self.assertIn("(880)", text)
+        self.assertIn("РАЗНЫЕ товары", text)
+        self.assertNotIn("ЗА УПАКОВКУ", text)      # главное: причину не выдумываем
+
+    def test_spread_inside_collection(self):
+        """Боевая WR: цены 864…1560, из прайса одна 1604 — папка неоднородна."""
+        items = [item(f"YO-724{i}", 1560, 1.974) for i in range(4)]
+        items += [item("YO-00074523", 900, 1.974), item("YO-00074524", 864, 1.974)]
+        [text] = unit_warnings(plan_collection(items, "T", "Classen", Decimal("1604"),
+                                               None, date(2026, 8, 14)))
+        self.assertIn("цены разные (864…1 560)", text)
+        self.assertIn("2 поз.", text)
+        self.assertNotIn("ЗА УПАКОВКУ", text)
+
+    def test_uniform_collection_still_gets_pack_hypothesis(self):
+        items = [item(f"YO-{i}", 880, 1.974) for i in range(5)]
+        [text] = unit_warnings(plan_collection(items, "T", "Classen", Decimal("1775"),
+                                               None, date(2026, 8, 14)))
+        self.assertIn("ЗА УПАКОВКУ", text)
+
+    def test_all_positions_already_at_price_is_silent(self):
+        """Нечего писать — нечего и предупреждать."""
+        items = [item(f"YO-{i}", 1775, 1.974) for i in range(5)]
+        self.assertEqual(unit_warnings(plan_collection(
+            items, "T", "Classen", Decimal("1775"), None, date(2026, 8, 14))), [])
 
 
 class QuietCasesTest(unittest.TestCase):
@@ -76,21 +122,12 @@ class QuietCasesTest(unittest.TestCase):
                                 date(2026, 8, 14))
         self.assertEqual(len(unit_warnings(group)), 1)
 
-    def test_different_old_prices_reported_separately(self):
-        """Боевая коллекция WR: 864 и 900 уезжают в 1604 — оба перехода подозрительны."""
+    def test_one_line_per_price_kind(self):
+        """Коллекция описывается одной строкой, а не строкой на каждый товар."""
         items = [item("YO-1", 864, 1.974), item("YO-2", 900, 1.974)]
         group = plan_collection(items, "T", "Classen", Decimal("1604"), None,
                                 date(2026, 8, 14))
-        self.assertEqual(len(unit_warnings(group)), 2)
-
-    def test_small_move_within_same_group_stays_quiet(self):
-        """У той же WR цена 1560 → 1604 — это +3%, порога скачка она не достигает."""
-        items = [item("YO-1", 864, 1.974), item("YO-2", 1560, 1.974)]
-        group = plan_collection(items, "T", "Classen", Decimal("1604"), None,
-                                date(2026, 8, 14))
-        texts = unit_warnings(group)
-        self.assertEqual(len(texts), 1)
-        self.assertIn("864", texts[0])
+        self.assertEqual(len(unit_warnings(group)), 1)
 
 
 if __name__ == "__main__":
