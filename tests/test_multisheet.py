@@ -158,12 +158,12 @@ class ProposalGuardsTest(unittest.IsolatedAsyncioTestCase):
         await self.tools.execute("get_1c_nomenclature", {"tm_code": "000000303"})
         text = await self._propose(tm="000000298")
         self.assertIn("000000303", text)
-        self.assertIn("не попало ни одной", text)
+        self.assertIn("не попала ни в план прогона", text)
 
     async def test_proposed_tm_is_not_reported(self):
         await self.tools.execute("get_1c_nomenclature", {"tm_code": "000000298"})
         text = await self._propose(tm="000000298")
-        self.assertNotIn("не попало ни одной", text)
+        self.assertNotIn("не попала ни в план", text)
 
     async def test_out_of_scope_tm_is_not_reported_as_lost(self):
         """ТМ целиком вне анализируемых категорий пропущена намеренно — не шумим."""
@@ -171,7 +171,7 @@ class ProposalGuardsTest(unittest.IsolatedAsyncioTestCase):
         self.tools._onec = FakeOnec([item("YO-9", 100, coll="YO-Z")])
         await self.tools.execute("get_1c_nomenclature", {"tm_code": "000000777"})
         text = await self._propose(tm="000000777", coll="YO-Z")
-        self.assertNotIn("не попало ни одной", text)
+        self.assertNotIn("не попала ни в план", text)
 
     async def test_replacing_pending_proposal_warns(self):
         """Старая кнопка перестаёт работать — админ должен узнать об этом сразу."""

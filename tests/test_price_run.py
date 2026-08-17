@@ -115,6 +115,60 @@ class ProposePerTmTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("К записи:", text)
 
 
+class PlannedTmNotFlaggedTest(unittest.IsolatedAsyncioTestCase):
+    """Марка из плана — не потеря, а нормальный ход прогона (§9.6).
+
+    При работе по одной ТМ в предложении всегда ровно одна, а остальные загруженные либо
+    уже пройдены, либо ждут очереди. Проверка «загружал, но не предложил» писалась для
+    прежнего мира, где предложение было одно на весь прайс, и в новом ругалась на каждую
+    соседнюю марку: «Номенклатуру ТМ Woodstyle я загружал, но в предложение не попало».
+    """
+
+    async def asyncSetUp(self):
+        clear_nomenclature_cache()
+        self._dir = tempfile.TemporaryDirectory()
+        self.store = PricingStore(Path(self._dir.name) / "t.db")
+        await self.store.init()
+        self.onec = FakeOnec([item("YO-1", 949, 1649, 1139)])
+        self.tools = PricingTools(self.onec, self.store, user_id=42)
+        await self.store.start_run(42, "Монарх", "Монарх-логистик", TMS)
+
+    async def asyncTearDown(self):
+        self._dir.cleanup()
+
+    async def _propose(self, tm="T1"):
+        return await self.tools.execute("propose_prices", {"groups": [
+            {"tm_code": tm, "tm_name": tm, "collection_ref": "YO-C", "purchase": 999}]})
+
+    async def test_other_planned_tms_are_silent(self):
+        for code in ("T2", "T3"):
+            await self.tools.execute("get_1c_nomenclature", {"tm_code": code})
+        text = await self._propose("T1")
+        self.assertNotIn("не попала ни в план", text)
+
+    async def test_already_processed_tm_is_silent(self):
+        await self.tools.execute("get_1c_nomenclature", {"tm_code": "T1"})
+        await self.store.mark_tm_done(42, "T1")
+        text = await self._propose("T2")
+        self.assertNotIn("не попала ни в план", text)
+
+    async def test_tm_outside_the_plan_is_still_flagged(self):
+        """Ради чего проверка и заводилась: бренд мимо плана и мимо предложения."""
+        await self.tools.execute("get_1c_nomenclature", {"tm_code": "000000999"})
+        text = await self._propose("T1")
+        self.assertIn("000000999", text)
+        self.assertIn("не попала ни в план прогона", text)
+
+    async def test_trademark_is_named_from_selling_tm(self):
+        """Имя берётся из выгрузки, а не из первого слова наименования товара."""
+        self.onec.tms = [("Woodstyle", "000000228")]
+        await self.tools.execute("get_selling_tm", {})
+        await self.tools.execute("get_1c_nomenclature", {"tm_code": "000000228"})
+        text = await self._propose("T1")
+        self.assertIn("ТМ Woodstyle (000000228)", text)
+        self.assertNotIn("ТМ Ламинат", text)
+
+
 class FinalNotesTest(unittest.IsolatedAsyncioTestCase):
     """Замечания по прайсу целиком: копятся молча, показываются один раз в конце (§9.6)."""
 

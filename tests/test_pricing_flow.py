@@ -28,6 +28,11 @@ class FakeOnec:
         self.written: list[list[dict]] = []
         self.reads = 0
         self.errors: list[dict] = []      # позиции, которые 1С не отдала
+        self.tms: list[tuple[str, str]] = []   # (имя, код) для selling_tm
+
+    def selling_tm(self):
+        from src.onec.client import TradeMark
+        return [TradeMark(name=n, code=c) for n, c in self.tms]
 
     def by_tm_all(self, tm_code, **kw):
         self.reads += 1

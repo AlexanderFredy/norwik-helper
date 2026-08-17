@@ -42,10 +42,14 @@ MAX_IMAGE_TOTAL_BYTES = 4_000_000
 # Кэш сбрасывается при новом прайсе и после записи цен (см. clear_nomenclature_cache).
 NOM_CACHE_TTL = 1800
 _NOM_CACHE: dict[str, tuple[float, list]] = {}
+# код ТМ → имя из selling-tm. В NomItem названия марки нет, а брать первое слово из
+# наименования товара нельзя: «Ламинат Woodstyle Opera …» даёт «Ламинат», а не бренд.
+_TM_NAMES: dict[str, str] = {}
 
 
 def clear_nomenclature_cache() -> None:
     _NOM_CACHE.clear()
+    _TM_NAMES.clear()
 
 PRICING_TOOLS = [
     {
@@ -627,6 +631,7 @@ class PricingTools:
 
     def _selling_tm(self) -> str:
         tms = self._onec.selling_tm()
+        _TM_NAMES.update({t.code: t.name for t in tms})   # чтобы звать марки по имени
         return json.dumps([{"name": t.name, "code": t.code} for t in tms], ensure_ascii=False)
 
     def _nom(self, tm_code: str) -> Nomenclature:
@@ -668,27 +673,32 @@ class PricingTools:
 
     # -------------------------------------------------------------- предложение
 
-    def _unproposed(self, inp: dict, scope: list[str]) -> list[str]:
-        """ТМ, чью номенклатуру агент грузил, но в предложение не передал.
+    def _unproposed(self, inp: dict, scope: list[str], run: dict | None) -> list[str]:
+        """ТМ, чью номенклатуру агент грузил, но нигде не учёл.
 
         Ловит молчаливую потерю целого бренда: в прайсе Монарха так выпал весь лист
-        ламината вместе с AGT, и заметить это было нечем — `propose_prices` видит только
-        то, что модель ему передала.
+        ламината вместе с AGT — `propose_prices` видит только то, что модель ему передала.
+
+        Марки ИЗ ПЛАНА сюда не попадают. При работе по одной ТМ (§9.6) в предложении всегда
+        ровно одна, а остальные загруженные либо уже пройдены, либо ждут своей очереди —
+        предупреждать о них значит ругаться на нормальный ход прогона. За них отвечает сам
+        план: пока в нём есть незакрытые марки, прогон не завершится.
         """
         proposed = {g.get("tm_code") for g in inp.get("groups") or []}
+        planned = {t.get("code") for t in (run or {}).get("planned") or []}
         out = []
         for tm_code, (_, nom) in _NOM_CACHE.items():
-            if tm_code in proposed or not nom.items:
+            if tm_code in proposed or tm_code in planned or not nom.items:
                 continue
             kinds = {i.product_type for i in nom.items if i.product_type}
             if kinds and not any(in_scope(scope, k) for k in kinds):
                 continue                    # вся ТМ вне анализируемых категорий — так и надо
             colls = {i.collection or i.parent for i in nom.items}
-            name = next((i.name.split()[0] for i in nom.items if i.name), tm_code)
+            name = _TM_NAMES.get(tm_code) or tm_code
             out.append(
                 f"⚠️ Номенклатуру ТМ {name} ({tm_code}) я загружал — {len(nom.items)} поз., "
-                f"{len(colls)} коллекций, — но в предложение не попало ни одной. "
-                "Если это из-за необработанного листа прайса, скажите какого.")
+                f"{len(colls)} коллекций, — но она не попала ни в план прогона, ни в "
+                "предложение. Если это из-за необработанного листа прайса, скажите какого.")
         return out
 
     async def _propose(self, inp: dict) -> str:
@@ -734,7 +744,7 @@ class PricingTools:
                 sel, g["tm_code"], g.get("tm_name", ""),
                 _dec(g.get("purchase")), _dec(g.get("rrc")), today))
 
-        problems += self._unproposed(inp, scope)
+        problems += self._unproposed(inp, scope, await self._store.get_run(self._user_id))
         payload = build_payload(results)
         # новое предложение отменяет прежнее неподтверждённое, и старая кнопка перестаёт
         # работать — молчать об этом нельзя, админ решит, что запись просто сломалась
