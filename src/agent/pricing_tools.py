@@ -22,7 +22,9 @@ from src.price_tool.changes import (
 from src.price_tool.exclusive import (
     HINT_WORDS, WHERE_FOUND, annotate, find, resolve,
 )
-from src.price_tool.parser import extract_images, parse_price_table, render_preview
+from src.price_tool.parser import (
+    extract_images, find_rows, parse_price_table, render_preview,
+)
 from src.price_tool.scope import describe, in_scope
 from src.price_tool.signature import price_signature
 from src.storage.pricing import PricingStore
@@ -60,7 +62,11 @@ PRICING_TOOLS = [
             "без него вернутся все листы). Вызывай в начале работы с прайсом.\n"
             "Если в ответе сказано, что показаны НЕ ВСЕ строки, — обязательно дочитай "
             "остаток: вызови ещё раз с тем же sheet и from_row из подсказки. Не сообщай "
-            "админу, что хвост прайса тебе не виден: он виден, его надо запросить."
+            "админу, что хвост прайса тебе не виден: он виден, его надо запросить.\n"
+            "БОЛЬШОЙ ПРАЙС (тысячи строк) НЕ ЛИСТАЙ ПОДРЯД: каждая выгрузка оседает в "
+            "переписке и раздувает её. Вместо этого найди нужный раздел параметром "
+            "contains (например contains=«Ceracasa») — вернутся НОМЕРА строк с этим "
+            "текстом, — и прочитай только его: from_row = номер начала раздела."
         ),
         "input_schema": {
             "type": "object",
@@ -68,6 +74,8 @@ PRICING_TOOLS = [
                 "sheet": {"type": "string"},
                 "from_row": {"type": "integer",
                              "description": "с какой непустой строки листа продолжить (с 1)"},
+                "contains": {"type": "string",
+                             "description": "искать строки с этим текстом и вернуть их НОМЕРА (название бренда, коллекции). Дёшево — так ищут начало раздела в большом прайсе"},
             },
             "additionalProperties": False,
         },
@@ -365,6 +373,8 @@ class PricingTools:
         self._file: tuple[str, bytes] | None = None      # (имя, содержимое) текущего прайса
         self._images: list[dict] = []                    # баннеры из прайса — для модели
         self.last_summary: str | None = None
+        # марка закрылась без кнопки — обработчик сам двинет очередь (§9.6)
+        self.advanced_to: str | None = None
 
     def set_file(self, filename: str, content: bytes) -> None:
         self._file = (filename, content)
@@ -573,6 +583,9 @@ class PricingTools:
         # и раздел другой ТМ выглядит продолжением предыдущей. Ставим маркер и прикладываем
         # само изображение — прочитать логотип может только модель.
         self._images = self._collect_images(content, filename, sheets)
+        needle = (inp.get("contains") or "").strip()
+        if needle:
+            return "\n\n".join(find_rows(sh, needle) for sh in sheets)[:MAX_TEXT_CHARS]
         start = max(1, int(inp.get("from_row") or 1))
         text = "\n\n".join(render_preview(s, start=start) for s in sheets)
         if len(text) > MAX_TEXT_CHARS:
@@ -824,6 +837,7 @@ class PricingTools:
         run = await self._store.mark_tm_done(self._user_id, tm_code) if tm_code else None
         if run and run["remaining"]:
             nxt = run["remaining"][0]["name"]
+            self.advanced_to = nxt
             return (summary + "\n\nОсталось обработать: "
                     + ", ".join(t["name"] for t in run["remaining"])
                     + f".\n\n[Записывать нечего, кнопки не будет. Покажи текст админу "

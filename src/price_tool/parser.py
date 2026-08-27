@@ -213,6 +213,33 @@ def non_empty_rows(sheet: Sheet) -> list[list[str]]:
 MAX_PREVIEW_ROWS = 1500
 
 
+def find_rows(sheet: Sheet, needle: str, limit: int = 60, max_cols: int = 40) -> str:
+    """Номера строк листа, где встречается подстрока.
+
+    Для мультибрендового прайса на тысячи строк листать его целиком бессмысленно: каждая
+    выгрузка оседает в истории диалога. Дешевле найти, с какой строки начинается раздел
+    нужного бренда, и прочитать только его.
+    """
+    rows = non_empty_rows(sheet)
+    want = (needle or "").strip().lower()
+    if not want:
+        return f"=== Лист: {sheet.name}: пустой запрос поиска ==="
+    hits = [(n, r) for n, r in enumerate(rows, 1)
+            if any(want in (c or "").lower() for c in r)]
+    head = (f"=== Лист: {sheet.name}: «{needle}» найдено в {len(hits)} строках "
+            f"из {len(rows)} ===")
+    if not hits:
+        return head
+    lines = [head]
+    for n, r in hits[:limit]:
+        lines.append(f"{n}\t" + "\t".join(r[:max_cols]))
+    if len(hits) > limit:
+        lines.append(f"... (показаны первые {limit} совпадений из {len(hits)})")
+    lines.append("Чтобы прочитать раздел, вызови read_price_file с from_row = номер "
+                 "первой строки раздела.")
+    return "\n".join(lines)
+
+
 def render_preview(sheet: Sheet, max_rows: int = MAX_PREVIEW_ROWS, max_cols: int = 40,
                    start: int = 1) -> str:
     """Таб-текст листа для агента: без хвостовых пустых ячеек, лимит строк и ячеек в строке.

@@ -123,48 +123,108 @@ async def _finish_run(message: Message, store: PricingStore, user_id: int,
     return True
 
 
+SHEET_MARK = "=== Лист:"
+DUMP_MIN_CHARS = 4000
+DUMP_STUB = ("[Выгрузка листа прайса убрана из истории, чтобы не раздувать контекст. "
+             "Файл никуда не делся: нужный кусок перечитай через read_price_file "
+             "(параметры sheet / contains / from_row).]")
+# Сколько марок подряд можно закрыть без участия админа. Защита от цикла: у каждой
+# итерации свой запрос к модели.
+MAX_AUTO_STEPS = 8
+
+
+def _is_dump(text) -> bool:
+    return isinstance(text, str) and SHEET_MARK in text and len(text) > DUMP_MIN_CHARS
+
+
+def _dump_texts(content) -> list:
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        return [b.get("text") for b in content
+                if isinstance(b, dict) and b.get("type") == "text"]
+    return []
+
+
+def _prune_file_dumps(messages: list[dict], keep_last: int = 1) -> list[dict]:
+    """Старые выгрузки прайса заменяются заглушкой.
+
+    Каждый read_price_file кладёт в историю до 40 000 символов, и они едут в КАЖДЫЙ
+    следующий запрос к модели. На прайсе в 12 870 строк история за три хода выросла до
+    560 000 символов, после чего модель перестала отвечать вовсе. Свежая выгрузка нужна,
+    все прежние — нет: файл лежит в памяти процесса и перечитывается по запросу.
+    """
+    seen, out = 0, []
+    for msg in reversed(messages):
+        content = msg.get("content")
+        if isinstance(content, list):
+            blocks, changed = [], False
+            for block in content:
+                if (isinstance(block, dict) and block.get("type") == "tool_result"
+                        and any(_is_dump(t) for t in _dump_texts(block.get("content")))):
+                    seen += 1
+                    if seen > keep_last:
+                        block = {**block, "content": DUMP_STUB}
+                        changed = True
+                blocks.append(block)
+            if changed:
+                msg = {**msg, "content": blocks}
+        out.append(msg)
+    return list(reversed(out))
+
+
 async def _run(message: Message, user_text: str, orchestrator, onec, store: PricingStore,
                status_msg: Message, user_id: int | None = None) -> None:
     # user_id передаётся явно, когда ход инициирует не админ, а мы сами — после нажатия
     # кнопки (§9.6): там `message` это сообщение БОТА, и from_user в нём — бот, а не админ
     if user_id is None:
         user_id = message.from_user.id
-    tools = PricingTools(onec, store, user_id)
-    if user_id in _files:
-        tools.set_file(*_files[user_id])
 
-    async def on_tool(name: str, _inp: dict) -> None:
+    for _ in range(MAX_AUTO_STEPS):
+        tools = PricingTools(onec, store, user_id)
+        if user_id in _files:
+            tools.set_file(*_files[user_id])
+        step_status = status_msg
+
+        async def on_tool(name: str, _inp: dict, _s=step_status) -> None:
+            try:
+                await _s.edit_text(_STATUS.get(name, f"Выполняю {name}..."))
+            except Exception:
+                pass
+
+        history = await store.load_messages(user_id)
+        history.append({"role": "user", "content": user_text})
+
         try:
-            await status_msg.edit_text(_STATUS.get(name, f"Выполняю {name}..."))
+            answer, history = await orchestrator.handle_turn(
+                history, on_tool=on_tool, system=PRICING_PROMPT,
+                extra_tools=PRICING_TOOLS, extra_executor=tools)
+        except Exception as exc:                       # noqa: BLE001
+            logger.exception("Ошибка обработки прайса")
+            await step_status.edit_text(describe_api_error(
+                exc, "Ошибка при обработке прайса. Подробности в логах."))
+            return
+
+        await store.save_messages(user_id, _prune_file_dumps(history))
+        try:
+            await step_status.delete()
         except Exception:
             pass
 
-    history = await store.load_messages(user_id)
-    history.append({"role": "user", "content": user_text})
+        pending = await store.get_pending(user_id)
+        await _send(message, answer, _keyboard(pending.proposal_id) if pending else None)
+        if pending is not None:
+            return                       # ждём кнопку админа
 
-    try:
-        answer, history = await orchestrator.handle_turn(
-            history, on_tool=on_tool, system=PRICING_PROMPT,
-            extra_tools=PRICING_TOOLS, extra_executor=tools)
-    except Exception as exc:                           # noqa: BLE001
-        logger.exception("Ошибка обработки прайса")
-        await status_msg.edit_text(describe_api_error(
-            exc, "Ошибка при обработке прайса. Подробности в логах."))
-        return
+        # марка закрылась без кнопки (менять нечего) — переходим сами, иначе прогон
+        # встанет: кнопки нет, а значит и обработчика, который двинул бы очередь, тоже
+        if not tools.advanced_to:
+            break
+        user_text = (f"По этой марке менять нечего. Продолжай со следующей: "
+                     f"{tools.advanced_to}.")
+        status_msg = await message.answer(f"Перехожу к марке {tools.advanced_to}...")
 
-    await store.save_messages(user_id, history)
-    try:
-        await status_msg.delete()
-    except Exception:
-        pass
-
-    pending = await store.get_pending(user_id)
-    await _send(message, answer, _keyboard(pending.proposal_id) if pending else None)
-
-    # последняя марка могла закрыться без кнопки (писать было нечего) — тогда прогон
-    # окончен прямо здесь, и выйти из режима больше некому
-    if pending is None:
-        await _finish_run(message, store, user_id)
+    await _finish_run(message, store, user_id)
 
 
 @router.message(F.document)
