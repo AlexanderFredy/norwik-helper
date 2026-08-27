@@ -210,19 +210,33 @@ def non_empty_rows(sheet: Sheet) -> list[list[str]]:
     return [_rtrim(r) for r in sheet.rows if any(c for c in r)]
 
 
-def render_preview(sheet: Sheet, max_rows: int = 250, max_cols: int = 40) -> str:
+MAX_PREVIEW_ROWS = 1500
+
+
+def render_preview(sheet: Sheet, max_rows: int = MAX_PREVIEW_ROWS, max_cols: int = 40,
+                   start: int = 1) -> str:
     """Таб-текст листа для агента: без хвостовых пустых ячеек, лимит строк и ячеек в строке.
 
     max_cols защищает от «битых» строк с тысячами дублированных ячеек (ошибки экспорта),
     которые иначе съедают весь бюджет текста.
+
+    `start` (нумерация с 1, по НЕПУСТЫМ строкам) позволяет дочитать длинный лист. Без него
+    хвост прайса был недостижим в принципе: прежний лимит в 250 строк резал файл на 394
+    строки, и коллекции ниже среза для сопоставления просто не существовали.
     """
     rows = non_empty_rows(sheet)
-    lines = [f"=== Лист: {sheet.name} ({len(rows)} непустых строк) ==="]
-    for r in rows[:max_rows]:
+    start = max(1, start)
+    chunk = rows[start - 1:start - 1 + max_rows]
+    last = start - 1 + len(chunk)
+    shown = (f"{len(rows)} непустых строк" if len(chunk) == len(rows)
+             else f"строки {start}\u2013{last} из {len(rows)}")
+    lines = [f"=== Лист: {sheet.name} ({shown}) ==="]
+    for r in chunk:
         line = "\t".join(r[:max_cols])
         if len(r) > max_cols:
             line += f"\t…(+{len(r) - max_cols} ячеек)"
         lines.append(line)
-    if len(rows) > max_rows:
-        lines.append(f"... (показаны первые {max_rows} из {len(rows)} строк)")
+    if last < len(rows):
+        lines.append(f"... (ещё {len(rows) - last} строк НЕ показано. Дочитай их: "
+                     f"read_price_file с sheet=«{sheet.name}» и from_row={last + 1})")
     return "\n".join(lines)

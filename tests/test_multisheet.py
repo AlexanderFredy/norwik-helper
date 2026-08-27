@@ -84,6 +84,37 @@ class MultiSheetMappingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m["sheet"] for m in left], ["SPC LVT"])
 
 
+class LongSheetTest(unittest.IsolatedAsyncioTestCase):
+    """Хвост длинного листа должен быть достижим (боевой прайс Монарха, 394 строки)."""
+
+    async def asyncSetUp(self):
+        clear_nomenclature_cache()
+        self._dir = tempfile.TemporaryDirectory()
+        self.store = PricingStore(Path(self._dir.name) / "t.db")
+        await self.store.init()
+        self.tools = PricingTools(FakeOnec([item("YO-1", 949)]), self.store, user_id=42)
+        wb = Workbook(); wb.remove(wb.active)
+        ws = wb.create_sheet(title="LA")
+        ws.append(["Артикул", "Наименование", "цена за м2"])
+        for i in range(400):
+            ws.append([f"A-{i}", f"Коллекция {i // 40} декор {i}", 900 + i])
+        buf = _io.BytesIO(); wb.save(buf)
+        self.tools.set_file("monarh.xlsx", buf.getvalue())
+
+    async def asyncTearDown(self):
+        self._dir.cleanup()
+
+    async def test_whole_sheet_fits_in_one_call(self):
+        text = await self.tools.execute("read_price_file", {})
+        self.assertIn("декор 399", text)          # хвост виден без доп. вызовов
+        self.assertNotIn("НЕ показано", text)
+
+    async def test_from_row_returns_the_tail(self):
+        text = await self.tools.execute("read_price_file", {"from_row": 380})
+        self.assertIn("декор 399", text)
+        self.assertNotIn("декор 100", text)       # начало не дублируется
+
+
 class MappingMigrationTest(unittest.IsolatedAsyncioTestCase):
     """Боевая база уже жила со старым ключом — переезд не должен терять трактовки."""
 
