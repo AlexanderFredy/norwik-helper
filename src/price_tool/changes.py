@@ -91,6 +91,7 @@ class GroupResult:
     plans: list[ItemPlan]
     pack: Decimal | None = None      # коэффициент упаковки из alt_units — для проверки ЕИ
     unit: str = ""                   # базовая ЕИ 1С (м2, шт.) — для текста предупреждения
+    whole: bool = True               # покрывает ли группа ВСЮ папку коллекции
 
     @property
     def to_write(self) -> list[ItemPlan]:
@@ -215,6 +216,43 @@ def _pack(item: NomItem | None) -> Decimal | None:
     return value if value > 0 else None
 
 
+def plan_items(items: list[NomItem], tm_code: str, tm_name: str, priced: list[dict],
+               today: date, min_pct: Decimal = MIN_CHANGE_PCT) -> tuple[GroupResult, list[str]]:
+    """Цены на отдельные товары коллекции — случай плитки (§7.7).
+
+    В одной папке коллекции лежат настенная, напольная, декоры, бордюры: разное назначение,
+    разный размер, разная цена. Единая цена на папку тут неверна по существу, поэтому
+    модель передаёт цену на каждый товар, а тронуты будут только перечисленные.
+
+    Возвращает (группа, коды переданных товаров, которых в 1С не нашлось).
+    """
+    by_ref = {i.ref: i for i in items}
+    plans, missing = [], []
+    for row in priced:
+        item = by_ref.get(row.get("ref"))
+        if item is None:
+            missing.append(str(row.get("ref")))
+            continue
+        plans.append(plan_item(item, _opt(row.get("purchase")), _opt(row.get("rrc")),
+                               today, min_pct))
+    first = items[0] if items else None
+    return GroupResult(
+        tm_code=tm_code, tm_name=tm_name,
+        collection_ref=first.collection_ref if first else "",
+        collection=(first.collection or first.parent or "без коллекции") if first else "",
+        plans=plans, pack=_pack(first), unit=first.unit if first else "",
+        whole=len(plans) == len(items)), missing
+
+
+def _opt(value) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except (ValueError, ArithmeticError):
+        return None
+
+
 def build_payload(groups: list[GroupResult]) -> list[dict]:
     """Тело set-prices (§10.2). Форма «а» — когда по всей коллекции пишется одно и то же."""
     items: list[dict] = []
@@ -224,7 +262,10 @@ def build_payload(groups: list[GroupResult]) -> list[dict]:
             continue
         uniform = (len(writable) == len(g.plans)
                    and all(p.prices == writable[0].prices for p in writable))
-        if uniform and g.collection_ref:
+        # форма «а» пишет цену на ВСЮ папку. Для плитки группа покрывает лишь часть
+        # коллекции (настенная отдельно от напольной), и групповая запись задела бы
+        # соседние элементы с другими ценами — тогда только по-товарно.
+        if uniform and g.collection_ref and g.whole:
             items.append({"tm": g.tm_code, "collection_ref": g.collection_ref,
                           "prices": {k: float(v) for k, v in writable[0].prices.items()}})
         else:

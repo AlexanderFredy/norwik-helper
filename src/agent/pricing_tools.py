@@ -17,7 +17,7 @@ from decimal import Decimal, InvalidOperation
 
 from src.onec.client import NomItem, Nomenclature, OnecClient
 from src.price_tool.changes import (
-    GroupResult, build_payload, plan_collection, unit_warnings,
+    GroupResult, build_payload, plan_collection, plan_items, unit_warnings,
 )
 from src.price_tool.exclusive import (
     HINT_WORDS, WHERE_FOUND, annotate, find, resolve,
@@ -259,7 +259,15 @@ PRICING_TOOLS = [
             "Розницу НЕ передавай — она считается автоматически по правилам магазина. "
             "Инструмент сам сравнит с текущими ценами 1С, отбросит изменения меньше 2%, "
             "посчитает розницу и вернёт готовый текст предложения. Ничего не записывает: "
-            "запись выполнит админ кнопкой. Вызывай ОДИН раз, когда сопоставление закончено."
+            "запись выполнит админ кнопкой. Вызывай ОДИН раз на марку.\n"
+            "ДВА СПОСОБА задать цену в группе:\n"
+            "• purchase/rrc на всю коллекцию — когда все её товары стоят одинаково "
+            "(ламинат, виниловый ламинат: коллекция = один декор в разных цветах);\n"
+            "• items[{ref, purchase, rrc}] — цена на каждый товар отдельно. Так задаётся "
+            "КЕРАМИЧЕСКАЯ ПЛИТКА и КЕРАМОГРАНИТ: в одной коллекции лежат настенная, "
+            "напольная, декор, бордюр, вставка, ступень — у каждого своя цена и свой размер. "
+            "Указывай items — трогаются только перечисленные товары, остальные в папке "
+            "остаются как есть."
         ),
         "input_schema": {
             "type": "object",
@@ -278,6 +286,20 @@ PRICING_TOOLS = [
                             "collection_ref": {"type": "string", "description": "код папки-коллекции из get_1c_nomenclature"},
                             "purchase": {"type": "number", "description": "закупка из прайса за базовую ЕИ; опустить, если в прайсе нет"},
                             "rrc": {"type": "number", "description": "РРЦ из прайса за базовую ЕИ; опустить, если в прайсе нет"},
+                            "items": {
+                                "type": "array",
+                                "description": "поэлементные цены (плитка/керамогранит). Если задано, purchase/rrc группы игнорируются, а товары вне списка не трогаются",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "ref": {"type": "string", "description": "Код товара 1С из get_1c_nomenclature"},
+                                        "purchase": {"type": "number"},
+                                        "rrc": {"type": "number"},
+                                    },
+                                    "required": ["ref"],
+                                    "additionalProperties": False,
+                                },
+                            },
                             "note": {"type": "string"},
                         },
                         "required": ["tm_code", "collection_ref"],
@@ -752,6 +774,19 @@ class PricingTools:
                 problems.append(
                     f"⚠️ {sel[0].collection or g.get('collection_ref')} ({kind}) — категория "
                     "не в списке анализируемых, цены не трогаю. Изменить: /categories")
+                continue
+            per_item = g.get("items") or []
+            if per_item:
+                # плитка: в одной папке настенная, напольная, декоры — у каждого своя цена
+                group, missing = plan_items(sel, g["tm_code"], g.get("tm_name", ""),
+                                            per_item, today)
+                if missing:
+                    problems.append(
+                        f"⚠️ {sel[0].collection or g.get('collection_ref')}: не нашёл в 1С "
+                        f"{len(missing)} поз. из переданных ({', '.join(missing[:5])}"
+                        + (", …" if len(missing) > 5 else "") + ") — цены по ним не тронуты.")
+                if group.plans:
+                    results.append(group)
                 continue
             results.append(plan_collection(
                 sel, g["tm_code"], g.get("tm_name", ""),

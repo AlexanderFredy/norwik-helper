@@ -40,7 +40,7 @@ C:\Data\ClodeCodeProjects\shop-helper\.venv\Scripts\python.exe -m src.main
 C:\Data\ClodeCodeProjects\shop-helper\.venv\Scripts\pip.exe install -r requirements.txt
 ```
 
-**Перед прогоном полезно** прогнать тесты (должно быть `OK`, 290 тестов):
+**Перед прогоном полезно** прогнать тесты (должно быть `OK`, 300 тестов):
 
 ```powershell
 C:\Data\ClodeCodeProjects\shop-helper\.venv\Scripts\python.exe -m unittest discover tests
