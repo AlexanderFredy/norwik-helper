@@ -87,14 +87,14 @@ class ProposePerTmTest(unittest.IsolatedAsyncioTestCase):
     async def test_single_tm_lists_whats_left(self):
         text = await self.tools.execute("propose_prices", {"groups": [self._group("T1")]})
         self.assertIn("Осталось обработать: Classen, AGT.", text)
-        self.assertIn("НЕ переходи", text)
+        self.assertIn("НЕ иди", text)
         self.assertIsNotNone(await self.store.get_pending(42))
 
     async def test_nothing_to_write_closes_tm_and_moves_on(self):
         """Кнопки не будет — значит марку закрываем сами, иначе прогон встанет."""
         text = await self.tools.execute("propose_prices",
                                         {"groups": [self._group("T1", purchase=949)]})
-        self.assertIn("продолжай со следующей марки: Classen", text)
+        self.assertIn("продолжай: Classen", text)
         run = await self.store.get_run(42)
         self.assertEqual([t["name"] for t in run["remaining"]], ["Classen", "AGT"])
 
@@ -319,8 +319,8 @@ class ContinueAfterApplyTest(unittest.IsolatedAsyncioTestCase):
         await self._press()
         text = "\n".join(self.chat.sent)
         self.assertIn("Осталось обработать: Classen, AGT.", text)
-        self.assertIn("Перехожу к марке Classen", text)
-        self.assertIn("Продолжай со следующей марки: Classen", self.orc.prompts[-1])
+        self.assertIn("Перехожу к Classen", text)
+        self.assertIn("Продолжай: Classen", self.orc.prompts[-1])
 
     async def test_price_mode_stays_open_until_the_end(self):
         """Файл и план не должны сбрасываться на середине прайса."""

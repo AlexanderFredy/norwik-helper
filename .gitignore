@@ -5,3 +5,4 @@ __pycache__/
 venv/
 data/*.db
 .pytest_cache/
+data/prices/

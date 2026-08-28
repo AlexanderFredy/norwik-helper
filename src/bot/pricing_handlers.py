@@ -13,12 +13,15 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from src.agent.pricing_tools import PRICING_TOOLS, PricingTools, clear_nomenclature_cache
+from src.agent.pricing_tools import (
+    PRICING_TOOLS, PricingTools, clear_nomenclature_cache, next_step, queue_tail,
+)
 from src.agent.prompts import PRICING_PROMPT
 from src.bot.errors import describe_api_error
 from src.price_tool.broadcast import build_broadcast, journal_rows
 from src.price_tool.exclusive import resolve
 from src.price_tool.history import LABELS
+from src.storage import price_files
 from src.storage.pricing import PricingStore
 from src.storage.users import UserStore
 
@@ -33,6 +36,8 @@ _STATUS = {
     "read_price_file": "Читаю прайс...",
     "get_product_scope": "Смотрю, какие категории анализируем...",
     "start_price_run": "Составляю план по маркам...",
+    "start_tm_collections": "Разбиваю марку на коллекции...",
+    "defer_task": "Откладываю задачу...",
     "add_final_note": "Откладываю замечание к итогу...",
     "save_price_mapping": "Запоминаю формат прайса...",
     "get_selling_tm": "Проверяю выгрузку ТМ в 1С...",
@@ -48,10 +53,22 @@ _files: dict[int, tuple[str, bytes]] = {}
 
 
 def _keyboard(proposal_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Записать в 1С", callback_data=f"price:apply:{proposal_id}"),
-        InlineKeyboardButton(text="✖️ Отмена", callback_data=f"price:cancel:{proposal_id}"),
-    ]])
+    """Второй ряд — движение по очереди (§9.7).
+
+    «Отмена» отклоняет предложение и ОСТАВЛЯЕТ на этом шаге: админ хочет переспросить
+    агента. «Пропустить» шаг закрывает и двигает очередь дальше, «Отложить» вдобавок
+    заводит задачу, чтобы вернуться к шагу позже.
+    """
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Записать в 1С",
+                              callback_data=f"price:apply:{proposal_id}"),
+         InlineKeyboardButton(text="✖️ Отмена",
+                              callback_data=f"price:cancel:{proposal_id}")],
+        [InlineKeyboardButton(text="⏭ Пропустить",
+                              callback_data=f"price:skip:{proposal_id}"),
+         InlineKeyboardButton(text="🕐 Отложить",
+                              callback_data=f"price:defer:{proposal_id}")],
+    ])
 
 
 def _chunks(text: str) -> list[str]:
@@ -110,6 +127,12 @@ async def _finish_run(message: Message, store: PricingStore, user_id: int,
     if run and run.get("notes"):
         lines.append("Осталось за рамками разбора:")
         lines += [f"— {n}" for n in run["notes"]]
+        lines.append("")
+    deferred = await store.list_deferred(user_id)
+    if deferred:
+        lines.append("Отложено, вернуться позже:")
+        lines += [f"— {_deferred_title(t)}" for t in deferred]
+        lines.append("Список: /deferred — там же как продолжить.")
         lines.append("")
     doc = (run or {}).get("price_doc") or (run or {}).get("supplier")
     lines.append(f"Прайс «{doc}» обработан полностью." if doc
@@ -222,7 +245,7 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
             break
         user_text = (f"По этой марке менять нечего. Продолжай со следующей: "
                      f"{tools.advanced_to}.")
-        status_msg = await message.answer(f"Перехожу к марке {tools.advanced_to}...")
+        status_msg = await message.answer(f"Перехожу к {tools.advanced_to}...")
 
     await _finish_run(message, store, user_id)
 
@@ -468,6 +491,132 @@ async def cmd_exclusive_forget(message: Message, command: CommandObject,
                          "— вернуть можно, сказав об этом при разборе прайса.")
 
 
+def _deferred_title(task: dict) -> str:
+    """Кратко: либо ТМ, либо ТМ/коллекция — как просил админ."""
+    tm = task.get("tm_name") or task.get("tm_code") or "?"
+    return f"{tm} / {task['collection']}" if task.get("collection") else tm
+
+
+def _deferred_line(i: int, task: dict) -> str:
+    doc = task.get("price_doc") or task.get("supplier")
+    when = f" от {task['price_date'][:10]}" if (task.get("price_date") or "") else ""
+    src = f" — прайс «{doc}»{when}" if doc else ""
+    mark = "  ⚠️ устарело, есть прайс новее" if task.get("stale") else ""
+    return f"{i}. {_deferred_title(task)}{src}{mark}"
+
+
+@router.message(Command("deferred"))
+async def cmd_deferred(message: Message, pricing_store: PricingStore, is_admin: bool) -> None:
+    """Отложенные задачи (§9.7): к чему решили вернуться позже."""
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+    tasks = await pricing_store.list_deferred(message.from_user.id)
+    if not tasks:
+        await message.answer(
+            "Отложенных задач нет. Они появляются, когда вы жмёте «Отложить» под "
+            "предложением по марке или коллекции.")
+        return
+    lines = ["Отложенные задачи:"]
+    lines += [_deferred_line(i, t) for i, t in enumerate(tasks, 1)]
+    lines.append("\nВернуться: /deferred_resume <номер> — прайс поднимется с сервера, "
+                 "присылать файл заново не нужно.")
+    lines.append("Убрать: /deferred_forget <номер>, /deferred_clear, "
+                 "/deferred_clear_stale.")
+    await _send(message, "\n".join(lines))
+
+
+async def _pick(message: Message, command: CommandObject,
+                store: PricingStore) -> dict | None:
+    tasks = await store.list_deferred(message.from_user.id)
+    arg = (command.args or "").strip()
+    if not arg.isdigit() or not 1 <= int(arg) <= len(tasks):
+        await message.answer("Укажите номер из /deferred, например: /deferred_forget 1")
+        return None
+    return tasks[int(arg) - 1]
+
+
+@router.message(Command("deferred_forget"))
+async def cmd_deferred_forget(message: Message, command: CommandObject,
+                              pricing_store: PricingStore, is_admin: bool) -> None:
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+    task = await _pick(message, command, pricing_store)
+    if task is None:
+        return
+    freed = await pricing_store.forget_deferred(message.from_user.id, task["id"])
+    price_files.forget(freed)
+    await message.answer(f"Убрал из отложенных: {_deferred_title(task)}.")
+
+
+@router.message(Command("deferred_clear"))
+async def cmd_deferred_clear(message: Message, pricing_store: PricingStore,
+                             is_admin: bool) -> None:
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+    tasks = await pricing_store.list_deferred(message.from_user.id)
+    if not tasks:
+        await message.answer("Список отложенных и так пуст.")
+        return
+    price_files.forget(await pricing_store.clear_deferred(message.from_user.id))
+    await message.answer(f"Список отложенных очищен ({len(tasks)}). "
+                         "Сохранённые прайсы удалены.")
+
+
+@router.message(Command("deferred_clear_stale"))
+async def cmd_deferred_clear_stale(message: Message, pricing_store: PricingStore,
+                                   is_admin: bool) -> None:
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+    tasks = [t for t in await pricing_store.list_deferred(message.from_user.id) if t["stale"]]
+    if not tasks:
+        await message.answer("Устаревших отложенных задач нет.")
+        return
+    price_files.forget(await pricing_store.clear_deferred(message.from_user.id,
+                                                          stale_only=True))
+    await message.answer("Убрал устаревшие: "
+                         + ", ".join(_deferred_title(t) for t in tasks) + ".")
+
+
+@router.message(Command("deferred_resume"))
+async def cmd_deferred_resume(message: Message, command: CommandObject, orchestrator, onec,
+                              pricing_store: PricingStore, is_admin: bool) -> None:
+    """Вернуться к отложенному: прайс поднимается с диска, пересылать его не нужно."""
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+    if onec is None:
+        await message.answer("Интеграция с 1С не настроена.")
+        return
+    task = await _pick(message, command, pricing_store)
+    if task is None:
+        return
+    content = price_files.load(task.get("file_path"))
+    if content is None:
+        await message.answer(
+            f"Прайс для «{_deferred_title(task)}» на сервере не найден — пришлите файл "
+            "заново документом. Саму задачу можно убрать: /deferred_forget.")
+        return
+
+    user_id = message.from_user.id
+    name = task.get("price_doc") or "прайс"
+    _files[user_id] = (name, content)
+    await pricing_store.reset(user_id)          # чистый диалог: старой истории здесь нет
+    await pricing_store.clear_run(user_id)
+    clear_nomenclature_cache()
+    status = await message.answer(f"Поднимаю прайс «{name}» с сервера...")
+    what = _deferred_title(task)
+    await _run(message,
+               f"Возвращаемся к отложенному: {what}. Прайс «{name}» тот же. Разбери "
+               "только это — план прогона составь из одной этой марки"
+               + (f", а внутри неё только коллекция «{task['collection']}»."
+                  if task.get("collection") else "."),
+               orchestrator, onec, pricing_store, status, user_id=user_id)
+
+
 def _is_price_reply(message: Message) -> bool:
     """Текст внутри открытого диалога по прайсу.
 
@@ -529,6 +678,11 @@ async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: Pr
         await callback.answer("Только администратор", show_alert=True)
         return
 
+    if action in ("skip", "defer"):
+        await _skip_or_defer(callback, action, int(raw_id), onec, pricing_store,
+                             orchestrator, user_id)
+        return
+
     if action == "cancel":
         await pricing_store.reject(user_id, int(raw_id))
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -586,31 +740,84 @@ async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: Pr
                   "Подробный отчёт собрать не удалось — смотрите логи. "
                   "Записанное можно проверить в 1С и через «когда меняли цены».")
 
-    tm_code = next((g.get("tm_code") for g in (proposal.digest or {}).get("groups") or []
-                    if g.get("tm_code")), None)
-    run = await pricing_store.mark_tm_done(user_id, tm_code) if tm_code else None
-    if run and run["remaining"]:
-        report += ("\n\nОсталось обработать: "
-                   + ", ".join(t["name"] for t in run["remaining"]) + ".")
+    step = _step_of(proposal)
+    # объект дошёл до записи — держать по нему отложенную задачу больше незачем
+    price_files.forget(await pricing_store.drop_deferred_for(
+        user_id, step["tm_code"] or "", step["collection_ref"]))
+    run = await _close_step(pricing_store, user_id, step)
+    report += queue_tail(run)
     await _deliver(progress, callback.message, report)
 
     clear_nomenclature_cache()      # цены в 1С изменились — кэш устарел
+    await _continue_or_finish(callback.message, pricing_store, user_id, run,
+                              orchestrator, onec, "Цены записаны.")
 
-    if run and run["remaining"]:
-        # прайс разобран не весь: продолжаем тем же диалогом — файл и история на месте,
-        # иначе админу пришлось бы присылать файл заново на каждую марку (§9.6)
-        nxt = run["remaining"][0]
-        status = await callback.message.answer(f"Перехожу к марке {nxt['name']}...")
-        await _run(callback.message,
-                   f"Цены записаны. Продолжай со следующей марки: {nxt['name']} "
-                   f"(код {nxt['code']}). Сопоставь её коллекции и вызови propose_prices "
-                   "только по ней.",
-                   orchestrator, onec, pricing_store, status, user_id=user_id)
+
+def _step_of(proposal) -> dict:
+    """Какой шаг очереди закрывает это предложение: марка и, возможно, коллекция."""
+    groups = (proposal.digest or {}).get("groups") or []
+    first = next((g for g in groups if g.get("tm_code")), {})
+    return {"tm_code": first.get("tm_code"), "tm_name": first.get("tm_name") or "",
+            "collection_ref": first.get("collection_ref") or "",
+            "collection": first.get("collection") or ""}
+
+
+async def _close_step(store: PricingStore, user_id: int, step: dict) -> dict | None:
+    """Пометить шаг пройденным на том уровне очереди, на котором мы находимся (§9.6.2)."""
+    run = await store.get_run(user_id)
+    stage = (run or {}).get("stage")
+    if stage and stage.get("tm_code") == step["tm_code"] and step["collection_ref"]:
+        return await store.mark_collection_done(user_id, step["collection_ref"])
+    if step["tm_code"]:
+        return await store.mark_tm_done(user_id, step["tm_code"])
+    return run
+
+
+async def _continue_or_finish(message: Message, store: PricingStore, user_id: int,
+                              run: dict | None, orchestrator, onec, prefix: str) -> None:
+    """Двинуть очередь дальше либо закрыть прогон. Один хвост на все три кнопки."""
+    nxt = next_step(run)
+    if not nxt:
+        await _finish_run(message, store, user_id, force=True)
         return
+    # прайс разобран не весь: продолжаем тем же диалогом — файл и история на месте,
+    # иначе админу пришлось бы присылать файл заново на каждый шаг (§9.6)
+    status = await message.answer(f"Перехожу к {nxt}...")
+    await _run(message, f"{prefix} Продолжай: {nxt}.",
+               orchestrator, onec, store, status, user_id=user_id)
 
-    # прайс пройден целиком — выходим из режима, иначе следующий обычный вопрос
-    # админа будет истолкован как ответ по прайсу
-    await _finish_run(callback.message, pricing_store, user_id, force=True)
+
+async def _skip_or_defer(callback: CallbackQuery, action: str, proposal_id: int, onec,
+                         store: PricingStore, orchestrator, user_id: int) -> None:
+    """«Пропустить» и «Отложить»: цены не пишем, очередь двигаем (§9.7).
+
+    Отличие от «Отмены» — там админ остаётся на шаге, чтобы переспросить агента.
+    """
+    proposal = await store.take_pending(user_id, proposal_id)
+    if proposal is None:
+        await callback.answer("Предложение уже обработано или устарело", show_alert=True)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        return
+    await store.mark_rejected(proposal.proposal_id)
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    step = _step_of(proposal)
+    title = step["collection"] or step["tm_name"] or step["tm_code"] or "шаг"
+    if action == "defer":
+        tools = PricingTools(onec, store, user_id)
+        if user_id in _files:
+            tools.set_file(*_files[user_id])
+        saved = await store.defer_task(user_id, {**step, **(await tools.run_context())})
+        head = (f"Отложено: {title}. Вернуться — /deferred, файл присылать не нужно."
+                if saved else f"«{title}» уже в списке отложенных.")
+    else:
+        head = f"Пропущено: {title}. Цены не менялись."
+    await callback.answer()
+
+    run = await _close_step(store, user_id, step)
+    await _send(callback.message, head + queue_tail(run))
+    await _continue_or_finish(callback.message, store, user_id, run, orchestrator, onec,
+                              "Этот шаг пропускаем.")
 
 
 def _price_label(kind: str) -> str:

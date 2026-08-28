@@ -27,6 +27,7 @@ from src.price_tool.parser import (
 )
 from src.price_tool.scope import describe, in_scope
 from src.price_tool.signature import price_signature
+from src.storage.price_files import save as save_price_file
 from src.storage.pricing import PricingStore
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,10 @@ MAX_IMAGE_TOTAL_BYTES = 4_000_000
 # каждое сообщение админа, и без общего кэша каждый его ответ («плинтус не трогай»)
 # заново выкачивал бы из 1С все ТМ прайса — минуты молчания на мультибрендовом прайсе.
 # Кэш сбрасывается при новом прайсе и после записи цен (см. clear_nomenclature_cache).
+# Марка крупнее этого разбирается по коллекциям (§9.6.2): держать в одном ходу и всю
+# номенклатуру, и весь раздел прайса модель не может — на Atlas Concorde Rus (932 поз.)
+# она упёрлась и переложила решение на админа.
+BIG_TM_ITEMS = 300
 NOM_CACHE_TTL = 1800
 _NOM_CACHE: dict[str, tuple[float, list]] = {}
 # код ТМ → имя из selling-tm. В NomItem названия марки нет, а брать первое слово из
@@ -52,6 +57,40 @@ _TM_NAMES: dict[str, str] = {}
 def clear_nomenclature_cache() -> None:
     _NOM_CACHE.clear()
     _TM_NAMES.clear()
+
+def next_step(run: dict | None) -> str | None:
+    """Что обрабатывать следующим: коллекция текущей марки либо следующая марка."""
+    if not run:
+        return None
+    stage = run.get("stage")
+    if stage and stage.get("remaining"):
+        return stage["remaining"][0]["name"]
+    return run["remaining"][0]["name"] if run["remaining"] else None
+
+
+def queue_tail(run: dict | None, skip_tm: str | None = None,
+               skip_coll: str | None = None) -> str:
+    """«Сейчас марка X, осталось в ней …» + «Осталось обработать …» по маркам.
+
+    Живёт на уровне модуля, а не в классе: тот же хвост дописывает обработчик кнопок
+    после записи, пропуска и откладывания.
+    """
+    if not run:
+        return ""
+    lines = []
+    stage = run.get("stage")
+    if stage:
+        left = [c["name"] for c in stage.get("remaining") or [] if c["ref"] != skip_coll]
+        head = f"Сейчас {stage.get('tm_name') or stage.get('tm_code')}"
+        lines.append(f"{head}. Осталось в марке: {', '.join(left)}." if left
+                     else f"{head} — последняя коллекция.")
+    # текущая марка из внешней очереди не выпадает, пока её коллекции не кончились
+    tms = [t["name"] for t in run["remaining"]
+           if t["code"] != (stage.get("tm_code") if stage else skip_tm)]
+    if tms:
+        lines.append(f"Осталось обработать: {', '.join(tms)}.")
+    return ("\n\n" + "\n".join(lines)) if lines else ""
+
 
 PRICING_TOOLS = [
     {
@@ -120,6 +159,7 @@ PRICING_TOOLS = [
             "properties": {
                 "supplier": {"type": "string"},
                 "price_doc": {"type": "string", "description": "как называть прайс в отчётах"},
+                "price_date": {"type": "string", "description": "дата прайса ГГГГ-ММ-ДД из шапки или имени файла — по ней видно, не устарели ли отложенные задачи"},
                 "trademarks": {
                     "type": "array",
                     "description": "в порядке обработки",
@@ -135,6 +175,60 @@ PRICING_TOOLS = [
                 },
             },
             "required": ["trademarks"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "start_tm_collections",
+        "description": (
+            "Разбить крупную марку на коллекции и обрабатывать их по очереди. Вызывай, "
+            "когда propose_prices отказал из-за объёма марки.\n"
+            "Перечисли ТОЛЬКО те коллекции 1С, которые реально встречаются в прайсе, — "
+            "иначе очередь забьётся коллекциями, по которым нечего менять. Дальше "
+            "передавай propose_prices по ОДНОЙ коллекции, как марки в общем плане."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tm_code": {"type": "string"},
+                "tm_name": {"type": "string"},
+                "collections": {
+                    "type": "array",
+                    "description": "в порядке обработки",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "ref": {"type": "string", "description": "collection_ref из get_1c_nomenclature"},
+                            "name": {"type": "string"},
+                        },
+                        "required": ["ref"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["tm_code", "collections"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "defer_task",
+        "description": (
+            "Отложить марку или коллекцию: админ сказал «пропустим, вернёмся позже». "
+            "Задача попадёт в список отложенных, переживёт конец прогона и перезапуск, "
+            "а прайс сохранится на сервере, чтобы вернуться без пересылки файла.\n"
+            "Вызывай ТОЛЬКО по явной просьбе админа: у него есть кнопка «Отложить» под "
+            "предложением, и сам по себе пропуск задачу не заводит."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tm_code": {"type": "string"},
+                "tm_name": {"type": "string"},
+                "collection_ref": {"type": "string", "description": "если откладываем одну коллекцию"},
+                "collection": {"type": "string"},
+                "reason": {"type": "string", "description": "словами админа, если назвал"},
+            },
+            "required": ["tm_code"],
             "additionalProperties": False,
         },
     },
@@ -390,6 +484,10 @@ class PricingTools:
                 return await self._save_mapping(inp)
             if name == "start_price_run":
                 return await self._start_run(inp)
+            if name == "start_tm_collections":
+                return await self._start_stage(inp)
+            if name == "defer_task":
+                return await self._defer(inp)
             if name == "add_final_note":
                 return await self._add_note(inp)
             if name == "get_product_scope":
@@ -471,12 +569,63 @@ class PricingTools:
         if not tms:
             return "Не переданы торговые марки — план не принят."
         doc = inp.get("price_doc") or (self._file[0] if self._file else None)
-        await self._store.start_run(self._user_id, inp.get("supplier"), doc, tms)
+        date_str = (inp.get("price_date") or "")[:10]
+        await self._store.start_run(self._user_id, inp.get("supplier"), doc, tms,
+                                    price_date=date_str)
+        stale_note = ""
+        if date_str:
+            signature = await asyncio.to_thread(self._signature) if self._file else None
+            stale = await self._store.mark_stale(self._user_id, inp.get("supplier"),
+                                                 signature, date_str)
+            if stale:
+                what = "; ".join(
+                    (f"{t['tm_name'] or t['tm_code']}"
+                     + (f" / {t['collection']}" if t["collection"] else "")
+                     + f" (прайс от {t['price_date'][:10]})") for t in stale[:5])
+                stale_note = (f"\n\n⚠️ Скажи админу: этот прайс от {date_str} новее, чем "
+                              f"прайсы отложенных задач — {what}. Они устарели, снять: "
+                              "/deferred_clear_stale")
         names = ", ".join(t["name"] for t in tms)
-        return (f"План принят: {len(tms)} марок — {names}.\n"
+        return (f"План принят: {len(tms)} марок — {names}." + stale_note + "\n"
                 f"Обрабатывай ПО ОДНОЙ, начни с «{tms[0]['name']}»: сопоставь её коллекции "
                 "и вызови propose_prices только по ней. К следующей переходи после того, "
                 "как админ нажмёт кнопку.")
+
+    async def _start_stage(self, inp: dict) -> str:
+        colls = [c for c in inp.get("collections") or [] if c.get("ref")]
+        if not colls:
+            return "Не переданы коллекции — очередь по марке не начата."
+        run = await self._store.start_stage(
+            self._user_id, inp["tm_code"], inp.get("tm_name") or inp["tm_code"], colls)
+        left = (run or {}).get("stage", {}).get("remaining") or []
+        names = ", ".join(c["name"] for c in left)
+        return (f"Марка разбита на {len(left)} коллекций: {names}.\n"
+                f"Начни с «{left[0]['name']}» — propose_prices по ней одной. К следующей "
+                "переходи после кнопки админа, как и с марками.")
+
+    async def _defer(self, inp: dict) -> str:
+        saved = await self._store.defer_task(self._user_id, {
+            **{k: inp.get(k) for k in ("tm_code", "tm_name", "collection_ref",
+                                       "collection", "reason")},
+            **(await self.run_context()),
+        })
+        what = inp.get("collection") or inp.get("tm_name") or inp.get("tm_code")
+        if not saved:
+            return f"«{what}» уже в списке отложенных — повторно не завожу."
+        return (f"Отложено: {what}. Прайс сохранён, вернуться можно командой "
+                "/deferred_resume без пересылки файла.")
+
+    async def run_context(self) -> dict:
+        """Реквизиты прайса для отложенной задачи + сам файл на диск."""
+        run = await self._store.get_run(self._user_id) or {}
+        ctx = {"supplier": run.get("supplier"), "price_doc": run.get("price_doc"),
+               "price_date": run.get("price_date"), "signature": None, "file_path": None}
+        if self._file:
+            ctx["signature"] = await asyncio.to_thread(self._signature)
+            path = await asyncio.to_thread(save_price_file, self._store.db_path,
+                                           self._file[0], self._file[1])
+            ctx["file_path"] = str(path) if path else None
+        return ctx
 
     async def _add_note(self, inp: dict) -> str:
         added = await self._store.add_run_notes(self._user_id, inp.get("notes") or [])
@@ -764,6 +913,35 @@ class PricingTools:
                     "propose_prices только по первой марке, а к следующей переходи после "
                     "того, как админ нажмёт кнопку по этой.")
 
+        run = await self._store.get_run(self._user_id)
+        stage = (run or {}).get("stage")
+        tm_code = next(iter(tms), None)
+
+        # Крупная марка разбирается по коллекциям (§9.6.2). Порог проверяет КОД: у модели
+        # на 900+ позициях не хватает хода, и раньше она отдавала выбор админу вопросом.
+        if tm_code and not (stage and stage.get("tm_code") == tm_code):
+            nom = await asyncio.to_thread(self._nom, tm_code)
+            if len(nom.items) >= BIG_TM_ITEMS:
+                colls = {}
+                for i in nom.items:
+                    colls.setdefault(i.collection_ref or "",
+                                     i.collection or i.parent or "без коллекции")
+                names = ", ".join(sorted(colls.values())[:15])
+                return (f"В этой марке {len(nom.items)} поз. и {len(colls)} коллекций — "
+                        "разбираем по коллекциям, целиком за один заход не берём. Вызови "
+                        "start_tm_collections, перечислив коллекции марки, которые есть В "
+                        f"ПРАЙСЕ (в 1С их: {names}"
+                        + (", …" if len(colls) > 15 else "")
+                        + "), и дальше передавай propose_prices по одной коллекции.")
+
+        # в режиме коллекций — ровно одна за вызов, симметрично правилу «одна ТМ»
+        if stage and stage.get("tm_code") == tm_code:
+            refs = {g.get("collection_ref") for g in inp.get("groups") or []}
+            if len(refs) > 1:
+                return ("Сейчас марка разбирается по коллекциям — передавай в "
+                        "propose_prices ОДНУ коллекцию за вызов. Порядок: "
+                        + ", ".join(c["name"] for c in stage["remaining"]))
+
         seen_tm: set[str] = set()
         for g in inp.get("groups", []):
             nom = await asyncio.to_thread(self._nom, g["tm_code"])
@@ -821,27 +999,31 @@ class PricingTools:
         summary = self._render(inp, results, problems, payload, active)
         self.last_summary = summary
 
-        tm_code = next(iter(tms), None)
+        coll_ref = next((g.get("collection_ref") for g in inp.get("groups") or []), None)
+        in_stage = bool(stage and stage.get("tm_code") == tm_code)
+
         if payload:
             await self._store.save_proposal(self._user_id, payload, summary,
                                             digest=self._digest(inp, results))
             run = await self._store.get_run(self._user_id)
-            left = [t["name"] for t in run["remaining"] if t["code"] != tm_code] if run else []
-            tail = f"\n\nОсталось обработать: {', '.join(left)}." if left else ""
-            return (summary + tail
+            return (summary + queue_tail(run, tm_code, coll_ref if in_stage else None)
                     + "\n\n[Предложение сохранено. Покажи этот текст админу дословно "
-                      "и жди нажатия кнопки — сам ничего не записывай и к следующей марке "
-                      "НЕ переходи: я сам скажу, когда админ подтвердит.]")
+                      "и жди нажатия кнопки — сам ничего не записывай и дальше по очереди "
+                      "НЕ иди: я сам скажу, когда админ ответит.]")
 
-        # писать нечего — подтверждать нечего, марку закрываем сразу и идём дальше
-        run = await self._store.mark_tm_done(self._user_id, tm_code) if tm_code else None
-        if run and run["remaining"]:
-            nxt = run["remaining"][0]["name"]
+        # писать нечего — подтверждать нечего, шаг закрываем сразу и идём дальше
+        if in_stage and coll_ref:
+            run = await self._store.mark_collection_done(self._user_id, coll_ref)
+        elif tm_code:
+            run = await self._store.mark_tm_done(self._user_id, tm_code)
+        else:
+            run = None
+        nxt = next_step(run)
+        if nxt:
             self.advanced_to = nxt
-            return (summary + "\n\nОсталось обработать: "
-                    + ", ".join(t["name"] for t in run["remaining"])
-                    + f".\n\n[Записывать нечего, кнопки не будет. Покажи текст админу "
-                      f"и сразу продолжай со следующей марки: {nxt}.]")
+            return (summary + queue_tail(run)
+                    + f"\n\n[Записывать нечего, кнопки не будет. Покажи текст админу "
+                      f"и сразу продолжай: {nxt}.]")
         # итоговый блок и выход из режима печатает обработчик — он один на оба пути
         return summary + "\n\n[Записывать нечего — кнопка подтверждения не появится.]"
 

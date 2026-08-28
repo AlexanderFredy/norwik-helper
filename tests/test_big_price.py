@@ -160,8 +160,8 @@ class AutoAdvanceTest(unittest.IsolatedAsyncioTestCase):
         await ph._run(chat, "прайс", Orc(box), self.onec, self.store, chat, user_id=42)
 
         text = "\n".join(chat.sent)
-        self.assertIn("Перехожу к марке Ceracasa", text)
-        self.assertIn("Перехожу к марке Imola", text)
+        self.assertIn("Перехожу к Ceracasa", text)
+        self.assertIn("Перехожу к Imola", text)
         self.assertIn("Прайс «Price.xls» обработан полностью", text)
         self.assertIsNone(await self.store.get_run(42))     # прогон закрыт
         self.assertNotIn(42, ph._files)

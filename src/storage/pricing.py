@@ -57,8 +57,31 @@ CREATE TABLE IF NOT EXISTS price_run (
     planned    TEXT NOT NULL,       -- JSON: [{code, name}] в порядке обработки
     done       TEXT NOT NULL,       -- JSON: [code] уже обработанных
     notes      TEXT NOT NULL DEFAULT '[]',  -- замечания по прайсу в целом: показать в конце
+    price_date TEXT,                -- дата прайса: по ней считается устаревание задач
+    stage      TEXT,                -- очередь коллекций внутри текущей марки (§9.6.2)
     started_at TEXT NOT NULL
 );
+-- Отложенные задачи: к чему решили вернуться позже (§9.7). Переживают конец прогона и
+-- перезапуск бота, поэтому отдельно от price_run, который в конце очищается.
+CREATE TABLE IF NOT EXISTS deferred_tasks (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        INTEGER NOT NULL,
+    supplier       TEXT,
+    supplier_norm  TEXT,            -- сверка «прайс того же поставщика»
+    price_doc      TEXT,
+    price_date     TEXT,            -- дата прайса: ТОЛЬКО по ней считается устаревание
+    signature      TEXT,            -- сигнатура формата (§6.5.2) — второй признак того же прайса
+    file_path      TEXT,            -- сохранённый прайс, если сохранить удалось
+    tm_code        TEXT NOT NULL,
+    tm_name        TEXT NOT NULL DEFAULT '',
+    collection_ref TEXT NOT NULL DEFAULT '',
+    collection     TEXT NOT NULL DEFAULT '',
+    reason         TEXT,
+    stale          INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL,
+    UNIQUE (user_id, tm_code, collection_ref)
+);
+CREATE INDEX IF NOT EXISTS ix_deferred_user ON deferred_tasks (user_id, created_at);
 -- Категории товаров, которые вообще анализируем (§6.8). Пусто = ограничений нет.
 -- Задаётся один раз на все прайсы, а не на каждый файл.
 CREATE TABLE IF NOT EXISTS product_scope (
@@ -139,6 +162,11 @@ class PricingStore:
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
 
+    @property
+    def db_path(self) -> Path:
+        """Путь к базе — рядом с ней лежат сохранённые прайсы (§9.7)."""
+        return self._db_path
+
     async def init(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self._db_path) as db:
@@ -149,9 +177,14 @@ class PricingStore:
             if "digest" not in columns:
                 await db.execute("ALTER TABLE pending_proposal ADD COLUMN digest TEXT")
             cur = await db.execute("PRAGMA table_info(price_run)")
-            if "notes" not in {row[1] for row in await cur.fetchall()}:
+            run_columns = {row[1] for row in await cur.fetchall()}
+            if "notes" not in run_columns:
                 await db.execute("ALTER TABLE price_run ADD COLUMN notes TEXT "
                                  "NOT NULL DEFAULT '[]'")
+            if "stage" not in run_columns:
+                await db.execute("ALTER TABLE price_run ADD COLUMN stage TEXT")
+            if "price_date" not in run_columns:
+                await db.execute("ALTER TABLE price_run ADD COLUMN price_date TEXT")
             await self._migrate_mappings(db)
             await db.commit()
 
@@ -271,6 +304,13 @@ class PricingStore:
     async def mark_applied(self, proposal_id: int) -> None:
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute("UPDATE pending_proposal SET status = 'applied' "
+                             "WHERE proposal_id = ?", (proposal_id,))
+            await db.commit()
+
+    async def mark_rejected(self, proposal_id: int) -> None:
+        """Предложение снято с рассмотрения: «Пропустить»/«Отложить» (§9.7)."""
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("UPDATE pending_proposal SET status = 'rejected' "
                              "WHERE proposal_id = ?", (proposal_id,))
             await db.commit()
 
@@ -451,15 +491,17 @@ class PricingStore:
     # ----------------------------------------------- прогон прайса по маркам (§9.6)
 
     async def start_run(self, user_id: int, supplier: str | None, price_doc: str | None,
-                        trademarks: list[dict]) -> None:
+                        trademarks: list[dict], price_date: str | None = None) -> None:
         """Новый прогон заменяет прежний: один прайс у админа в работе за раз."""
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "INSERT INTO price_run (user_id, supplier, price_doc, planned, done, "
-                "started_at) VALUES (?, ?, ?, ?, '[]', ?) ON CONFLICT(user_id) DO UPDATE SET "
+                "INSERT INTO price_run (user_id, supplier, price_doc, price_date, planned, "
+                "done, stage, started_at) VALUES (?, ?, ?, ?, ?, '[]', NULL, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET "
                 "supplier = excluded.supplier, price_doc = excluded.price_doc, "
-                "planned = excluded.planned, done = '[]', started_at = excluded.started_at",
-                (user_id, supplier, price_doc,
+                "price_date = excluded.price_date, planned = excluded.planned, "
+                "done = '[]', stage = NULL, started_at = excluded.started_at",
+                (user_id, supplier, price_doc, price_date or None,
                  json.dumps(trademarks, ensure_ascii=False), _now()))
             await db.commit()
 
@@ -467,15 +509,61 @@ class PricingStore:
         """{supplier, price_doc, planned, done, remaining} либо None."""
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT supplier, price_doc, planned, done, notes FROM price_run "
-                "WHERE user_id = ?", (user_id,))
+                "SELECT supplier, price_doc, planned, done, notes, stage, price_date "
+                "FROM price_run WHERE user_id = ?", (user_id,))
             row = await cur.fetchone()
         if not row:
             return None
         planned, done = json.loads(row[2]), set(json.loads(row[3]))
-        return {"supplier": row[0], "price_doc": row[1], "planned": planned, "done": done,
-                "notes": json.loads(row[4] or "[]"),
+        stage = json.loads(row[5]) if row[5] else None
+        if stage is not None:
+            stage_done = set(stage.get("done") or [])
+            stage["remaining"] = [c for c in stage.get("planned") or []
+                                  if c.get("ref") not in stage_done]
+        return {"supplier": row[0], "price_doc": row[1], "price_date": row[6],
+                "planned": planned, "done": done, "notes": json.loads(row[4] or "[]"),
+                "stage": stage,
                 "remaining": [t for t in planned if t.get("code") not in done]}
+
+    # --------------------------------------- очередь коллекций внутри марки (§9.6.2)
+
+    async def start_stage(self, user_id: int, tm_code: str, tm_name: str,
+                          collections: list[dict]) -> dict | None:
+        """Крупная марка разбирается по коллекциям — очередь второго уровня."""
+        stage = {"tm_code": tm_code, "tm_name": tm_name,
+                 "planned": [{"ref": c["ref"], "name": c.get("name") or c["ref"]}
+                             for c in collections if c.get("ref")],
+                 "done": []}
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("UPDATE price_run SET stage = ? WHERE user_id = ?",
+                             (json.dumps(stage, ensure_ascii=False), user_id))
+            await db.commit()
+        return await self.get_run(user_id)
+
+    async def mark_collection_done(self, user_id: int, collection_ref: str) -> dict | None:
+        """Закрыть коллекцию; когда очередь опустела — закрыть и саму марку."""
+        run = await self.get_run(user_id)
+        stage = (run or {}).get("stage")
+        if not stage:
+            return run
+        done = sorted(set(stage.get("done") or []) | {collection_ref})
+        rest = [c for c in stage.get("planned") or [] if c.get("ref") not in set(done)]
+        if rest:
+            stage["done"] = done
+            async with aiosqlite.connect(self._db_path) as db:
+                await db.execute("UPDATE price_run SET stage = ? WHERE user_id = ?",
+                                 (json.dumps(stage, ensure_ascii=False), user_id))
+                await db.commit()
+            return await self.get_run(user_id)
+        # коллекции кончились — марка пройдена, второй уровень сворачивается
+        await self.clear_stage(user_id)
+        return await self.mark_tm_done(user_id, stage["tm_code"])
+
+    async def clear_stage(self, user_id: int) -> None:
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("UPDATE price_run SET stage = NULL WHERE user_id = ?",
+                             (user_id,))
+            await db.commit()
 
     async def add_run_notes(self, user_id: int, notes: list[str]) -> int:
         """Замечания по прайсу в целом — копятся и показываются один раз, в конце (§9.6).
@@ -515,6 +603,103 @@ class PricingStore:
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute("DELETE FROM price_run WHERE user_id = ?", (user_id,))
             await db.commit()
+
+    # ------------------------------------------------ отложенные задачи (§9.7)
+
+    _DEFERRED_FIELDS = ("supplier", "supplier_norm", "price_doc", "price_date", "signature",
+                        "file_path", "tm_code", "tm_name", "collection_ref", "collection",
+                        "reason")
+
+    async def defer_task(self, user_id: int, task: dict) -> bool:
+        """Отложить марку или коллекцию. Повтор того же объекта не плодит записей."""
+        from src.price_tool.scope import normalize
+
+        row = {f: task.get(f) or "" for f in self._DEFERRED_FIELDS}
+        if not row["tm_code"]:
+            return False
+        row["supplier_norm"] = normalize(task.get("supplier"))
+        row["file_path"] = task.get("file_path") or None
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                f"INSERT OR IGNORE INTO deferred_tasks (user_id, "
+                f"{', '.join(self._DEFERRED_FIELDS)}, created_at) "
+                f"VALUES ({', '.join('?' * (len(self._DEFERRED_FIELDS) + 2))})",
+                (user_id, *(row[f] for f in self._DEFERRED_FIELDS), _now()))
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def list_deferred(self, user_id: int) -> list[dict]:
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT id, tm_name, tm_code, collection, collection_ref, supplier, "
+                "price_doc, price_date, file_path, stale, reason FROM deferred_tasks "
+                "WHERE user_id = ? ORDER BY id", (user_id,))
+            rows = await cur.fetchall()
+        keys = ("id", "tm_name", "tm_code", "collection", "collection_ref", "supplier",
+                "price_doc", "price_date", "file_path", "stale", "reason")
+        return [dict(zip(keys, r)) for r in rows]
+
+    async def _drop_deferred(self, user_id: int, where: str, params: tuple) -> list[str]:
+        """Удаляет записи и возвращает файлы, на которые больше никто не ссылается."""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                f"SELECT file_path FROM deferred_tasks WHERE user_id = ? AND {where}",
+                (user_id, *params))
+            touched = {r[0] for r in await cur.fetchall() if r[0]}
+            await db.execute(
+                f"DELETE FROM deferred_tasks WHERE user_id = ? AND {where}",
+                (user_id, *params))
+            await db.commit()
+            if not touched:
+                return []
+            cur = await db.execute(
+                "SELECT DISTINCT file_path FROM deferred_tasks WHERE file_path IS NOT NULL")
+            still_used = {r[0] for r in await cur.fetchall()}
+        return sorted(touched - still_used)
+
+    async def forget_deferred(self, user_id: int, task_id: int) -> list[str]:
+        return await self._drop_deferred(user_id, "id = ?", (task_id,))
+
+    async def clear_deferred(self, user_id: int, stale_only: bool = False) -> list[str]:
+        return await self._drop_deferred(user_id, "stale = 1" if stale_only else "1 = 1", ())
+
+    async def drop_deferred_for(self, user_id: int, tm_code: str,
+                                collection_ref: str = "") -> list[str]:
+        """Объект реально обработан — держать по нему отложенную задачу незачем."""
+        return await self._drop_deferred(
+            user_id, "tm_code = ? AND collection_ref = ?", (tm_code, collection_ref or ""))
+
+    async def mark_stale(self, user_id: int, supplier: str | None, signature: str | None,
+                         price_date: str | None) -> list[dict]:
+        """Пометить задачи, которые перекрыты БОЛЕЕ СВЕЖИМ прайсом того же поставщика.
+
+        Сравниваются ТОЛЬКО даты прайсов. Тот же прайс, присланный заново, — обычный
+        способ вернуться к отложенному, и ронять из-за него задачу нельзя; переэкспорт с
+        той же датой тоже не устаревание, хотя содержимое файла и отличается. Нет даты у
+        нового прайса или у задачи — сравнивать не с чем, молчим.
+        """
+        from src.price_tool.scope import normalize
+
+        day = (price_date or "")[:10]
+        if len(day) != 10:
+            return []
+        norm = normalize(supplier)
+        if not norm and not signature:
+            return []
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT id, tm_name, tm_code, collection, price_date FROM deferred_tasks "
+                "WHERE user_id = ? AND stale = 0 AND length(price_date) >= 10 "
+                "AND substr(price_date, 1, 10) < ? "
+                "AND ((? <> '' AND supplier_norm = ?) OR (? <> '' AND signature = ?))",
+                (user_id, day, norm, norm, signature or "", signature or ""))
+            rows = await cur.fetchall()
+            if rows:
+                await db.executemany("UPDATE deferred_tasks SET stale = 1 WHERE id = ?",
+                                     [(r[0],) for r in rows])
+                await db.commit()
+        keys = ("id", "tm_name", "tm_code", "collection", "price_date")
+        return [dict(zip(keys, r)) for r in rows]
 
     # -------------------------------------------------- категории товаров (§6.8)
 

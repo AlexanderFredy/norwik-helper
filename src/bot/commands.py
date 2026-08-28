@@ -23,6 +23,8 @@ ADMIN_COMMANDS = COMMON_COMMANDS + [
     BotCommand(command="categories", description="Категории товаров, которые анализируем"),
     BotCommand(command="category_add", description="Добавить категорию"),
     BotCommand(command="category_remove", description="Убрать категорию"),
+    BotCommand(command="deferred", description="Отложенные задачи"),
+    BotCommand(command="deferred_resume", description="Вернуться к отложенной"),
     BotCommand(command="exclusives", description="Эксклюзивы поставщиков"),
     BotCommand(command="exclusive_forget", description="Снять пометку эксклюзива"),
     BotCommand(command="adduser", description="Добавить пользователя"),
@@ -66,6 +68,19 @@ _ADMIN_HELP = """
 /categories — текущий список
 /category_add ламинат, керамическая плитка — добавить
 /category_remove плинтус — убрать
+
+<b>Отложенные задачи</b>
+Под каждым предложением есть кнопки: «Пропустить» — не менять цены и идти дальше,
+«Отложить» — то же, но запомнить, что сюда надо вернуться. Прайс при этом
+сохраняется на сервере, так что присылать файл заново не придётся.
+Крупная марка (от 300 позиций в 1С) разбирается по коллекциям сама — вопросов
+об объёме бот больше не задаёт.
+
+/deferred — список отложенного
+/deferred_resume &lt;номер&gt; — вернуться к задаче
+/deferred_forget &lt;номер&gt; — убрать одну
+/deferred_clear — убрать все
+/deferred_clear_stale — убрать те, что перекрыты более свежим прайсом
 
 <b>Эксклюзивы поставщиков</b>
 Если в прайсе написано «эксклюзив», я это запомню и буду добавлять пометку после
