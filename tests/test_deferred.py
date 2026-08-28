@@ -293,11 +293,71 @@ class ButtonsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["price_date"], "2026-08-26")
         self.assertTrue(Path(row["file_path"]).exists())
 
+    async def test_defer_tm_from_tm_mode(self):
+        """В режиме марок откладывается марка целиком — коллекция в задаче не указана."""
+        chat = await self._press("defer_tm")
+        self.assertIn("целиком", chat.text)
+        [row] = await self.store.list_deferred(42)
+        self.assertEqual(row["collection_ref"], "")
+
+    async def test_defer_tm_from_collection_mode_closes_the_whole_tm(self):
+        """Отложили марку, стоя на коллекции: остальные её коллекции не спрашиваем."""
+        await self.store.start_stage(42, "T1", "Atlas Concorde Rus", [
+            {"ref": "YO-C", "name": "Allure"}, {"ref": "YO-D", "name": "Drift"}])
+        chat = await self._press("defer_tm")
+        self.assertIn("целиком", chat.text)
+        run = await self.store.get_run(42)
+        self.assertIsNone(run["stage"])                       # очередь коллекций свёрнута
+        self.assertEqual([t["name"] for t in run["remaining"]], ["Azteca"])
+        [row] = await self.store.list_deferred(42)
+        self.assertEqual(row["collection_ref"], "")
+
+    async def test_defer_collection_keeps_the_tm_in_queue(self):
+        await self.store.start_stage(42, "T1", "Atlas Concorde Rus", [
+            {"ref": "YO-C", "name": "Allure"}, {"ref": "YO-D", "name": "Drift"}])
+        await self._press("defer")
+        run = await self.store.get_run(42)
+        self.assertEqual([c["name"] for c in run["stage"]["remaining"]], ["Drift"])
+        [row] = await self.store.list_deferred(42)
+        self.assertEqual(row["collection_ref"], "YO-C")
+
     async def test_cancel_keeps_the_step(self):
         chat = await self._press("cancel")
         self.assertIn("Отменено", chat.text)
         self.assertEqual([t["name"] for t in (await self.store.get_run(42))["remaining"]],
                          ["Atlas Concorde Rus", "Azteca"])
+
+
+class KeyboardTest(unittest.TestCase):
+    """В режиме коллекций «Отложить» двусмысленна — поэтому кнопок две."""
+
+    @staticmethod
+    def _texts(markup):
+        return [b.text for row in markup.inline_keyboard for b in row]
+
+    @staticmethod
+    def _actions(markup):
+        return [b.callback_data.split(":")[1]
+                for row in markup.inline_keyboard for b in row]
+
+    def test_tm_mode_has_one_defer(self):
+        markup = ph._keyboard(7, in_stage=False)
+        self.assertEqual(self._actions(markup),
+                         ["apply", "skip", "defer_tm", "cancel"])
+        self.assertIn("🕐 Отложить марку целиком", self._texts(markup))
+
+    def test_collection_mode_has_both(self):
+        markup = ph._keyboard(7, in_stage=True)
+        self.assertEqual(self._actions(markup),
+                         ["apply", "skip", "defer", "defer_tm", "cancel"])
+        self.assertIn("🕐 Отложить коллекцию", self._texts(markup))
+        self.assertIn("🕐 Отложить марку", self._texts(markup))
+
+    def test_cancel_explains_itself(self):
+        """Иначе «Отмена» и «Пропустить» неотличимы на вид."""
+        for stage in (False, True):
+            self.assertIn("✖️ Отмена (остаться на текущей задаче)",
+                          self._texts(ph._keyboard(7, in_stage=stage)))
 
 
 async def _noop():

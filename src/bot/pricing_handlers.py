@@ -52,23 +52,39 @@ _STATUS = {
 _files: dict[int, tuple[str, bytes]] = {}
 
 
-def _keyboard(proposal_id: int) -> InlineKeyboardMarkup:
-    """Второй ряд — движение по очереди (§9.7).
+def _keyboard(proposal_id: int, in_stage: bool = False) -> InlineKeyboardMarkup:
+    """Кнопки под предложением (§9.7).
 
     «Отмена» отклоняет предложение и ОСТАВЛЯЕТ на этом шаге: админ хочет переспросить
-    агента. «Пропустить» шаг закрывает и двигает очередь дальше, «Отложить» вдобавок
-    заводит задачу, чтобы вернуться к шагу позже.
+    агента. «Пропустить» шаг закрывает и двигает очередь, «Отложить» вдобавок заводит
+    задачу на возврат.
+
+    Когда марка разбита на коллекции (`in_stage`), «Отложить» без уточнения двусмысленна —
+    коллекцию или всю марку? — поэтому кнопки две. В режиме марок откладывать можно только
+    марку целиком, и вторая кнопка не нужна.
     """
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Записать в 1С",
-                              callback_data=f"price:apply:{proposal_id}"),
-         InlineKeyboardButton(text="✖️ Отмена",
-                              callback_data=f"price:cancel:{proposal_id}")],
-        [InlineKeyboardButton(text="⏭ Пропустить",
-                              callback_data=f"price:skip:{proposal_id}"),
-         InlineKeyboardButton(text="🕐 Отложить",
-                              callback_data=f"price:defer:{proposal_id}")],
-    ])
+    rows = [[InlineKeyboardButton(text="✅ Записать в 1С",
+                                  callback_data=f"price:apply:{proposal_id}"),
+             InlineKeyboardButton(text="⏭ Пропустить",
+                                  callback_data=f"price:skip:{proposal_id}")]]
+    if in_stage:
+        rows.append([
+            InlineKeyboardButton(text="🕐 Отложить коллекцию",
+                                 callback_data=f"price:defer:{proposal_id}"),
+            InlineKeyboardButton(text="🕐 Отложить марку",
+                                 callback_data=f"price:defer_tm:{proposal_id}")])
+    else:
+        rows.append([InlineKeyboardButton(text="🕐 Отложить марку целиком",
+                                          callback_data=f"price:defer_tm:{proposal_id}")])
+    rows.append([InlineKeyboardButton(text="✖️ Отмена (остаться на текущей задаче)",
+                                      callback_data=f"price:cancel:{proposal_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _in_stage(store: PricingStore, user_id: int) -> bool:
+    """Идём ли сейчас по коллекциям внутри марки."""
+    run = await store.get_run(user_id)
+    return bool((run or {}).get("stage"))
 
 
 def _chunks(text: str) -> list[str]:
@@ -235,7 +251,9 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
             pass
 
         pending = await store.get_pending(user_id)
-        await _send(message, answer, _keyboard(pending.proposal_id) if pending else None)
+        markup = (_keyboard(pending.proposal_id, await _in_stage(store, user_id))
+                  if pending else None)
+        await _send(message, answer, markup)
         if pending is not None:
             return                       # ждём кнопку админа
 
@@ -678,7 +696,7 @@ async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: Pr
         await callback.answer("Только администратор", show_alert=True)
         return
 
-    if action in ("skip", "defer"):
+    if action in ("skip", "defer", "defer_tm"):
         await _skip_or_defer(callback, action, int(raw_id), onec, pricing_store,
                              orchestrator, user_id)
         return
@@ -709,7 +727,8 @@ async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: Pr
         await pricing_store.release(proposal.proposal_id)
         await progress.edit_text(
             f"Ошибка записи в 1С: {exc}\nЦены не обновлены — можно повторить.",
-            reply_markup=_keyboard(proposal.proposal_id))
+            reply_markup=_keyboard(proposal.proposal_id,
+                                   await _in_stage(pricing_store, user_id)))
         return
 
     await pricing_store.mark_applied(proposal.proposal_id)
@@ -762,11 +781,18 @@ def _step_of(proposal) -> dict:
             "collection": first.get("collection") or ""}
 
 
-async def _close_step(store: PricingStore, user_id: int, step: dict) -> dict | None:
-    """Пометить шаг пройденным на том уровне очереди, на котором мы находимся (§9.6.2)."""
+async def _close_step(store: PricingStore, user_id: int, step: dict,
+                      whole_tm: bool = False) -> dict | None:
+    """Пометить шаг пройденным на том уровне очереди, на котором мы находимся (§9.6.2).
+
+    `whole_tm` закрывает марку вместе с недоработанными коллекциями: админ отложил её
+    целиком, и оставшиеся коллекции спрашивать по одной незачем.
+    """
     run = await store.get_run(user_id)
     stage = (run or {}).get("stage")
-    if stage and stage.get("tm_code") == step["tm_code"] and step["collection_ref"]:
+    if whole_tm and stage and stage.get("tm_code") == step["tm_code"]:
+        await store.clear_stage(user_id)
+    elif stage and stage.get("tm_code") == step["tm_code"] and step["collection_ref"]:
         return await store.mark_collection_done(user_id, step["collection_ref"])
     if step["tm_code"]:
         return await store.mark_tm_done(user_id, step["tm_code"])
@@ -802,19 +828,26 @@ async def _skip_or_defer(callback: CallbackQuery, action: str, proposal_id: int,
     await callback.message.edit_reply_markup(reply_markup=None)
 
     step = _step_of(proposal)
+    whole_tm = action == "defer_tm"
+    if whole_tm:
+        # откладываем марку целиком — коллекция в задаче не указывается, иначе вернуться
+        # к ней получится только по одной этой коллекции
+        step = {**step, "collection_ref": "", "collection": ""}
     title = step["collection"] or step["tm_name"] or step["tm_code"] or "шаг"
-    if action == "defer":
+
+    if action == "skip":
+        head = f"Пропущено: {title}. Цены не менялись."
+    else:
         tools = PricingTools(onec, store, user_id)
         if user_id in _files:
             tools.set_file(*_files[user_id])
         saved = await store.defer_task(user_id, {**step, **(await tools.run_context())})
-        head = (f"Отложено: {title}. Вернуться — /deferred, файл присылать не нужно."
-                if saved else f"«{title}» уже в списке отложенных.")
-    else:
-        head = f"Пропущено: {title}. Цены не менялись."
+        what = f"марка {title} целиком" if whole_tm else title
+        head = (f"Отложено: {what}. Вернуться — /deferred, файл присылать не нужно."
+                if saved else f"«{what}» уже в списке отложенных.")
     await callback.answer()
 
-    run = await _close_step(store, user_id, step)
+    run = await _close_step(store, user_id, step, whole_tm=whole_tm)
     await _send(callback.message, head + queue_tail(run))
     await _continue_or_finish(callback.message, store, user_id, run, orchestrator, onec,
                               "Этот шаг пропускаем.")
