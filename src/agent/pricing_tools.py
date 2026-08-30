@@ -168,6 +168,8 @@ PRICING_TOOLS = [
                         "properties": {
                             "code": {"type": "string", "description": "код ТМ из get_selling_tm"},
                             "name": {"type": "string"},
+                            "first_row": {"type": "integer", "description": "с какой строки прайса начинается раздел бренда — запомню, чтобы при повторной присылке того же файла не искать заново"},
+                            "last_row": {"type": "integer"},
                         },
                         "required": ["code", "name"],
                         "additionalProperties": False,
@@ -542,10 +544,11 @@ class PricingTools:
         signature = await asyncio.to_thread(self._signature)
         if not signature:
             return self._attach(text + scope)
+        layout = await self._layout_note(signature)
         known = await self._store.get_mappings(signature)
         if not known:
             return self._attach(
-                text + scope
+                text + scope + layout
                 + "\n\n[Формат прайса встречается впервые: трактовку колонок нужно "
                 "определить, при неоднозначности — спросить админа и сохранить "
                 "через save_price_mapping (по одному вызову на КАЖДЫЙ лист с ценами).]")
@@ -565,10 +568,11 @@ class PricingTools:
               "save_price_mapping с указанием листа. Пропускать лист можно только "
               "потому, что его категория товара вне анализа, или потому, что так сказал "
               "админ — но об этом всё равно скажи в предложении.]")
-        return self._attach(text + scope + "\n".join(block))
+        return self._attach(text + scope + layout + "\n".join(block))
 
     async def _start_run(self, inp: dict) -> str:
-        tms = [{"code": t["code"], "name": t.get("name") or t["code"]}
+        tms = [{"code": t["code"], "name": t.get("name") or t["code"],
+                **{k: t[k] for k in ("first_row", "last_row") if t.get(k)}}
                for t in inp.get("trademarks") or [] if t.get("code")]
         if not tms:
             return "Не переданы торговые марки — план не принят."
@@ -589,6 +593,13 @@ class PricingTools:
                 stale_note = (f"\n\n⚠️ Скажи админу: этот прайс от {date_str} новее, чем "
                               f"прайсы отложенных задач — {what}. Они устарели, снять: "
                               "/deferred_clear_stale")
+        # раскладку запоминаем по сигнатуре файла: тот же прайс, присланный заново,
+        # разведку брендов повторять не заставит (§6.9)
+        signature = await asyncio.to_thread(self._signature) if self._file else None
+        if signature:
+            await self._store.drop_old_layouts(inp.get("supplier"), date_str)
+            await self._store.save_layout(signature, inp.get("supplier"), doc,
+                                          date_str, tms)
         names = ", ".join(t["name"] for t in tms)
         return (f"План принят: {len(tms)} марок — {names}." + stale_note + "\n"
                 f"Обрабатывай ПО ОДНОЙ, начни с «{tms[0]['name']}»: сопоставь её коллекции "
@@ -643,6 +654,23 @@ class PricingTools:
         scope = [c["category"] for c in await self._store.list_scope()]
         return json.dumps({"categories": scope, "instruction": describe(scope)},
                           ensure_ascii=False)
+
+    async def _layout_note(self, signature: str) -> str:
+        """Если этот же файл уже разбирался — отдаём готовую раскладку брендов."""
+        layout = await self._store.get_layout(signature)
+        if not layout or not layout.get("sections"):
+            return ""
+        rows = []
+        for sec in layout["sections"]:
+            where = ""
+            if sec.get("first_row"):
+                where = f", строки {sec['first_row']}" + (
+                    f"–{sec['last_row']}" if sec.get("last_row") else " и далее")
+            rows.append(f"{sec.get('name') or sec.get('code')} ({sec.get('code')}){where}")
+        return ("\n\n[ЭТОТ ПРАЙС УЖЕ РАЗБИРАЛСЯ " + (layout.get("updated_at") or "")[:10]
+                + ". Разведку брендов повторять НЕ НУЖНО, вот сохранённая раскладка: "
+                + "; ".join(rows) + ". Передай в start_price_run этот же список и сразу "
+                "читай нужный раздел через from_row.]")
 
     async def _scope_note(self) -> str:
         scope = [c["category"] for c in await self._store.list_scope()]

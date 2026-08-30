@@ -82,6 +82,18 @@ CREATE TABLE IF NOT EXISTS deferred_tasks (
     UNIQUE (user_id, tm_code, collection_ref)
 );
 CREATE INDEX IF NOT EXISTS ix_deferred_user ON deferred_tasks (user_id, created_at);
+-- Раскладка разобранного прайса: где какой бренд (§6.9). Ключ — сигнатура файла, то есть
+-- ТОТ ЖЕ прайс узнаётся при повторной присылке и разведку заново делать не нужно.
+-- Чистится, когда от того же поставщика пришёл прайс НОВЕЕ.
+CREATE TABLE IF NOT EXISTS price_layout (
+    signature     TEXT PRIMARY KEY,
+    supplier      TEXT,
+    supplier_norm TEXT,
+    price_doc     TEXT,
+    price_date    TEXT,
+    sections      TEXT NOT NULL,     -- JSON: [{code, name, first_row, last_row}]
+    updated_at    TEXT NOT NULL
+);
 -- Категории товаров, которые вообще анализируем (§6.8). Пусто = ограничений нет.
 -- Задаётся один раз на все прайсы, а не на каждый файл.
 CREATE TABLE IF NOT EXISTS product_scope (
@@ -603,6 +615,59 @@ class PricingStore:
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute("DELETE FROM price_run WHERE user_id = ?", (user_id,))
             await db.commit()
+
+    # ------------------------------------------- раскладка прайса (§6.9)
+
+    async def save_layout(self, signature: str, supplier: str | None, price_doc: str | None,
+                          price_date: str | None, sections: list[dict]) -> None:
+        """Запомнить, где какой бренд в этом файле."""
+        from src.price_tool.scope import normalize
+
+        if not signature or not sections:
+            return
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO price_layout (signature, supplier, supplier_norm, price_doc, "
+                "price_date, sections, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(signature) DO UPDATE SET supplier = excluded.supplier, "
+                "supplier_norm = excluded.supplier_norm, price_doc = excluded.price_doc, "
+                "price_date = excluded.price_date, sections = excluded.sections, "
+                "updated_at = excluded.updated_at",
+                (signature, supplier, normalize(supplier), price_doc, (price_date or "")[:10],
+                 json.dumps(sections, ensure_ascii=False), _now()))
+            await db.commit()
+
+    async def get_layout(self, signature: str) -> dict | None:
+        if not signature:
+            return None
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT supplier, price_doc, price_date, sections, updated_at "
+                "FROM price_layout WHERE signature = ?", (signature,))
+            row = await cur.fetchone()
+        if not row:
+            return None
+        return {"supplier": row[0], "price_doc": row[1], "price_date": row[2],
+                "sections": json.loads(row[3]), "updated_at": row[4]}
+
+    async def drop_old_layouts(self, supplier: str | None, price_date: str | None) -> int:
+        """Пришёл прайс НОВЕЕ от того же поставщика — прежние раскладки устарели.
+
+        Сравниваются только даты: тот же прайс, присланный заново, свою раскладку
+        сохраняет — ради этого всё и заводилось.
+        """
+        from src.price_tool.scope import normalize
+
+        day = (price_date or "")[:10]
+        norm = normalize(supplier)
+        if len(day) != 10 or not norm:
+            return 0
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "DELETE FROM price_layout WHERE supplier_norm = ? "
+                "AND length(price_date) >= 10 AND price_date < ?", (norm, day))
+            await db.commit()
+            return cur.rowcount
 
     # ------------------------------------------------ отложенные задачи (§9.7)
 

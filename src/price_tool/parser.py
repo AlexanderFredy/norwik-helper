@@ -5,6 +5,7 @@
 Форматы: .xlsx (openpyxl, data_only), .xls (xlrd), .csv. Ошибки не бросаются.
 """
 import csv
+import hashlib
 import io
 import logging
 from dataclasses import dataclass, field
@@ -181,7 +182,23 @@ def _from_csv(content: bytes) -> list[Sheet]:
     return [Sheet(name="csv", rows=rows)]
 
 
-def parse_price_table(content: bytes, filename: str) -> list[Sheet]:
+# Разобранный файл держим в памяти: на прайсе Артисана (12 870 строк) разбор стоит
+# 0.5 c, а за один read_price_file он случался дважды — в самом чтении и внутри
+# price_signature, плюс отдельное открытие книги ради картинок. Токенов это не экономит
+# (за них платим при передаче текста модели), но снимает около минуты ожидания за прогон.
+_PARSED: dict[str, list] = {}
+_PARSED_LIMIT = 2          # админ работает с одним прайсом, второй слот — на пересылку
+
+
+def _cache_key(content: bytes, filename: str) -> str:
+    return hashlib.sha1(content).hexdigest()[:16] + PurePosixPath(filename or "").suffix.lower()
+
+
+def clear_parse_cache() -> None:
+    _PARSED.clear()
+
+
+def _parse_uncached(content: bytes, filename: str) -> list[Sheet]:
     """Разбирает прайс в список листов со строками. Пустой список — если не разобрать."""
     ext = PurePosixPath(filename.lower()).suffix
     try:
@@ -267,3 +284,26 @@ def render_preview(sheet: Sheet, max_rows: int = MAX_PREVIEW_ROWS, max_cols: int
         lines.append(f"... (ещё {len(rows) - last} строк НЕ показано. Дочитай их: "
                      f"read_price_file с sheet=«{sheet.name}» и from_row={last + 1})")
     return "\n".join(lines)
+
+
+def _copy(sheets: list[Sheet]) -> list[Sheet]:
+    """Свежие объекты на каждый вызов.
+
+    Вызывающие мутируют строки — mark_images вставляет в них маркеры картинок. Отдай мы
+    сам кэш, вторая правка легла бы поверх первой и сигнатура файла поехала бы вместе с
+    ней: запомненный маппинг переставал находиться.
+    """
+    return [Sheet(name=sh.name, rows=[list(r) for r in sh.rows]) for sh in sheets]
+
+
+def parse_price_table(content: bytes, filename: str) -> list[Sheet]:
+    """Разбор файла с памятью на повторные вызовы (см. _PARSED)."""
+    key = _cache_key(content, filename)
+    hit = _PARSED.get(key)
+    if hit is not None:
+        return _copy(hit)
+    sheets = _parse_uncached(content, filename)
+    if len(_PARSED) >= _PARSED_LIMIT:
+        _PARSED.pop(next(iter(_PARSED)))
+    _PARSED[key] = sheets
+    return _copy(sheets)
