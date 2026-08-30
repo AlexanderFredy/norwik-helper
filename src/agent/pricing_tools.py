@@ -23,7 +23,7 @@ from src.price_tool.exclusive import (
     HINT_WORDS, WHERE_FOUND, annotate, find, resolve,
 )
 from src.price_tool.parser import (
-    extract_images, find_rows, parse_price_table, render_preview,
+    extract_images, find_rows, non_empty_rows, parse_price_table, render_preview,
 )
 from src.price_tool.scope import describe, in_scope
 from src.price_tool.signature import price_signature
@@ -47,6 +47,13 @@ MAX_IMAGE_TOTAL_BYTES = 4_000_000
 # номенклатуру, и весь раздел прайса модель не может — на Atlas Concorde Rus (932 поз.)
 # она упёрлась и переложила решение на админа.
 BIG_TM_ITEMS = 300
+
+# С какого размера прайс считается дорогим и требует решения админа (§6.10). Замер: прайс
+# Артисана на 12 870 строк обошёлся примерно в 570 тыс. входных токенов за прогон — по нему
+# и построена оценка ниже. Порог намеренно высокий: обычный прайс поставщика в него не
+# попадает, вопрос должен быть редким.
+BIG_PRICE_ROWS = 5000
+MEASURED_ROWS, MEASURED_TOKENS = 12_870, 570_000
 NOM_CACHE_TTL = 1800
 _NOM_CACHE: dict[str, tuple[float, list]] = {}
 # код ТМ → имя из selling-tm. В NomItem названия марки нет, а брать первое слово из
@@ -209,6 +216,29 @@ PRICING_TOOLS = [
                 },
             },
             "required": ["tm_code", "collections"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "set_price_decision",
+        "description": (
+            "Записать ответ админа по КРУПНОМУ прайсу: разбирать его или админ обновит "
+            "цены вручную. Вызывай только после явного ответа админа на вопрос, который "
+            "ты задал по подсказке из read_price_file.\n"
+            "decision=process — разбираем обычным порядком, вопрос больше не повторится.\n"
+            "decision=manual — не разбираем: прайс считается обработанным, в отложенные "
+            "НЕ попадает, админ обновит цены сам."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "decision": {"type": "string", "description": "process | manual"},
+                "supplier": {"type": "string"},
+                "price_doc": {"type": "string"},
+                "price_date": {"type": "string", "description": "дата прайса ГГГГ-ММ-ДД"},
+                "reason": {"type": "string", "description": "словами админа, если назвал"},
+            },
+            "required": ["decision"],
             "additionalProperties": False,
         },
     },
@@ -475,6 +505,8 @@ class PricingTools:
         self.last_summary: str | None = None
         # марка закрылась без кнопки — обработчик сам двинет очередь (§9.6)
         self.advanced_to: str | None = None
+        # админ решил обновить крупный прайс вручную — выходим из режима
+        self.handled_manually = False
 
     def set_file(self, filename: str, content: bytes) -> None:
         self._file = (filename, content)
@@ -492,6 +524,8 @@ class PricingTools:
                 return await self._start_run(inp)
             if name == "start_tm_collections":
                 return await self._start_stage(inp)
+            if name == "set_price_decision":
+                return await self._set_decision(inp)
             if name == "defer_task":
                 return await self._defer(inp)
             if name == "add_final_note":
@@ -514,6 +548,15 @@ class PricingTools:
             return f"Ошибка выполнения {name}: {exc}"
 
     # ------------------------------------------------------------------ чтение
+
+    def _file_key(self) -> str:
+        """Хеш СОДЕРЖИМОГО — им опознаётся «тот же самый прайс» (§6.9, §6.10).
+
+        Сигнатура (§6.5.2) для этого не годится: она считается по скелету файла, поэтому
+        прайс того же поставщика за следующий месяц имеет ту же сигнатуру при других
+        строках — решение «обрабатываю вручную» молча перешло бы на новый файл.
+        """
+        return hashlib.sha1(self._file[1]).hexdigest()[:16] if self._file else ""
 
     def _signature(self) -> str:
         """Сигнатура структуры текущего прайса — ключ маппинга (§6.5.2)."""
@@ -544,7 +587,13 @@ class PricingTools:
         signature = await asyncio.to_thread(self._signature)
         if not signature:
             return self._attach(text + scope)
-        layout = await self._layout_note(signature)
+        # разбор кеширован (§6.9), поэтому получить листы здесь заново почти бесплатно
+        sheets = await asyncio.to_thread(parse_price_table, self._file[1], self._file[0])
+        file_key = await asyncio.to_thread(self._file_key)
+        decided = await self._big_price_gate(file_key, sheets, inp)
+        if decided:
+            return decided
+        layout = await self._layout_note(file_key)
         known = await self._store.get_mappings(signature)
         if not known:
             return self._attach(
@@ -595,10 +644,10 @@ class PricingTools:
                               "/deferred_clear_stale")
         # раскладку запоминаем по сигнатуре файла: тот же прайс, присланный заново,
         # разведку брендов повторять не заставит (§6.9)
-        signature = await asyncio.to_thread(self._signature) if self._file else None
-        if signature:
+        file_key = await asyncio.to_thread(self._file_key)
+        if file_key:
             await self._store.drop_old_layouts(inp.get("supplier"), date_str)
-            await self._store.save_layout(signature, inp.get("supplier"), doc,
+            await self._store.save_layout(file_key, inp.get("supplier"), doc,
                                           date_str, tms)
         names = ", ".join(t["name"] for t in tms)
         return (f"План принят: {len(tms)} марок — {names}." + stale_note + "\n"
@@ -655,9 +704,64 @@ class PricingTools:
         return json.dumps({"categories": scope, "instruction": describe(scope)},
                           ensure_ascii=False)
 
-    async def _layout_note(self, signature: str) -> str:
+    @staticmethod
+    def _row_count(sheets: list) -> int:
+        return sum(len(non_empty_rows(sh)) for sh in sheets)
+
+    async def _big_price_gate(self, file_key: str, sheets: list, inp: dict) -> str | None:
+        """Крупный прайс: спросить админа, разбирать ли, до того как тратиться (§6.10).
+
+        Возвращает текст-остановку либо None, если можно работать дальше. Решение помнится
+        по сигнатуре файла: повторная присылка того же прайса вопрос не повторяет.
+        """
+        known = await self._store.get_decision(file_key)
+        if known and known["decision"] == "manual":
+            doc = known.get("price_doc") or "прайс"
+            return (f"[По этому прайсу («{doc}») админ уже решил, что обработает его "
+                    f"ВРУЧНУЮ ({(known.get('decided_at') or '')[:10]}). Разбирать не нужно: "
+                    "скажи админу об этом и остановись. В отложенные он не идёт — прайс "
+                    "считается обработанным.]")
+        if known and known["decision"] == "process":
+            return None                      # уже согласовано, вопрос не повторяем
+
+        rows = await asyncio.to_thread(self._row_count, sheets)
+        if rows < BIG_PRICE_ROWS:
+            return None
+
+        estimate = int(rows / MEASURED_ROWS * MEASURED_TOKENS)
+        n = f"{rows:,}".replace(",", " ")
+        cost = f"{estimate:,}".replace(",", " ")
+        return (f"[КРУПНЫЙ ПРАЙС: {n} строк на {len(sheets)} листах. По замеру на прайсе "
+                f"такого же размера разбор обойдётся примерно в {cost} входных токенов — "
+                "это заметные деньги. НЕ НАЧИНАЙ разбор. Спроси админа ровно одно: "
+                "обработать этот прайс или пропустить (он обновит цены вручную). Назови "
+                "ему число строк и оценку. Получив ответ, вызови set_price_decision с "
+                "process или manual и действуй по ответу.]")
+
+    async def _set_decision(self, inp: dict) -> str:
+        file_key = await asyncio.to_thread(self._file_key)
+        if not file_key:
+            return "Не удалось опознать файл — решение не сохранено."
+        decision = "manual" if inp.get("decision") == "manual" else "process"
+        run = await self._store.get_run(self._user_id) or {}
+        rows = None
+        if self._file:
+            sheets = await asyncio.to_thread(parse_price_table, self._file[1], self._file[0])
+            rows = await asyncio.to_thread(self._row_count, sheets)
+        await self._store.save_decision(
+            file_key, decision, inp.get("supplier") or run.get("supplier"),
+            inp.get("price_doc") or (self._file[0] if self._file else None),
+            inp.get("price_date") or run.get("price_date"), rows, inp.get("reason"))
+        if decision == "manual":
+            self.handled_manually = True
+            return ("Записано: прайс обработает админ вручную. В отложенные он НЕ идёт и "
+                    "считается обработанным. Скажи админу об этом и остановись — разбирать "
+                    "ничего не нужно.")
+        return "Записано: прайс разбираем. Продолжай обычным порядком, вопрос повторять не буду."
+
+    async def _layout_note(self, file_key: str) -> str:
         """Если этот же файл уже разбирался — отдаём готовую раскладку брендов."""
-        layout = await self._store.get_layout(signature)
+        layout = await self._store.get_layout(file_key)
         if not layout or not layout.get("sections"):
             return ""
         rows = []

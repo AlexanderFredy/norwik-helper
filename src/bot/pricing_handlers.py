@@ -38,6 +38,7 @@ _STATUS = {
     "start_price_run": "Составляю план по маркам...",
     "start_tm_collections": "Разбиваю марку на коллекции...",
     "defer_task": "Откладываю задачу...",
+    "set_price_decision": "Запоминаю решение по прайсу...",
     "add_final_note": "Откладываю замечание к итогу...",
     "save_price_mapping": "Запоминаю формат прайса...",
     "get_selling_tm": "Проверяю выгрузку ТМ в 1С...",
@@ -292,6 +293,18 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
         await _send(message, text, markup)
         if pending is not None:
             return                       # ждём кнопку админа
+
+        # админ решил обновить этот прайс вручную — из режима выходим, в отложенные он
+        # НЕ идёт и считается обработанным (§6.10)
+        if tools.handled_manually:
+            _files.pop(user_id, None)
+            await store.reset(user_id)
+            await store.clear_run(user_id)
+            clear_nomenclature_cache()
+            await message.answer(
+                "Прайс помечен как обработанный вручную — разбирать его я не буду. "
+                "В отложенные он не добавлен. Пришлите следующий файл, когда понадобится.")
+            return
 
         # марка закрылась без кнопки (менять нечего) — переходим сами, иначе прогон
         # встанет: кнопки нет, а значит и обработчика, который двинул бы очередь, тоже

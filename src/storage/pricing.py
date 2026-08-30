@@ -82,17 +82,32 @@ CREATE TABLE IF NOT EXISTS deferred_tasks (
     UNIQUE (user_id, tm_code, collection_ref)
 );
 CREATE INDEX IF NOT EXISTS ix_deferred_user ON deferred_tasks (user_id, created_at);
--- Раскладка разобранного прайса: где какой бренд (§6.9). Ключ — сигнатура файла, то есть
--- ТОТ ЖЕ прайс узнаётся при повторной присылке и разведку заново делать не нужно.
+-- Раскладка разобранного прайса: где какой бренд (§6.9). Ключ — ХЕШ СОДЕРЖИМОГО: только
+-- он означает «тот же самый файл». Сигнатура (§6.5.2) для этого не годится — она считается
+-- по скелету (листы + шапка, без данных), и прайс того же поставщика за следующий месяц
+-- имеет ту же сигнатуру, но другие строки.
 -- Чистится, когда от того же поставщика пришёл прайс НОВЕЕ.
 CREATE TABLE IF NOT EXISTS price_layout (
-    signature     TEXT PRIMARY KEY,
+    file_hash     TEXT PRIMARY KEY,
     supplier      TEXT,
     supplier_norm TEXT,
     price_doc     TEXT,
     price_date    TEXT,
     sections      TEXT NOT NULL,     -- JSON: [{code, name, first_row, last_row}]
     updated_at    TEXT NOT NULL
+);
+-- Решение админа по крупному прайсу (§6.10): разбирать или он сделает вручную.
+-- Ключ — хеш содержимого: повторная присылка ТОГО ЖЕ файла вопрос не повторяет, а
+-- прайс за следующий месяц спросит заново — решение принималось не про него.
+CREATE TABLE IF NOT EXISTS price_decisions (
+    file_hash     TEXT PRIMARY KEY,
+    supplier      TEXT,
+    price_doc     TEXT,
+    price_date    TEXT,
+    decision      TEXT NOT NULL,     -- process | manual
+    rows          INTEGER,
+    reason        TEXT,
+    decided_at    TEXT NOT NULL
 );
 -- Категории товаров, которые вообще анализируем (§6.8). Пусто = ограничений нет.
 -- Задаётся один раз на все прайсы, а не на каждый файл.
@@ -198,6 +213,15 @@ class PricingStore:
             if "price_date" not in run_columns:
                 await db.execute("ALTER TABLE price_run ADD COLUMN price_date TEXT")
             await self._migrate_mappings(db)
+            for table in ("price_layout", "price_decisions"):
+                cur = await db.execute(f"PRAGMA table_info({table})")
+                cols = {row[1] for row in await cur.fetchall()}
+                if cols and "file_hash" not in cols:
+                    # ключом была сигнатура формата — это неверная идентификация файла;
+                    # содержимое кэша восстановится само при следующем разборе
+                    await db.execute(f"DROP TABLE {table}")
+                    await db.executescript(_SCHEMA)
+                    logger.info("Кеш %s пересоздан: ключ сменился на хеш содержимого", table)
             await db.commit()
 
     @staticmethod
@@ -616,34 +640,72 @@ class PricingStore:
             await db.execute("DELETE FROM price_run WHERE user_id = ?", (user_id,))
             await db.commit()
 
+    # ------------------------------- решение по крупному прайсу (§6.10)
+
+    async def save_decision(self, file_hash: str, decision: str, supplier: str | None,
+                            price_doc: str | None, price_date: str | None,
+                            rows: int | None = None, reason: str | None = None) -> None:
+        if not file_hash or decision not in ("process", "manual"):
+            return
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO price_decisions (file_hash, supplier, price_doc, price_date, "
+                "decision, rows, reason, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(file_hash) DO UPDATE SET decision = excluded.decision, "
+                "reason = excluded.reason, decided_at = excluded.decided_at",
+                (file_hash, supplier, price_doc, (price_date or "")[:10], decision,
+                 rows, reason, _now()))
+            await db.commit()
+
+    async def get_decision(self, file_hash: str) -> dict | None:
+        if not file_hash:
+            return None
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT decision, supplier, price_doc, price_date, rows, reason, decided_at "
+                "FROM price_decisions WHERE file_hash = ?", (file_hash,))
+            row = await cur.fetchone()
+        keys = ("decision", "supplier", "price_doc", "price_date", "rows", "reason",
+                "decided_at")
+        return dict(zip(keys, row)) if row else None
+
+    async def list_manual(self) -> list[dict]:
+        """Прайсы, которые админ решил обработать вручную — их показываем в отчётах."""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT supplier, price_doc, price_date, rows, decided_at "
+                "FROM price_decisions WHERE decision = 'manual' ORDER BY decided_at DESC")
+            keys = ("supplier", "price_doc", "price_date", "rows", "decided_at")
+            return [dict(zip(keys, r)) for r in await cur.fetchall()]
+
     # ------------------------------------------- раскладка прайса (§6.9)
 
-    async def save_layout(self, signature: str, supplier: str | None, price_doc: str | None,
+    async def save_layout(self, file_hash: str, supplier: str | None, price_doc: str | None,
                           price_date: str | None, sections: list[dict]) -> None:
         """Запомнить, где какой бренд в этом файле."""
         from src.price_tool.scope import normalize
 
-        if not signature or not sections:
+        if not file_hash or not sections:
             return
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "INSERT INTO price_layout (signature, supplier, supplier_norm, price_doc, "
+                "INSERT INTO price_layout (file_hash, supplier, supplier_norm, price_doc, "
                 "price_date, sections, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(signature) DO UPDATE SET supplier = excluded.supplier, "
+                "ON CONFLICT(file_hash) DO UPDATE SET supplier = excluded.supplier, "
                 "supplier_norm = excluded.supplier_norm, price_doc = excluded.price_doc, "
                 "price_date = excluded.price_date, sections = excluded.sections, "
                 "updated_at = excluded.updated_at",
-                (signature, supplier, normalize(supplier), price_doc, (price_date or "")[:10],
+                (file_hash, supplier, normalize(supplier), price_doc, (price_date or "")[:10],
                  json.dumps(sections, ensure_ascii=False), _now()))
             await db.commit()
 
-    async def get_layout(self, signature: str) -> dict | None:
-        if not signature:
+    async def get_layout(self, file_hash: str) -> dict | None:
+        if not file_hash:
             return None
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
                 "SELECT supplier, price_doc, price_date, sections, updated_at "
-                "FROM price_layout WHERE signature = ?", (signature,))
+                "FROM price_layout WHERE file_hash = ?", (file_hash,))
             row = await cur.fetchone()
         if not row:
             return None
