@@ -19,6 +19,7 @@ from src.agent.pricing_tools import (
 from src.agent.prompts import PRICING_PROMPT
 from src.bot.errors import describe_api_error
 from src.price_tool.broadcast import build_broadcast, journal_rows
+from src.price_tool import modes
 from src.price_tool.exclusive import resolve
 from src.price_tool.history import LABELS
 from src.storage import price_files
@@ -247,6 +248,7 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
 
     for _ in range(MAX_AUTO_STEPS):
         tools = PricingTools(onec, store, user_id)
+        tools.mode = await store.get_setting(modes.SETTING, modes.DEFAULT)
         if user_id in _files:
             tools.set_file(*_files[user_id])
         step_status = status_msg
@@ -427,6 +429,42 @@ _SCOPE_HELP = ("\nДобавить: /category_add ламинат, керамич
                "Список действует для всех прайсов сразу, повторять его в каждом файле "
                "не нужно. Названия сверяются нестрого: «плитка» покроет «Керамическая "
                "плитка» из 1С.")
+
+
+@router.message(Command("mode"))
+async def cmd_mode(message: Message, command: CommandObject, pricing_store: PricingStore,
+                   is_admin: bool) -> None:
+    """Режим работы с прайсом (§5.2): что правим и какие замечания показываем."""
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+    current = await pricing_store.get_setting(modes.SETTING, modes.DEFAULT)
+    arg = (command.args or "").strip()
+    if not arg:
+        await message.answer(
+            f"Сейчас: {modes.title(current)}.\n\n"
+            "Переключить:\n"
+            "/mode товары+цены — сначала расхождения справочника, потом цены (по умолчанию)\n"
+            "/mode товары — только справочник, предложения по ценам не будет\n"
+            "/mode цены — только цены; замечания, не связанные с ценами, показывать не буду")
+        return
+
+    picked = modes.parse(arg)
+    if picked is None:
+        await message.answer(f"Не понял режим «{arg}». Допустимо: "
+                             + ", ".join(modes.ALL) + ".")
+        return
+    if picked == current:
+        await message.answer(f"Режим уже такой: {modes.title(picked)}.")
+        return
+    await pricing_store.set_setting(modes.SETTING, picked)
+    note = ""
+    if picked == modes.PRICES_ONLY:
+        note = ("\nЗамечания по справочнику — расхождения упаковки, несопоставленные "
+                "строки, коллекции без строк в прайсе — показывать больше не буду.")
+    elif picked == modes.ITEMS_ONLY:
+        note = "\nПредложений по ценам и кнопки записи в 1С не будет."
+    await message.answer(f"Режим: {modes.title(picked)}.{note}")
 
 
 @router.message(Command("categories"))
@@ -888,6 +926,7 @@ async def _skip_or_defer(callback: CallbackQuery, action: str, proposal_id: int,
         head = f"Пропущено: {title}. Цены не менялись."
     else:
         tools = PricingTools(onec, store, user_id)
+        tools.mode = await store.get_setting(modes.SETTING, modes.DEFAULT)
         if user_id in _files:
             tools.set_file(*_files[user_id])
         saved = await store.defer_task(user_id, {**step, **(await tools.run_context())})

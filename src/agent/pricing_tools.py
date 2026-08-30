@@ -25,6 +25,7 @@ from src.price_tool.exclusive import (
 from src.price_tool.parser import (
     extract_images, find_rows, non_empty_rows, parse_price_table, render_preview,
 )
+from src.price_tool import modes
 from src.price_tool.scope import describe, in_scope
 from src.price_tool.signature import price_signature
 from src.storage.price_files import save as save_price_file
@@ -447,7 +448,12 @@ PRICING_TOOLS = [
                 "warnings": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "что показать админу: не сопоставленные строки, бренды не в выгрузке, расхождения",
+                    "description": "замечания ПРО ЦЕНЫ: подозрительные переходы, вопросы по колонкам, всё что влияет на записываемую цену",
+                },
+                "item_warnings": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "замечания ПРО СПРАВОЧНИК: несопоставленные строки прайса, коллекции 1С без строк в прайсе, расхождения названий, размеров и коэффициентов упаковки, бренды не в выгрузке. В режиме «только цены» их не передавай — админ их не ждёт",
                 },
             },
             "required": ["groups"],
@@ -507,6 +513,7 @@ class PricingTools:
         self.advanced_to: str | None = None
         # админ решил обновить крупный прайс вручную — выходим из режима
         self.handled_manually = False
+        self.mode = modes.DEFAULT      # обновляется обработчиком из настроек
 
     def set_file(self, filename: str, content: bytes) -> None:
         self._file = (filename, content)
@@ -583,7 +590,7 @@ class PricingTools:
 
     async def _read_with_mapping(self, inp: dict) -> str | list[dict]:
         text = await asyncio.to_thread(self._read_price_file, inp)
-        scope = await self._scope_note()
+        scope = await self._mode_note() + await self._scope_note()
         signature = await asyncio.to_thread(self._signature)
         if not signature:
             return self._attach(text + scope)
@@ -775,6 +782,9 @@ class PricingTools:
                 + ". Разведку брендов повторять НЕ НУЖНО, вот сохранённая раскладка: "
                 + "; ".join(rows) + ". Передай в start_price_run этот же список и сразу "
                 "читай нужный раздел через from_row.]")
+
+    async def _mode_note(self) -> str:
+        return f"\n\n[РЕЖИМ РАБОТЫ: {modes.title(self.mode)}. {modes.describe(self.mode)}]"
 
     async def _scope_note(self) -> str:
         scope = [c["category"] for c in await self._store.list_scope()]
@@ -1043,8 +1053,14 @@ class PricingTools:
     async def _propose(self, inp: dict) -> str:
         today = date.today()
         results: list[GroupResult] = []
-        problems: list[str] = []
+        problems: list[str] = []          # состояние системы — видно в любом режиме
+        item_problems: list[str] = []     # про справочник — только в режимах с товарами
         scope = [c["category"] for c in await self._store.list_scope()]
+
+        if not modes.with_prices(self.mode):
+            return ("Сейчас режим «только правка товаров» — цены не трогаем, предложение "
+                    "не готовлю. Разбирай расхождения справочника и докладывай их админу. "
+                    "Сменить режим может только админ командой /mode.")
 
         # Одна марка за вызов (§9.6): админ смотрит и подтверждает бренд целиком, а не
         # простыню по всему прайсу. Заодно короче отчёт и понятнее, что осталось.
@@ -1099,7 +1115,8 @@ class PricingTools:
             items = nom.items
             sel = [i for i in items if i.collection_ref == g.get("collection_ref")]
             if not sel:
-                problems.append(f"коллекция {g.get('collection_ref')} не найдена у ТМ {g['tm_code']}")
+                item_problems.append(
+                    f"коллекция {g.get('collection_ref')} не найдена у ТМ {g['tm_code']}")
                 continue
             # категория вне анализа — не пишем, даже если модель коллекцию передала (§6.8)
             kind = next((i.product_type for i in sel if i.product_type), None)
@@ -1114,7 +1131,7 @@ class PricingTools:
                 group, missing = plan_items(sel, g["tm_code"], g.get("tm_name", ""),
                                             per_item, today)
                 if missing:
-                    problems.append(
+                    item_problems.append(
                         f"⚠️ {sel[0].collection or g.get('collection_ref')}: не нашёл в 1С "
                         f"{len(missing)} поз. из переданных ({', '.join(missing[:5])}"
                         + (", …" if len(missing) > 5 else "") + ") — цены по ним не тронуты.")
@@ -1138,7 +1155,8 @@ class PricingTools:
                     "скажите: соберу заново.")
 
         active, _ = resolve(*await self._store.load_exclusives())
-        summary = self._render(inp, results, problems, payload, active)
+        summary = self._render(inp, results, problems, payload, active,
+                               item_problems)
         self.last_summary = summary
 
         coll_ref = next((g.get("collection_ref") for g in inp.get("groups") or []), None)
@@ -1200,7 +1218,8 @@ class PricingTools:
         }
 
     def _render(self, inp: dict, results: list[GroupResult], problems: list[str],
-                payload: list[dict], exclusives: dict | None = None) -> str:
+                payload: list[dict], exclusives: dict | None = None,
+                item_problems: list[str] | None = None) -> str:
         supplier = inp.get("supplier") or "поставщика"
         lines = [f"Обновляем цены от {supplier} на:"]
         by_tm: dict[str, list[GroupResult]] = {}
@@ -1237,7 +1256,12 @@ class PricingTools:
         suspicious: list[str] = []
         for g in results:
             suspicious += unit_warnings(g)
+        # Замечания кода классифицируются ЗДЕСЬ, а не отдаются на усмотрение модели:
+        # иначе одно и то же наблюдение попадёт то в ценовую корзину, то в товарную.
+        # `problems` — состояние системы, показывается всегда (§5.2).
         warns = suspicious + list(inp.get("warnings") or []) + problems
+        if modes.with_items(self.mode):
+            warns += list(inp.get("item_warnings") or []) + list(item_problems or [])
         for g in results:
             below_p = [p for p in g.plans if p.warning == "rrc_below_purchase"]
             below_r = [p for p in g.plans if p.warning == "rrc_below_retail"]

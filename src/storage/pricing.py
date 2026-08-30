@@ -109,6 +109,12 @@ CREATE TABLE IF NOT EXISTS price_decisions (
     reason        TEXT,
     decided_at    TEXT NOT NULL
 );
+-- Общие настройки бота: сейчас режим работы (§5.2), дальше — прочие одиночные значения.
+CREATE TABLE IF NOT EXISTS app_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 -- Категории товаров, которые вообще анализируем (§6.8). Пусто = ограничений нет.
 -- Задаётся один раз на все прайсы, а не на каждый файл.
 CREATE TABLE IF NOT EXISTS product_scope (
@@ -638,6 +644,22 @@ class PricingStore:
     async def clear_run(self, user_id: int) -> None:
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute("DELETE FROM price_run WHERE user_id = ?", (user_id,))
+            await db.commit()
+
+    # -------------------------------------------------- настройки (§5.2)
+
+    async def get_setting(self, key: str, default: str = "") -> str:
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute("SELECT value FROM app_settings WHERE key = ?", (key,))
+            row = await cur.fetchone()
+        return row[0] if row else default
+
+    async def set_setting(self, key: str, value: str) -> None:
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                "updated_at = excluded.updated_at", (key, value, _now()))
             await db.commit()
 
     # ------------------------------- решение по крупному прайсу (§6.10)
