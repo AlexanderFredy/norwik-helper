@@ -70,14 +70,17 @@ class Orchestrator:
         system: str | None = None,
         extra_tools: list[dict] | None = None,
         extra_executor=None,
+        base_tools: bool = True,
     ) -> tuple[str, list[dict]]:
         """Ход диалога поверх истории. Возвращает (ответ, обновлённая история).
 
         `extra_tools`/`extra_executor` подключают режимные инструменты (напр. обновление
-        цен) поверх базовых. История сериализуема — её сохраняет вызывающий (§12.1 спеки).
+        цен). `base_tools=False` убирает менеджерские: в режиме цен они не нужны, но
+        уезжают в каждый запрос и вдобавок соблазняют модель полезть в почту.
+        История сериализуема — её сохраняет вызывающий (§12.1 спеки).
         """
         messages = list(messages)
-        tools = list(TOOL_DEFINITIONS) + list(extra_tools or [])
+        tools = (list(TOOL_DEFINITIONS) if base_tools else []) + list(extra_tools or [])
 
         for _ in range(MAX_ITERATIONS):
             response = await self._client.messages.create(

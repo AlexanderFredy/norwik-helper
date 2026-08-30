@@ -87,7 +87,8 @@ class ProposePerTmTest(unittest.IsolatedAsyncioTestCase):
     async def test_single_tm_lists_whats_left(self):
         text = await self.tools.execute("propose_prices", {"groups": [self._group("T1")]})
         self.assertIn("Осталось обработать: Classen, AGT.", text)
-        self.assertIn("НЕ иди", text)
+        self.assertIn("сам не иди", text)
+        self.assertIn("ПЕРЕПИСЫВАТЬ ЕГО НЕ НУЖНО", text)
         self.assertIsNotNone(await self.store.get_pending(42))
 
     async def test_nothing_to_write_closes_tm_and_moves_on(self):
@@ -277,7 +278,7 @@ class FakeOrchestrator:
         self.prompts: list[str] = []
 
     async def handle_turn(self, history, on_tool=None, system=None, extra_tools=None,
-                          extra_executor=None):
+                          extra_executor=None, **kw):
         self.prompts.append(history[-1]["content"])
         return "продолжаю", history
 

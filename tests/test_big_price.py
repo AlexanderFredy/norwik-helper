@@ -119,7 +119,7 @@ class FakeOrchestrator:
         self._box = tools_box
 
     async def handle_turn(self, history, on_tool=None, system=None, extra_tools=None,
-                          extra_executor=None):
+                          extra_executor=None, **kw):
         self.prompts.append(history[-1]["content"])
         self._box.append(extra_executor)
         await extra_executor.execute("propose_prices", {"groups": [{

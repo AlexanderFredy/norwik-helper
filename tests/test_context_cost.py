@@ -129,5 +129,79 @@ class NomenclatureFilterTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["items"], [])
 
 
+class ToolSetTest(unittest.IsolatedAsyncioTestCase):
+    """В режиме цен менеджерские инструменты не нужны, а едут в каждый запрос."""
+
+    async def test_pricing_turn_gets_only_pricing_tools(self):
+        from src.agent.orchestrator import Orchestrator
+        from src.agent.pricing_tools import PRICING_TOOLS
+
+        seen = {}
+
+        class FakeMessages:
+            async def create(self, **kw):
+                seen.update(kw)
+                raise RuntimeError("stop")
+
+        orc = Orchestrator.__new__(Orchestrator)
+        orc._client = type("C", (), {"messages": FakeMessages()})()
+        orc._executor = None
+        with self.assertRaises(RuntimeError):
+            await orc.handle_turn([{"role": "user", "content": "."}],
+                                  extra_tools=PRICING_TOOLS, base_tools=False)
+        names = {t["name"] for t in seen["tools"]}
+        self.assertIn("propose_prices", names)
+        self.assertNotIn("search_emails", names)
+        self.assertNotIn("web_search", names)
+
+    async def test_manager_turn_keeps_base_tools(self):
+        from src.agent.orchestrator import Orchestrator
+
+        seen = {}
+
+        class FakeMessages:
+            async def create(self, **kw):
+                seen.update(kw)
+                raise RuntimeError("stop")
+
+        orc = Orchestrator.__new__(Orchestrator)
+        orc._client = type("C", (), {"messages": FakeMessages()})()
+        orc._executor = None
+        with self.assertRaises(RuntimeError):
+            await orc.handle_turn([{"role": "user", "content": "."}])
+        self.assertIn("search_emails", {t.get("name") for t in seen["tools"]})
+
+
+class ProposalEchoTest(unittest.IsolatedAsyncioTestCase):
+    """Предложение шлёт код: модель переписывала его на выход по цене выхода."""
+
+    async def asyncSetUp(self):
+        clear_nomenclature_cache()
+        self._dir = tempfile.TemporaryDirectory()
+        self.store = PricingStore(Path(self._dir.name) / "t.db")
+        await self.store.init()
+        self.tools = PricingTools(FakeOnec([item("YO-1", 949, 1649, 1139)]),
+                                  self.store, user_id=42)
+
+    async def asyncTearDown(self):
+        self._dir.cleanup()
+
+    async def test_last_summary_holds_the_admin_text(self):
+        await self.tools.execute("propose_prices", {"groups": [
+            {"tm_code": "T1", "tm_name": "Peli", "collection_ref": "YO-C",
+             "purchase": 999}]})
+        self.assertIn("К записи:", self.tools.last_summary)
+        # служебные скобки для модели в текст админу попадать не должны
+        self.assertNotIn("ПЕРЕПИСЫВАТЬ", self.tools.last_summary)
+
+    async def test_model_is_told_not_to_repeat(self):
+        text = await self.tools.execute("propose_prices", {"groups": [
+            {"tm_code": "T1", "tm_name": "Peli", "collection_ref": "YO-C",
+             "purchase": 999}]})
+        # текст остаётся в ответе — иначе модель не сможет ответить на вопрос по нему
+        self.assertIn("К записи:", text)
+        self.assertIn("ПЕРЕПИСЫВАТЬ ЕГО НЕ НУЖНО", text)
+
+
 if __name__ == "__main__":
     unittest.main()

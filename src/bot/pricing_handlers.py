@@ -262,7 +262,7 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
         try:
             answer, history = await orchestrator.handle_turn(
                 history, on_tool=on_tool, system=PRICING_PROMPT,
-                extra_tools=PRICING_TOOLS, extra_executor=tools)
+                extra_tools=PRICING_TOOLS, extra_executor=tools, base_tools=False)
         except Exception as exc:                       # noqa: BLE001
             logger.exception("Ошибка обработки прайса")
             await step_status.edit_text(describe_api_error(
@@ -278,7 +278,18 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
         pending = await store.get_pending(user_id)
         markup = (_keyboard(pending.proposal_id, await _in_stage(store, user_id))
                   if pending else None)
-        await _send(message, answer, markup)
+        # Предложение админу шлём из last_summary, а не из ответа модели: текст собран
+        # кодом, и переписывание его моделью стоило ~2 000 выходных токенов на шаг, а
+        # заодно теряло строки. Ответ модели добавляем, только если она сказала что-то
+        # своё — вопрос или замечание сверх предложения.
+        if pending and tools.last_summary:
+            extra = (answer or "").strip()
+            text = tools.last_summary
+            if extra and extra[:40] not in tools.last_summary:
+                text += "\n\n" + extra
+        else:
+            text = answer
+        await _send(message, text, markup)
         if pending is not None:
             return                       # ждём кнопку админа
 
