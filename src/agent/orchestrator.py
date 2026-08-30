@@ -18,6 +18,13 @@ MAX_ITERATIONS = 30
 # намеренно: API их так не принимает.
 _CACHEABLE = {"text", "tool_result", "image", "document"}
 
+# Час, а не пять минут по умолчанию. Между предложением и нажатием кнопки админ читает
+# цены и думает — за пять минут префикс протухает, и следующий шаг оплачивается целиком.
+# Запись в часовой кеш дороже (×2 против ×1.25), но на прогоне прайса префикс читается
+# десятки раз, а чтение стоит ×0.1. Проверено: usage.cache_creation показывает
+# ephemeral_1h_input_tokens.
+CACHE = {"type": "ephemeral", "ttl": "1h"}
+
 
 def _cached(messages: list[dict]) -> list[dict]:
     """Копия истории с точкой кеширования на последнем блоке.
@@ -43,7 +50,7 @@ def _cached(messages: list[dict]) -> list[dict]:
     tail = blocks[-1]
     if not isinstance(tail, dict) or tail.get("type") not in _CACHEABLE:
         return messages
-    blocks[-1] = {**tail, "cache_control": {"type": "ephemeral"}}
+    blocks[-1] = {**tail, "cache_control": CACHE}
     return messages[:-1] + [{**last, "content": blocks}]
 
 
@@ -91,7 +98,7 @@ class Orchestrator:
                     {
                         "type": "text",
                         "text": system or SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"},
+                        "cache_control": CACHE,
                     }
                 ],
                 tools=tools,

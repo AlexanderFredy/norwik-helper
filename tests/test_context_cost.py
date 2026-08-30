@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.agent.orchestrator import _cached
+from src.agent.orchestrator import CACHE, _cached
 from src.agent.pricing_tools import PricingTools, clear_nomenclature_cache
 from src.bot.pricing_handlers import DUMP_STUB, NOM_STUB, _prune_file_dumps
 from src.storage.pricing import PricingStore
@@ -38,7 +38,11 @@ class CacheBreakpointTest(unittest.TestCase):
     def test_breakpoint_on_last_block(self):
         msgs = [{"role": "user", "content": "прайс"}, result("итог")]
         out = _cached(msgs)
-        self.assertEqual(out[-1]["content"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(out[-1]["content"][0]["cache_control"], CACHE)
+
+    def test_ttl_is_an_hour(self):
+        """Пять минут по умолчанию не переживают паузу админа над кнопкой."""
+        self.assertEqual(CACHE, {"type": "ephemeral", "ttl": "1h"})
 
     def test_original_history_stays_clean(self):
         """cache_control не должен попасть в сохраняемую историю и копиться там."""
