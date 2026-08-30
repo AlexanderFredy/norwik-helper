@@ -163,17 +163,33 @@ async def _finish_run(message: Message, store: PricingStore, user_id: int,
 
 
 SHEET_MARK = "=== Лист:"
+NOM_MARK = '"not_returned_by_1c"'          # так выглядит только ответ get_1c_nomenclature
 DUMP_MIN_CHARS = 4000
 DUMP_STUB = ("[Выгрузка листа прайса убрана из истории, чтобы не раздувать контекст. "
              "Файл никуда не делся: нужный кусок перечитай через read_price_file "
              "(параметры sheet / contains / from_row).]")
+NOM_STUB = ("[Выгрузка номенклатуры убрана из истории, чтобы не раздувать контекст. "
+            "Данные не потеряны: вызови get_1c_nomenclature заново — они берутся из "
+            "кэша, к 1С запрос не пойдёт. По возможности сужай выборку параметром "
+            "collection_ref.]")
 # Сколько марок подряд можно закрыть без участия админа. Защита от цикла: у каждой
 # итерации свой запрос к модели.
 MAX_AUTO_STEPS = 8
 
 
+def _dump_kind(text) -> str | None:
+    """Какая это тяжёлая выгрузка: лист прайса, номенклатура 1С — или ничего."""
+    if not isinstance(text, str) or len(text) <= DUMP_MIN_CHARS:
+        return None
+    if SHEET_MARK in text:
+        return "sheet"
+    if NOM_MARK in text:
+        return "nomenclature"
+    return None
+
+
 def _is_dump(text) -> bool:
-    return isinstance(text, str) and SHEET_MARK in text and len(text) > DUMP_MIN_CHARS
+    return _dump_kind(text) is not None
 
 
 def _dump_texts(content) -> list:
@@ -188,22 +204,31 @@ def _dump_texts(content) -> list:
 def _prune_file_dumps(messages: list[dict], keep_last: int = 1) -> list[dict]:
     """Старые выгрузки прайса заменяются заглушкой.
 
-    Каждый read_price_file кладёт в историю до 40 000 символов, и они едут в КАЖДЫЙ
-    следующий запрос к модели. На прайсе в 12 870 строк история за три хода выросла до
-    560 000 символов, после чего модель перестала отвечать вовсе. Свежая выгрузка нужна,
-    все прежние — нет: файл лежит в памяти процесса и перечитывается по запросу.
+    Каждая тяжёлая выгрузка едет в КАЖДЫЙ следующий запрос к модели, а цикл ручной:
+    один шаг по коллекции — это несколько запросов со всей историей. На прайсе Артисана
+    пять страниц номенклатуры дали 224 000 символов, лист прайса — ещё 89 000.
+
+    Свежая выгрузка каждого вида нужна, все прежние — нет. Прайс лежит в памяти процесса,
+    номенклатура — в `_NOM_CACHE`, так что перечитывание не стоит ни запроса к 1С, ни
+    запроса в Telegram.
     """
-    seen, out = 0, []
+    seen: dict[str, int] = {}
+    stubs = {"sheet": DUMP_STUB, "nomenclature": NOM_STUB}
+    out = []
     for msg in reversed(messages):
         content = msg.get("content")
         if isinstance(content, list):
             blocks, changed = [], False
             for block in content:
-                if (isinstance(block, dict) and block.get("type") == "tool_result"
-                        and any(_is_dump(t) for t in _dump_texts(block.get("content")))):
-                    seen += 1
-                    if seen > keep_last:
-                        block = {**block, "content": DUMP_STUB}
+                kind = None
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    kind = next((k for k in (_dump_kind(t)
+                                             for t in _dump_texts(block.get("content")))
+                                 if k), None)
+                if kind:
+                    seen[kind] = seen.get(kind, 0) + 1
+                    if seen[kind] > keep_last:
+                        block = {**block, "content": stubs[kind]}
                         changed = True
                 blocks.append(block)
             if changed:

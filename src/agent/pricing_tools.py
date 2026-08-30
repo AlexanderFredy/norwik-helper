@@ -279,12 +279,16 @@ PRICING_TOOLS = [
         "description": (
             "Номенклатура одной ТМ с текущими ценами (закупка/розница/РРЦ) и коэффициентами "
             "ЕИ. Параметры: tm_code (код из get_selling_tm), page (с 1), size (200). "
-            "У товара есть collection_ref — код папки-коллекции, он нужен для предложения."
+            "У товара есть collection_ref — код папки-коллекции, он нужен для предложения.\n"
+            "Работаешь по одной коллекции — ОБЯЗАТЕЛЬНО передавай collection_ref: вернутся "
+            "только её товары. Выгрузка всей марки на 900 позиций весит десятки тысяч "
+            "символов, едет в каждый следующий запрос и стоит дорого."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "tm_code": {"type": "string"},
+                "collection_ref": {"type": "string", "description": "код папки-коллекции: вернуть только её товары"},
                 "page": {"type": "integer"},
                 "size": {"type": "integer"},
             },
@@ -850,9 +854,15 @@ class PricingTools:
         page, size = int(inp.get("page", 1)), int(inp.get("size", 200))
         nom = self._nom(inp["tm_code"])
         items = nom.items
+        # Сужение до коллекции — главный рычаг по токенам: марка на 900 позиций даёт
+        # ~45 000 символов на страницу, а в режиме коллекций нужна одна папка из семи.
+        wanted = (inp.get("collection_ref") or "").strip()
+        if wanted:
+            items = [i for i in items if i.collection_ref == wanted]
         chunk = items[(page - 1) * size: page * size]
         return json.dumps({
             "tm": inp["tm_code"], "total": len(items), "page": page,
+            "collection_ref": wanted or None,
             # позиции, которые 1С не смогла отдать: их не будет в items, и молчать
             # об этом нельзя — сопоставление с прайсом окажется неполным
             "not_returned_by_1c": [

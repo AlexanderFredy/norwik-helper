@@ -14,6 +14,39 @@ MAX_TOKENS = 16000
 MAX_ITERATIONS = 30
 
 
+# На каких блоках можно ставить точку кеширования. thinking и tool_use исключены
+# намеренно: API их так не принимает.
+_CACHEABLE = {"text", "tool_result", "image", "document"}
+
+
+def _cached(messages: list[dict]) -> list[dict]:
+    """Копия истории с точкой кеширования на последнем блоке.
+
+    Цикл ручной, поэтому КАЖДЫЙ вызов инструмента — это отдельный запрос со всей историей
+    заново. Без кеша шаг по одной коллекции на разобранном прайсе (≈200 тыс. токенов
+    контекста, несколько инструментов) стоил миллион входных токенов. Точка кеширования
+    делает повторную отправку префикса почти бесплатной.
+
+    Оригинал не трогаем: cache_control не должен попасть в сохраняемую историю — он бы
+    копился от хода к ходу и упёрся в лимит точек кеширования.
+    """
+    if not messages:
+        return messages
+    last = messages[-1]
+    content = last.get("content")
+    if isinstance(content, str):
+        blocks = [{"type": "text", "text": content}]
+    elif isinstance(content, list) and content:
+        blocks = list(content)
+    else:
+        return messages
+    tail = blocks[-1]
+    if not isinstance(tail, dict) or tail.get("type") not in _CACHEABLE:
+        return messages
+    blocks[-1] = {**tail, "cache_control": {"type": "ephemeral"}}
+    return messages[:-1] + [{**last, "content": blocks}]
+
+
 class Orchestrator:
     def __init__(self, api_key: str, executor: ToolExecutor) -> None:
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
@@ -59,7 +92,7 @@ class Orchestrator:
                     }
                 ],
                 tools=tools,
-                messages=messages,
+                messages=_cached(messages),
             )
 
             content = [b.model_dump() for b in response.content]   # для персистентности
