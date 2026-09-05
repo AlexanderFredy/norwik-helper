@@ -2338,55 +2338,77 @@ SUPPLIER_PRICES_KEEP_DAYS=730      # чистка наблюдений (§12.2)
 {
   "total": 15,
   "items": [
-    { "ref": "YO-00004416", "name": "Ламинат",           // код для примера
-      "parent_ref": "", "kind": "type", "product_type_ref": "000000003",
+    { "ref": "YO-00004416", "name": "Ламинат", "parent_ref": "",       // код для примера
+      "kind": "type", "level": 1, "product_type_ref": "000000003",
       "not_exported": false },
-    { "ref": "YO-00004417", "name": "Виниловый ламинат", // код для примера
-      "parent_ref": "", "kind": "type", "product_type_ref": "000000002",
+    { "ref": "YO-00004417", "name": "Виниловый ламинат", "parent_ref": "",  // для примера
+      "kind": "type", "level": 1, "product_type_ref": "000000002",
       "not_exported": false },
 
-    { "ref": "YO-00069285", "name": "CAMSAN",            // код для примера
-      "parent_ref": "YO-00004416", "kind": "tm", "not_exported": false },
-    { "ref": "YO-00069295", "name": "CAMSAN",            // код для примера
-      "parent_ref": "YO-00004417", "kind": "tm", "not_exported": false },
+    { "ref": "YO-00069285", "name": "CAMSAN", "parent_ref": "YO-00004416",  // для примера
+      "kind": "tm", "level": 2, "product_type_ref": "", "not_exported": false },
+    { "ref": "YO-00069295", "name": "CAMSAN", "parent_ref": "YO-00004417",  // для примера
+      "kind": "tm", "level": 2, "product_type_ref": "", "not_exported": false },
 
-    { "ref": "YO-00069286", "name": "PLATINUM",
-      "parent_ref": "YO-00069285", "kind": "collection", "not_exported": true },
-    { "ref": "YO-00069288", "name": "AVANGARD",
-      "parent_ref": "YO-00069285", "kind": "collection", "not_exported": true },
-    { "ref": "YO-00069289", "name": "AVANGARD+",
-      "parent_ref": "YO-00069285", "kind": "collection", "not_exported": true },
-    { "ref": "YO-00069290", "name": "SERENZA",
-      "parent_ref": "YO-00069285", "kind": "collection", "not_exported": false },
-    { "ref": "YO-00072115", "name": "Albero",
-      "parent_ref": "YO-00069285", "kind": "collection", "not_exported": false },
-    { "ref": "YO-00072121", "name": "Premium",
-      "parent_ref": "YO-00069285", "kind": "collection", "not_exported": true },
-    { "ref": "YO-00072128", "name": "Milango",
-      "parent_ref": "YO-00069285", "kind": "collection", "not_exported": false },
-    { "ref": "YO-00072133", "name": "Legno Extra",
-      "parent_ref": "YO-00069285", "kind": "collection", "not_exported": true },
-    { "ref": "YO-00072784", "name": "Modern Long",
-      "parent_ref": "YO-00069285", "kind": "collection", "not_exported": false },
-    { "ref": "YO-00072959", "name": "Modern Long",
-      "parent_ref": "YO-00069285", "kind": "collection", "not_exported": true },
+    { "ref": "YO-00069286", "name": "PLATINUM", "parent_ref": "YO-00069285",
+      "kind": "collection", "level": 3, "not_exported": true  },
+    { "ref": "YO-00069288", "name": "AVANGARD", "parent_ref": "YO-00069285",
+      "kind": "collection", "level": 3, "not_exported": true  },
+    { "ref": "YO-00069289", "name": "AVANGARD+", "parent_ref": "YO-00069285",
+      "kind": "collection", "level": 3, "not_exported": true  },
+    { "ref": "YO-00069290", "name": "SERENZA", "parent_ref": "YO-00069285",
+      "kind": "collection", "level": 3, "not_exported": false },
+    { "ref": "YO-00072115", "name": "Albero", "parent_ref": "YO-00069285",
+      "kind": "collection", "level": 3, "not_exported": false },
+    { "ref": "YO-00072121", "name": "Premium", "parent_ref": "YO-00069285",
+      "kind": "collection", "level": 3, "not_exported": true  },
+    { "ref": "YO-00072128", "name": "Milango", "parent_ref": "YO-00069285",
+      "kind": "collection", "level": 3, "not_exported": false },
+    { "ref": "YO-00072133", "name": "Legno Extra", "parent_ref": "YO-00069285",
+      "kind": "collection", "level": 3, "not_exported": true  },
+    { "ref": "YO-00072784", "name": "Modern Long", "parent_ref": "YO-00069285",
+      "kind": "collection", "level": 3, "not_exported": false },
+    { "ref": "YO-00072959", "name": "Modern Long", "parent_ref": "YO-00069285",
+      "kind": "collection", "level": 3, "not_exported": true  },
 
-    { "ref": "YO-00069287", "name": "PLATINUM+",
-      "parent_ref": "YO-00069295", "kind": "collection", "not_exported": false },
+    { "ref": "YO-00069287", "name": "PLATINUM+", "parent_ref": "YO-00069295",
+      "kind": "collection", "level": 3, "not_exported": false },
 
     { "ref": "YO-00004421", "name": "!Номенклатура снятая с производства",
-      "parent_ref": "", "kind": "discontinued", "not_exported": true }
+      "parent_ref": "", "kind": "discontinued", "level": 1, "not_exported": true }
   ],
   "errors": []
 }
 ```
 
+Папка размера у керамики — тот самый `group`, ради которого `kind` не выводится из уровня
+механически (`GET get-products/folders?tm=000000297`, Kerranova):
+
+```jsonc
+    { "ref": "YO-00068526", "name": "Canyon", "parent_ref": "YO-00068522",
+      "kind": "collection", "level": 3, "not_exported": false },
+    { "ref": "YO-00068690", "name": "600x1200", "parent_ref": "YO-00068526",
+      "kind": "group", "level": 4, "not_exported": false }
+```
+
 **Поля узла.** `ref` — код папки, им и адресуемся при `create_item.parent_ref`.
 `parent_ref` — пустая строка у папки в корне. `kind` = `type` | `tm` | `collection` |
-`discontinued` | `group`. `product_type_ref` — только у `kind: "type"`, чтобы связать ветку
-дерева с кодом вида товара из `by-tm`. `not_exported` — **эффективный** флаг, как в `by-tm`:
-считается по иерархии, а не «своя ли пометка». Так и нужно, потому что решение всегда одно —
-будет ли выгружаться товар, который сюда положат.
+`group` | `discontinued`. `level` — уровень вложенности, корень = 1. `product_type_ref` —
+код вида товара, заполнен у `kind: "type"`, чтобы связать ветку дерева с `by-tm`.
+`not_exported` — **эффективный** флаг, как в `by-tm`: считается по иерархии, а не «своя ли
+пометка». Так и нужно, потому что решение всегда одно — будет ли выгружаться товар,
+который сюда положат.
+
+`level` отдаётся не для красоты: `kind` из него и выводится (1 — вид товара, 2 — марка,
+3 — коллекция, глубже — `group`), а признака смысла папки в конфигурации нет вовсе. Пусть
+агент видит и вывод, и факт, из которого он сделан.
+
+Реализация — `specs/1c/folders.bsl`. Три вещи там сделаны иначе, чем напрашивалось:
+папки марки выводятся **из товаров** (у товара `Производитель` — ссылка, значит связь
+точная), а не подбором папки по имени марки; `?tm=` отдаёт поддерево целиком, поэтому
+пустая папка коллекции видна, а `?product_type=` без марки — только два уровня, иначе
+ответ по керамической плитке это сотни узлов; папки снятых приходят **всегда**, независимо
+от фильтров, потому что нужны они как раз тогда, когда фильтр стоит на другой ветке.
 
 **`matched_folder` не нужен.** Для `properties?tm=` он требовался (§19.2.1), потому что там
 сопоставление по имени невидимо. Здесь папка ТМ приходит узлом `kind: "tm"` — агент видит
@@ -2486,16 +2508,21 @@ SUPPLIER_PRICES_KEEP_DAYS=730      # чистка наблюдений (§12.2)
 | `000000009` | Штучный паркет | `*…Штучный паркет` | `YO-00012389` | 15 |
 | `000000006` | Инженерная доска | `*…(Инженерная доска)` | `YO-00006400` | 10 |
 | `000000026` | Линолеум | `*…(Линолеум)` | `YO-00033820` | 1 |
+| `000000028` | Обои | заведена 05.09.2026 | `YO-00078918` | 0 |
+| `000000011` | Керамогранит | заведена 05.09.2026 | `YO-00012382` | 0 |
 
-**Двух папок не хватает, и обе нужны для действующего ассортимента** (`NEEDS_FOLDER` в
-модуле): **Обои** (`000000028`, 447 снятых лежат в глобальной папке, 499 действующих
-позиций) и **Керамогранит** (`000000011`, 19 и 59). До того как папки заведут в 1С, перенос
-по этим видам товара невозможен, и отказ называет вид товара прямо.
+**Все виды товара с действующим ассортиментом закрыты.** Двух папок в базе не было —
+обоям (447 снятых лежали в глобальной папке, 499 действующих позиций) и керамограниту
+(19 и 59); админ завёл их 05.09.2026. Товаров в этих папках пока нет, поэтому имён мы не
+знаем: у таких строк маппинга `folder_name` пуст, и `problems()` сверяет только
+существование — иначе получили бы ложное «переименована» на ровном месте.
 
-Остальные девять видов из двадцати (Плинтус, Пробковые покрытия, Терассная доска, Ковролин,
-Подложка, Паркетная химия, Строительные материалы, Аккумулятор, Керамогранит частично)
-действующих позиций не имеют вовсе — ассортимент закрыт. Папку им заводить незачем: перенос
-по ним не встретится, а если встретится, отказ сработает штатно.
+Остальные восемь видов из двадцати (Плинтус, Пробковые покрытия, Терассная доска, Ковролин,
+Подложка, Паркетная химия, Строительные материалы, Аккумулятор) действующих позиций не имеют
+вовсе — ассортимент закрыт. Папку им заводить незачем: перенос по ним не встретится, а если
+встретится, сработает отказ. Список `NEEDS_FOLDER` в модуле сейчас пуст и нужен на будущее:
+заведут новый вид товара — отказ назовёт причину, а не отделается «вида товара нет в
+таблице».
 
 #### Что показала полная выгрузка (165 марок)
 
