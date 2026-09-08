@@ -22,6 +22,7 @@ JSON_UTF8 = {"Content-Type": "application/json; charset=utf-8"}
 class TradeMark:
     name: str      # NameTM, напр. "Classen / Классен"
     code: str      # Code, напр. "000000104" (строка, ведущие нули важны)
+    selling: bool = True   # помечена к выгрузке на сайт; см. selling_tm(all_marks=…)
 
 
 @dataclass(frozen=True)
@@ -143,11 +144,20 @@ class OnecClient:
                 time.sleep(2 * (attempt + 1))
         raise last  # type: ignore[misc]
 
-    def selling_tm(self) -> list[TradeMark]:
-        r = self._get("/get-products/selling-tm")
+    def selling_tm(self, all_marks: bool = False) -> list[TradeMark]:
+        """Торговые марки. По умолчанию — только помеченные к выгрузке на сайт.
+
+        `all_marks=True` отдаёт и непомеченные (§19.10). Нужно, потому что марку заводят
+        РАНЬШЕ, чем помечают: пока она прорабатывается, товары для неё уже создают, а
+        `create_item.manufacturer` требует её код. В ПЛАН прогона прайса непомеченные не
+        идут — разбирать непроработанную марку рано.
+        """
+        params = {"include_not_exported": 1} if all_marks else None
+        r = self._get("/get-products/selling-tm", params=params)
         r.raise_for_status()
         data = _loads_bom(r.content)
-        return [TradeMark(name=x.get("NameTM", ""), code=str(x.get("Code", ""))) for x in data]
+        return [TradeMark(name=x.get("NameTM", ""), code=str(x.get("Code", "")),
+                          selling=bool(x.get("Selling", True))) for x in data]
 
     def by_tm(self, tm_code: str, page: int = 1, size: int = 200) -> NomenclaturePage:
         r = self._get(

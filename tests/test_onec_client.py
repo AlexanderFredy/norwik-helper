@@ -121,5 +121,44 @@ class PostEncodingTest(unittest.TestCase):
         self.assertIn("Дуб Милас".encode("utf-8"), seen["body"])
 
 
+class SellingTmTest(unittest.TestCase):
+    """Все марки против только выгружаемых (§19.10)."""
+
+    def _client(self, payload):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["url"] = str(request.url)
+            return httpx.Response(200, content=json.dumps(payload).encode("utf-8"))
+
+        c = OnecClient("http://example.invalid/api", "token")
+        c._client = httpx.Client(base_url="http://example.invalid/api",
+                                 transport=httpx.MockTransport(handler))
+        return c, seen
+
+    def test_default_asks_only_selling(self):
+        c, seen = self._client([{"NameTM": "Peli", "Code": "000000298"}])
+        c.selling_tm()
+        self.assertNotIn("include_not_exported", seen["url"])
+
+    def test_all_marks_sets_the_flag(self):
+        c, seen = self._client([])
+        c.selling_tm(all_marks=True)
+        self.assertIn("include_not_exported=1", seen["url"])
+
+    def test_selling_flag_parsed(self):
+        c, _ = self._client([{"NameTM": "Peli", "Code": "000000298", "Selling": True},
+                             {"NameTM": "Linderwood", "Code": "000000999",
+                              "Selling": False}])
+        tms = c.selling_tm(all_marks=True)
+        self.assertTrue(tms[0].selling)
+        self.assertFalse(tms[1].selling)
+
+    def test_old_response_without_flag_counts_as_selling(self):
+        """Старый обработчик поля не отдаёт — считаем марку выгружаемой, как раньше."""
+        c, _ = self._client([{"NameTM": "Peli", "Code": "000000298"}])
+        self.assertTrue(c.selling_tm()[0].selling)
+
+
 if __name__ == "__main__":
     unittest.main()
