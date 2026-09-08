@@ -86,5 +86,40 @@ class OkEnvelopeTest(unittest.TestCase):
         self.assertEqual(page.tm, "CAMSAN")
 
 
+class PostEncodingTest(unittest.TestCase):
+    """Тело записи уходит с явной кодировкой.
+
+    Ценам это было безразлично — в их теле одни коды и числа. Но set-items повезёт
+    кириллические наименования, а 1С читает тело через `ПолучитьТелоКакСтроку()`, которая
+    без charset в заголовке выбирает кодировку сама. Молча созданный товар с испорченным
+    именем откатывать дороже, чем указать кодировку.
+    """
+
+    def _capture(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["content_type"] = request.headers.get("content-type")
+            seen["body"] = request.content
+            return httpx.Response(200, content=b'{"date":"2026-09-08","updated":0,'
+                                               b'"unchanged":0,"failed":0,'
+                                               b'"results":[],"errors":[]}')
+
+        c = OnecClient("http://example.invalid/api", "token")
+        c._client = httpx.Client(base_url="http://example.invalid/api",
+                                 transport=httpx.MockTransport(handler))
+        return c, seen
+
+    def test_charset_is_declared(self):
+        c, seen = self._capture()
+        c.set_prices([{"ref": "YO-1", "prices": {"purchase": 100}}])
+        self.assertEqual(seen["content_type"], "application/json; charset=utf-8")
+
+    def test_cyrillic_body_is_utf8_not_escaped(self):
+        c, seen = self._capture()
+        c.set_prices([{"ref": "YO-1", "name": "Дуб Милас"}])
+        self.assertIn("Дуб Милас".encode("utf-8"), seen["body"])
+
+
 if __name__ == "__main__":
     unittest.main()

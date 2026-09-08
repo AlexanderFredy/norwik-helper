@@ -10,6 +10,13 @@ from dataclasses import dataclass, field
 
 import httpx
 
+# charset указан ЯВНО. 1С читает тело через `ПолучитьТелоКакСтроку()`, а она без charset в
+# заголовке выбирает кодировку сама. Ценам это было безразлично — в их теле одни коды и
+# числа, — но `set-items` повезёт кириллические наименования товаров, и неверно угаданная
+# кодировка молча создаст позиции с испорченными именами. Отменить такую запись дороже, чем
+# указать кодировку.
+JSON_UTF8 = {"Content-Type": "application/json; charset=utf-8"}
+
 
 @dataclass(frozen=True)
 class TradeMark:
@@ -187,7 +194,7 @@ class OnecClient:
         """
         body = json.dumps({"items": items}, ensure_ascii=False).encode("utf-8")
         r = self._client.post("/get-products/set-prices", content=body,
-                              headers={"Content-Type": "application/json"}, timeout=300)
+                              headers=JSON_UTF8, timeout=300)
         text = r.content.decode("utf-8-sig", errors="replace")
         if "<!DOCTYPE" in text:
             raise RuntimeError(f"1С вернул HTML вместо JSON (HTTP {r.status_code})")
