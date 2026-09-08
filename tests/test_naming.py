@@ -5,9 +5,10 @@
 """
 import unittest
 
-from src.price_tool.naming import (MARKUP, ensure_type_prefix, fix_article_in_name,
-                                   fix_caps, is_xml_safe, markup_chars,
-                                   strip_type_prefix, tidy, violations, xml_safe)
+from src.price_tool.naming import (MARKUP, collection_case, ensure_type_prefix,
+                                   fix_article_in_name, fix_caps, fix_collection_in_name,
+                                   is_xml_safe, markup_chars, strip_type_prefix, tidy,
+                                   violations, xml_safe)
 
 
 class ControlCharsTest(unittest.TestCase):
@@ -224,6 +225,75 @@ class LegacyTypeWordTest(unittest.TestCase):
         """«Водостойкий» не синоним «Ламината» — там дописываем, как обычно."""
         self.assertEqual(ensure_type_prefix("Водостойкий ламинат Peli", "Ламинат"),
                          "Ламинат Водостойкий ламинат Peli")
+
+
+class CollectionCase(unittest.TestCase):
+    """§19.10: в названии коллекции первая буква заглавная, остальные строчные."""
+
+    def test_caps_latin(self):
+        self.assertEqual(collection_case("QUARTZ"), "Quartz")
+
+    def test_caps_cyrillic(self):
+        self.assertEqual(collection_case("СТАРОДУБ"), "Стародуб")
+
+    def test_lowercase_gets_capital(self):
+        self.assertEqual(collection_case("quartz"), "Quartz")
+
+    def test_already_canonical(self):
+        self.assertEqual(collection_case("Linderwood"), "Linderwood")
+
+    def test_two_words(self):
+        self.assertEqual(collection_case("MOST FLOOR"), "Most Floor")
+
+    def test_token_with_digits_untouched(self):
+        """`AC5` и `8` — не слова: регистр там либо осмыслен, либо не при чём."""
+        self.assertEqual(collection_case("GRUNWALD AC5 8"), "Grunwald AC5 8")
+
+    def test_ampersand_name_untouched(self):
+        """`Onyx&More` — настоящее имя коллекции; `Onyx&more` было бы порчей."""
+        self.assertEqual(collection_case("Onyx&More"), "Onyx&More")
+
+    def test_single_letter_untouched(self):
+        self.assertEqual(collection_case("S QUARTZ"), "S Quartz")
+
+    def test_spaces_and_control_chars(self):
+        self.assertEqual(collection_case("  QUARTZ" + chr(0) + "  ADANA "), "Quartz Adana")
+
+    def test_empty(self):
+        self.assertEqual(collection_case(None), "")
+
+
+class CollectionInName(unittest.TestCase):
+
+    def test_renames_inside_item_name(self):
+        self.assertEqual(
+            fix_collection_in_name("Виниловый ламинат Linderwood QUARTZ Адана LQ-01",
+                                   "QUARTZ"),
+            "Виниловый ламинат Linderwood Quartz Адана LQ-01")
+
+    def test_accepts_already_cased_collection(self):
+        self.assertEqual(
+            fix_collection_in_name("Виниловый ламинат Linderwood QUARTZ Адана LQ-01",
+                                   "Quartz"),
+            "Виниловый ламинат Linderwood Quartz Адана LQ-01")
+
+    def test_idempotent(self):
+        name = "Виниловый ламинат Linderwood Quartz Адана LQ-01"
+        self.assertEqual(fix_collection_in_name(name, "QUARTZ"), name)
+
+    def test_collection_absent_leaves_name(self):
+        name = "Ламинат Peli Anatolia Дуб Сильвер"
+        self.assertEqual(fix_collection_in_name(name, "QUARTZ"), name)
+
+    def test_only_first_occurrence(self):
+        """Второе совпадение — часть названия расцветки, его не трогаем."""
+        self.assertEqual(
+            fix_collection_in_name("Плитка ROMA Дуб ROMA", "ROMA"),
+            "Плитка Roma Дуб ROMA")
+
+    def test_empty_collection(self):
+        name = "Ламинат Peli Дуб"
+        self.assertEqual(fix_collection_in_name(name, ""), name)
 
 
 if __name__ == "__main__":
