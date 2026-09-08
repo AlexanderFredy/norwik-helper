@@ -258,35 +258,152 @@ def _from_pdf(content: bytes) -> list[Sheet]:
     return sheets
 
 
+# Слова, отстоящие по вертикали меньше чем на столько, считаются одной строкой. Кегль
+# в прайсах 6–9 pt, межстрочный интервал заметно больше трёх пунктов.
+ROW_TOLERANCE = 3.0
+
+
 def _pdf_rows(page) -> list[tuple[list[str], float]]:
     """Строки страницы вместе с их вертикальной координатой.
 
-    Координата нужна не разбору, а КАРТИНКАМ: логотип коллекции привязывается к строке по
-    тому, в чью полосу он попал (см. `pdf_image_anchors`). Возвращать её отсюда дешевле,
-    чем считать таблицы второй раз.
+    ТЕКСТ БЕРЁМ ИЗ ТАБЛИЦЫ, А РАЗРЕЗАЕМ ПО СЛОВАМ. Две крайности здесь одинаково плохи.
+
+    `table.extract()` даёт чистый текст, но склеивает соседние позиции в одну строку, когда
+    между ними нет линейки: ячейка «Артикул» вернулась как `'LE-267-32\nLE-263-32'`, а
+    «Фаска» — как одно `'Нет'` на обе. По данным 1С это «нет» принадлежит LE-263, у LE-267
+    фаска четырёхсторонняя, — то есть признак из такой строки не разложить по позициям, и
+    попытка это сделать испортила бы верную карточку.
+
+    Сборка из `extract_words()` эту склейку снимает, но ломает ШАПКУ: она нарисована с
+    разрядкой, и слова распадаются на буквы («ор и ги н а л»), причём любой допуск склейки
+    либо не помогает, либо слипает соседние колонки.
+
+    Поэтому: строки берём из таблицы, а по словам пересобираем ТОЛЬКО те, что оказались
+    склейкой нескольких позиций. Шапку это не задевает — её распознаёт `_split_count`.
     """
     out: list[tuple[list[str], float]] = []
 
     for table in page.find_tables():
-        # `table.extract()` отдаёт значения, `table.rows` — геометрию; идут они строго
-        # параллельно, поэтому сшиваем по индексу. Искать строку через `.index()` нельзя:
-        # объекты строк сравниваются не так, как ожидается, и поиск падает.
         values = table.extract()
+        bounds = None
         for index, row in enumerate(table.rows):
-            cells = [_pdf_cell(v) for v in (values[index] if index < len(values) else [])]
-            if any(cells):
-                out.append((_rtrim(cells), float(row.bbox[1])))
+            raw = values[index] if index < len(values) else []
+            parts = [str(v or "").split("\n") for v in raw]
+            count = _split_count(parts)
+
+            if count < 2:
+                cells = [_pdf_cell(v) for v in raw]
+                if any(cells):
+                    out.append((_rtrim(cells), float(row.bbox[1])))
+                continue
+
+            if bounds is None:
+                bounds = _column_bounds(table)
+            rebuilt = _rebuild_from_words(page, row, bounds, count)
+            if not rebuilt:
+                # ПЕРЕСОБРАТЬ НЕ ВЫШЛО — отдаём строку как была. Потерять её нельзя: на
+                # первой версии этой правки так молча исчезли LE-266 и LF-700, а пропавшая
+                # позиция в прайсе хуже склеенной — склейку видно, пропажу нет.
+                cells = [_pdf_cell(v) for v in raw]
+                if any(cells):
+                    out.append((_rtrim(cells), float(row.bbox[1])))
+                continue
+            for cells, top in rebuilt:
+                if any(cells):
+                    out.append((_rtrim(cells), top))
 
     if out:
         return out
 
-    # РЕЗЕРВ: таблицы не нашлись (в прайсе нет линеек). Тогда одна колонка на строку —
+    # РЕЗЕРВ: таблиц на странице нет (прайс без линеек). Тогда одна колонка на строку —
     # это хуже, но всё же лучше пустого листа: агент хотя бы увидит текст.
     for line in page.extract_text_lines():
         text = " ".join((line.get("text") or "").split())
         if text:
             out.append(([text], float(line["top"])))
     return out
+
+
+def _split_count(parts: list[list[str]]) -> int:
+    """Сколько позиций склеено в строке. 1 — строка одна, резать нечего.
+
+    ПРИЗНАК: все многострочные ячейки имеют ОДНО И ТО ЖЕ число частей. У склейки позиций
+    так и есть — по строке на позицию в каждой заполненной колонке. У шапки не так:
+    «Название/оригинал» это 2 части, «Вес/поддона/(кг)» — 3, «цена за м.кв. (самовывоз…» —
+    4. Разнобой означает перенос длинного текста внутри ячейки, а не несколько записей.
+    """
+    multi = [len(p) for p in parts if len(p) > 1]
+    # ОДНОЙ многострочной ячейки мало: это просто перенос длинного текста. У склейки
+    # позиций многострочны и артикул, и название, и всё остальное заполненное. Метка
+    # класса «8 /32 MM» стоит в объединённой по вертикали ячейке одна — и на ней первая
+    # версия правила разрезала строку, теряя саму позицию.
+    counts = set(multi)
+    return counts.pop() if len(counts) == 1 and len(multi) >= 2 else 1
+
+
+def _rebuild_from_words(page, row, bounds, count: int) -> list[tuple[list[str], float]]:
+    """Пересобрать склеенную строку из слов: по строке на позицию.
+
+    Значение, стоящее в такой строке ОДИН раз («Нет» в колонке «Фаска»), достаётся той
+    позиции, на чьей высоте оно нарисовано, — ради этого всё и затевалось.
+    """
+    if not bounds:
+        return []
+    try:
+        words = page.crop(row.bbox).extract_words()
+    except Exception:
+        return []
+
+    lines = _group_by_line(words)
+    if len(lines) != count:
+        return []          # разошлось с ожиданием — лучше оставить строку как была
+
+    out = []
+    for top, line in lines:
+        cells = [""] * len(bounds)
+        for word in line:
+            index = _column_of(bounds, word)
+            cells[index] = (cells[index] + " " + word["text"]).strip()
+        out.append((cells, top))
+    return out
+
+
+def _column_bounds(table) -> list[tuple[float, float]]:
+    """Границы колонок по x, собранные из ячеек таблицы."""
+    edges: set[float] = set()
+    right = 0.0
+    for row in table.rows:
+        for cell in row.cells:
+            if cell:
+                edges.add(round(float(cell[0]), 1))
+                right = max(right, float(cell[2]))
+    if not edges:
+        return []
+    lefts = sorted(edges)
+    return [(x, (lefts[i + 1] if i + 1 < len(lefts) else right))
+            for i, x in enumerate(lefts)]
+
+
+def _column_of(bounds: list[tuple[float, float]], word) -> int:
+    """Колонка, в которую попадает слово. Считаем по ЛЕВОМУ краю, а не по центру:
+    длинное значение вылезает вправо за свою ячейку, и центр уводит его к соседям."""
+    x = float(word["x0"])
+    for index, (left, right) in enumerate(bounds):
+        if left - 1 <= x < right:
+            return index
+    return 0 if x < bounds[0][0] else len(bounds) - 1
+
+
+def _group_by_line(words) -> list[tuple[float, list]]:
+    """Слова, сгруппированные в строки по вертикали."""
+    lines: list[tuple[float, list]] = []
+    for word in sorted(words, key=lambda w: (w["top"], w["x0"])):
+        top = float(word["top"])
+        if lines and abs(top - lines[-1][0]) <= ROW_TOLERANCE:
+            lines[-1][1].append(word)
+        else:
+            lines.append((top, [word]))
+    return lines
 
 
 def pdf_image_anchors(content: bytes) -> dict[str, list[tuple[int, bytes, str]]]:

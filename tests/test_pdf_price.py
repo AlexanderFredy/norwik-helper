@@ -64,6 +64,35 @@ class PdfPriceTest(unittest.TestCase):
         self.assertNotIn("quartz", text)
         self.assertIn("spc", text)          # в тексте только технология
 
+    def _row_with(self, article: str) -> list[str]:
+        return next(r for r in self.sheets[0].rows if article in " ".join(r))
+
+    def test_glued_positions_are_split(self):
+        """PDF склеил LE-267 и LE-263 в одну строку таблицы — их надо развести.
+
+        Признак «нет фаски» стоял в такой строке ОДИН раз, и по данным 1С он принадлежит
+        LE-263: у LE-267 фаска четырёхсторонняя. Склеенная строка сделала бы признак
+        неразложимым, а угадывание испортило бы верную карточку.
+        """
+        self.assertNotIn("LE-263", " ".join(self._row_with("LE-267")))
+        self.assertIn("Нет", self._row_with("LE-263"))
+        self.assertNotIn("Нет", self._row_with("LE-267"))
+        self.assertIn("Нет", self._row_with("LE-269"))
+
+    def test_wrapped_header_is_not_split(self):
+        """Шапка тоже многострочна, но это перенос текста, а не несколько позиций."""
+        header = next(r for r in self.sheets[0].rows if "Артикул" in " ".join(r))
+        self.assertIn("Название оригинал", header)
+        self.assertIn("Тип поверхности", header)
+
+    def test_row_with_one_wrapped_cell_survives(self):
+        """Метка класса «8 /32 MM» стоит в объединённой ячейке одна — на ней первая версия
+        правила разрезала строку и теряла саму позицию."""
+        row = self._row_with("LE-266")
+        self.assertIn("8 /32 MM", row)
+        self.assertIn("Medio", row)
+        self.assertTrue(any("LF-700" in " ".join(r) for r in self.sheets[0].rows))
+
     def test_images_are_anchored_to_rows(self):
         anchors = pdf_image_anchors(self.data)
         self.assertIn("стр. 1", anchors)
