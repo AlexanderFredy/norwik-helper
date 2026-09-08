@@ -148,3 +148,50 @@ def strip_type_prefix(name: str | None, product_type: str | None) -> str:
         return text
 
     return text[len(kind):].strip()
+
+
+# --- чужой артикул в наименовании -----------------------------------------------------
+#
+# «Ламинат Peli Anatolia Platinium Дуб Сильвер AN PLT 911» при реквизите `AN PLT 910` —
+# опечатка ввода: артикул `AN PLT 911` принадлежит СОСЕДНЕЙ позиции («Дуб Сеньи»).
+#
+# ПОЧЕМУ ЭТО МОЖНО ПРАВИТЬ БЕЗ ВОПРОСА. Ключ позиции — реквизит «Артикул», по нему идёт
+# сопоставление с прайсом; наименование это подпись. Когда в подписи стоит чужой ключ,
+# ошибка не в ключе.
+#
+# ИЩЕМ НЕ ПО ШАБЛОНУ, А ПО СПИСКУ РЕАЛЬНЫХ АРТИКУЛОВ. Формат артикула у каждого поставщика
+# свой — «AN DSG 901», «LE-263-32», «K-900/MR/600x1200x11», — и регулярное выражение под них
+# всё равно ошибётся. Зато набор артикулов марки известен точно, и подстрока из него в чужом
+# имени случайной быть не может.
+
+
+def fix_article_in_name(name: str | None, article: str | None,
+                        known_articles) -> str:
+    """Меняет чужой артикул в наименовании на собственный.
+
+    Не трогает, если:
+      * свой артикул в имени уже есть — тогда лишний текст это что-то другое;
+      * чужих артикулов найдено ноль или больше одного — случай неоднозначный, и решать
+        его молча нельзя.
+    """
+    text = " ".join((name or "").split())
+    own = " ".join((article or "").split())
+
+    if not text or not own:
+        return text
+    if own.lower() in text.lower():
+        return text
+
+    hits = [a for a in {" ".join((x or "").split()) for x in known_articles}
+            if a and a.lower() != own.lower() and a.lower() in text.lower()]
+
+    # «LE 263» внутри «LE 2630» — это одно попадание, а не два: оставляем самое длинное.
+    hits = [a for a in hits
+            if not any(a != b and a.lower() in b.lower() for b in hits)]
+
+    if len(hits) != 1:
+        return text
+
+    foreign = hits[0]
+    at = text.lower().index(foreign.lower())
+    return (text[:at] + own + text[at + len(foreign):]).strip()

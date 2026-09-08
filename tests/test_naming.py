@@ -5,9 +5,9 @@
 """
 import unittest
 
-from src.price_tool.naming import (MARKUP, ensure_type_prefix, fix_caps, is_xml_safe,
-                                   markup_chars, strip_type_prefix, tidy, violations,
-                                   xml_safe)
+from src.price_tool.naming import (MARKUP, ensure_type_prefix, fix_article_in_name,
+                                   fix_caps, is_xml_safe, markup_chars,
+                                   strip_type_prefix, tidy, violations, xml_safe)
 
 
 class ControlCharsTest(unittest.TestCase):
@@ -161,6 +161,45 @@ class TypePrefixTest(unittest.TestCase):
         site = "Дуб Голд"
         self.assertEqual(strip_type_prefix(ensure_type_prefix(site, "Ламинат"), "Ламинат"),
                          site)
+
+
+class ArticleInNameTest(unittest.TestCase):
+    """Чужой артикул в наименовании — опечатка: ключ это реквизит, а не подпись."""
+
+    KNOWN = {"AN PLT 909", "AN PLT 910", "AN PLT 911", "AN PLT 912"}
+
+    def test_foreign_article_replaced(self):
+        self.assertEqual(
+            fix_article_in_name("Ламинат Peli Platinium Дуб Сильвер AN PLT 911",
+                                "AN PLT 910", self.KNOWN),
+            "Ламинат Peli Platinium Дуб Сильвер AN PLT 910")
+
+    def test_own_article_present_untouched(self):
+        """Свой артикул на месте — лишний текст рядом это что-то другое, не наше дело."""
+        name = "Ламинат Peli Дуб Сеньи AN PLT 911"
+        self.assertEqual(fix_article_in_name(name, "AN PLT 911", self.KNOWN), name)
+
+    def test_unknown_token_left_alone(self):
+        """Артикул, который никому не принадлежит, молча менять нельзя."""
+        name = "Ламинат Peli Дуб Сильвер AN PLT 999"
+        self.assertEqual(fix_article_in_name(name, "AN PLT 910", self.KNOWN), name)
+
+    def test_two_foreign_articles_is_ambiguous(self):
+        name = "Ламинат Peli AN PLT 911 и AN PLT 912"
+        self.assertEqual(fix_article_in_name(name, "AN PLT 910", self.KNOWN), name)
+
+    def test_longer_article_wins_over_its_prefix(self):
+        known = {"LE 263", "LE 2630"}
+        self.assertEqual(fix_article_in_name("Ламинат Peli LE 2630", "LE 517", known),
+                         "Ламинат Peli LE 517")
+
+    def test_no_article_no_change(self):
+        self.assertEqual(fix_article_in_name("Ламинат Peli Дуб", "AN PLT 910", self.KNOWN),
+                         "Ламинат Peli Дуб")
+
+    def test_empty_inputs(self):
+        self.assertEqual(fix_article_in_name(None, "AN PLT 910", self.KNOWN), "")
+        self.assertEqual(fix_article_in_name("Дуб", None, self.KNOWN), "Дуб")
 
 
 if __name__ == "__main__":
