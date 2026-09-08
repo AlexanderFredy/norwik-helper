@@ -19,6 +19,7 @@ from src.agent.pricing_tools import (
 from src.agent.prompts import PRICING_PROMPT
 from src.bot.errors import describe_api_error
 from src.price_tool.broadcast import build_broadcast, journal_rows
+from src.price_tool.item_broadcast import build_item_broadcast
 from src.price_tool import modes
 from src.price_tool.exclusive import resolve
 from src.price_tool.history import LABELS
@@ -803,6 +804,15 @@ async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: Pr
 
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer("Записываю...")
+
+    # ДВА ПРЕДМЕТА ЗАПИСИ, ОДНА КНОПКА. Справочник и цены подтверждаются по очереди
+    # (§19.7), поэтому висящее предложение всегда одно, а чем его записывать — говорит
+    # его `kind`. Развилка здесь, а не в модели: она про set-items вообще не знает.
+    if proposal.kind == "items":
+        await _apply_items(callback, proposal, onec, pricing_store, store,
+                           orchestrator, user_id)
+        return
+
     progress = await callback.message.answer("Обновляю цены в 1С...")
 
     try:
@@ -857,6 +867,119 @@ async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: Pr
     clear_nomenclature_cache()      # цены в 1С изменились — кэш устарел
     await _continue_or_finish(callback.message, pricing_store, user_id, run,
                               orchestrator, onec, "Цены записаны.")
+
+
+async def _apply_items(callback: CallbackQuery, proposal, onec,
+                       pricing_store: PricingStore, store: UserStore,
+                       orchestrator, user_id: int) -> None:
+    """Запись правок справочника по кнопке админа (§19.8).
+
+    Отличий от записи цен три, и все три существенные.
+
+    **Батч не откатывается.** Часть операций может провалиться, часть — быть пропущена по
+    зависимости (`skipped_dependency`): не создалась папка коллекции — не создались товары
+    в ней. Молчать об этом нельзя: админ увидел бы «создано 0» и решил, что просто нечего
+    было делать.
+
+    **Повтор небезопасен так же, как у цен, но дороже.** Оборванное соединение возвращает
+    предложение в очередь целиком — включая уже созданные позиции. Поэтому повтор
+    предлагается только когда запрос НЕ ДОШЁЛ; после ответа 1С кнопки нет, и расхождение
+    разбирается следующим прогоном по прайсу.
+
+    **Уведомления другие.** Про нормализацию менеджерам не говорят вовсе, админу — одной
+    строкой на коллекцию (§19.9).
+    """
+    progress = await callback.message.answer("Записываю правки в справочник 1С...")
+
+    try:
+        result = await asyncio.to_thread(onec.set_items, proposal.payload)
+    except Exception as exc:                       # noqa: BLE001
+        logger.exception("Ошибка записи справочника в 1С")
+        await pricing_store.release(proposal.proposal_id)
+        await progress.edit_text(
+            f"Ошибка записи в 1С: {exc}\nСправочник не изменён — можно повторить.",
+            reply_markup=_keyboard(proposal.proposal_id,
+                                   await _in_stage(pricing_store, user_id)))
+        return
+
+    await pricing_store.mark_applied(proposal.proposal_id)
+
+    # Справочник уже изменён. Дальше ничто не имеет права оставить админа без ответа —
+    # молчание бота неотличимо от «ничего не произошло», а товары при этом созданы.
+    try:
+        report = _format_items_result(result)
+        if proposal.digest:
+            text = build_item_broadcast(proposal.digest, for_admin=True)
+            if text:
+                report += "\n\n" + text
+            sent = await _notify_items(callback.message.bot, store, proposal.digest,
+                                       user_id)
+            if sent:
+                report += f"\n\nМенеджерам отправлено уведомление: {sent}."
+    except Exception:                              # noqa: BLE001
+        logger.exception("Ошибка при подготовке отчёта после записи справочника")
+        report = (f"Справочник обновлён: создано {result.get('created', 0)}, "
+                  f"изменено {result.get('updated', 0)}. "
+                  "Подробный отчёт собрать не удалось — смотрите логи.")
+
+    step = _step_of(proposal)
+    await _deliver(progress, callback.message, report)
+    clear_nomenclature_cache()     # справочник изменился — выгрузка в кэше устарела
+
+    # ОЧЕРЕДЬ НЕ ДВИГАЕМ. По §19.7 за правками справочника идут цены ПО ТОЙ ЖЕ коллекции,
+    # и закрыть шаг здесь значило бы пропустить их. Шаг закроет ценовое предложение —
+    # либо, в режиме «только товары», его закроет сама модель следующим ходом.
+    tail = f" Коллекция: {step['collection']}." if step.get("collection") else ""
+    status = await callback.message.answer("Продолжаю...")
+    await _run(callback.message,
+               f"Правки справочника записаны.{tail} Продолжай по инструкции: "
+               "если режим включает цены — предложи цены по этой же коллекции, "
+               "иначе переходи к следующей.",
+               orchestrator, onec, pricing_store, status, user_id=user_id)
+
+
+def _format_items_result(result: dict) -> str:
+    """Отчёт о записи справочника. Пропущенные по зависимости — отдельной строкой."""
+    parts = [f"Справочник обновлён ({result.get('date', '')}):"]
+    for key, label in (("created", "создано"), ("updated", "изменено"),
+                       ("unchanged", "без изменений"), ("skipped", "пропущено"),
+                       ("failed", "ошибок")):
+        value = int(result.get(key) or 0)
+        if value:
+            parts.append(f"  {label}: {value}")
+
+    errors = [e for e in (result.get("errors") or []) if isinstance(e, dict)]
+    if errors:
+        parts.append("\nНе записано:")
+        for e in errors[:10]:
+            ref = e.get("ref") or f"операция {e.get('index')}"
+            parts.append(f"  • {ref}: {e.get('message') or e.get('code')}")
+        if len(errors) > 10:
+            parts.append(f"  … и ещё {len(errors) - 10}")
+
+    if len(parts) == 1:
+        parts.append("  записывать было нечего")
+
+    return "\n".join(parts)
+
+
+async def _notify_items(bot, store: UserStore, digest: dict, admin_id: int) -> int:
+    """Уведомление менеджерам о правках справочника (§19.9). Про нормализацию — молчим."""
+    text = build_item_broadcast(digest, for_admin=False)
+    if not text:
+        return 0
+    parts = _chunks(text)
+    sent = 0
+    for user in await store.list_all():
+        if user.telegram_id == admin_id:
+            continue
+        try:
+            for chunk in parts:
+                await bot.send_message(user.telegram_id, chunk)
+            sent += 1
+        except Exception:
+            logger.warning("Не доставлено менеджеру %s", user.telegram_id, exc_info=True)
+    return sent
 
 
 def _step_of(proposal) -> dict:

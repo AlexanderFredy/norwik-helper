@@ -25,6 +25,7 @@ from src.price_tool.exclusive import (
 from src.price_tool.parser import (
     extract_images, find_rows, non_empty_rows, parse_price_table, render_preview,
 )
+from src.price_tool import items as item_rules
 from src.price_tool import modes
 from src.price_tool.scope import describe, in_scope
 from src.price_tool.signature import price_signature
@@ -56,7 +57,7 @@ BIG_TM_ITEMS = 300
 BIG_PRICE_ROWS = 5000
 MEASURED_ROWS, MEASURED_TOKENS = 12_870, 570_000
 NOM_CACHE_TTL = 1800
-_NOM_CACHE: dict[str, tuple[float, list]] = {}
+_NOM_CACHE: dict[tuple[str, bool], tuple[float, list]] = {}
 # код ТМ → имя из selling-tm. В NomItem названия марки нет, а брать первое слово из
 # наименования товара нельзя: «Ламинат Woodstyle Opera …» даёт «Ламинат», а не бренд.
 _TM_NAMES: dict[str, str] = {}
@@ -391,6 +392,113 @@ PRICING_TOOLS = [
         },
     },
     {
+        "name": "get_1c_folders",
+        "description": (
+            "Дерево папок номенклатуры 1С. Нужно, чтобы понять, КУДА класть товар: код "
+            "папки марки внутри ветки вида товара, код папки коллекции, код папки снятых "
+            "с производства. Зови с фильтрами — без них дерево больше тысячи узлов.\n"
+            "`kind` приходит из 1С и выводится из МЕСТА узла в дереве: root | type | tm | "
+            "collection | group | discontinued. По имени вид папки не определяй: ветки "
+            "видов товара называются «Водостойкий ламинат» и «Двери».\n"
+            "С фильтром `tm` возвращаются и папки в ЧУЖИХ ветках, где лежат товары этой "
+            "марки, — это и есть кандидаты на разнос по правильным папкам."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "product_type": {"type": "string",
+                                 "description": "код вида товара, ветку которого показать"},
+                "tm": {"type": "string", "description": "код торговой марки"},
+            },
+        },
+    },
+    {
+        "name": "get_1c_properties",
+        "description": (
+            "Доп. свойства вида товара и ДОПУСТИМЫЕ значения с кодами — из чего выбирать "
+            "при создании и правке товара. Свойства с пустым списком значений (длина, "
+            "ширина, толщина) заполняются числом, а не выбором.\n"
+            "Свойство «Коллекция» (`0000003`) запрашивай ТОЛЬКО вместе с `tm` и "
+            "`property`: без отбора в нём три тысячи значений. Пустой список при запросе "
+            "с маркой значит «у этой марки в этой ветке коллекций нет» — это ответ, а не "
+            "сбой отбора."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "product_type": {"type": "string", "description": "код вида товара"},
+                "tm": {"type": "string", "description": "код ТМ — сужает «Коллекцию»"},
+                "property": {"type": "string", "description": "код одного свойства"},
+            },
+            "required": ["product_type"],
+        },
+    },
+    {
+        "name": "propose_items",
+        "description": (
+            "Предложить админу правки СПРАВОЧНИКА по ОДНОЙ коллекции: создать позиции, "
+            "поправить поля, перенести в другую папку. Цены сюда не передаются — они "
+            "идут отдельно через propose_prices ПОСЛЕ подтверждения правок (§19.7).\n"
+            "НАИМЕНОВАНИЯ СОБИРАЕТ КОД, не ты. Передавай ЧАСТИ: `title` — только "
+            "название расцветки («Дуб Медовый»), `tail` — артикул или размер, которым "
+            "поставщик различает позиции. Имя, полное наименование и наименование для "
+            "сайта соберутся сами по правилам §19.5.\n"
+            "Передавай только то, что МЕНЯЕТСЯ: отсутствие поля значит «не трогать». "
+            "Регистр и лишние пробелы правь молча — код сам отнесёт их к нормализации.\n"
+            "Одна коллекция за вызов. К следующей переходи после кнопки админа."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tm_code": {"type": "string"},
+                "tm_name": {"type": "string"},
+                "product_type": {"type": "string", "description": "код вида товара"},
+                "product_type_name": {"type": "string",
+                                      "description": "имя вида товара для наименования"},
+                "collection": {"type": "string", "description": "имя коллекции"},
+                "new_folder": {
+                    "type": "object",
+                    "description": "создать папку коллекции: parent_ref — код папки ТМ",
+                    "properties": {"parent_ref": {"type": "string"},
+                                   "name": {"type": "string"}},
+                },
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {"type": "string", "enum": ["create", "update"]},
+                            "ref": {"type": "string", "description": "код 1С для update"},
+                            "article": {"type": "string"},
+                            "title": {"type": "string",
+                                      "description": "ТОЛЬКО название расцветки"},
+                            "tail": {"type": "string",
+                                     "description": "артикул или размер в конце имени"},
+                            "parent_ref": {"type": "string",
+                                           "description": "куда положить/перенести"},
+                            "unit": {"type": "string"},
+                            "pack_coefficient": {"type": "number"},
+                            "length": {"type": "number"},
+                            "width": {"type": "number"},
+                            "thickness": {"type": "number"},
+                            "properties": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"property": {"type": "string"},
+                                                   "value_code": {"type": "string"}},
+                                },
+                            },
+                        },
+                        "required": ["op"],
+                    },
+                },
+                "warnings": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "замечания по коллекции, которые код не увидит сам",
+                },
+            },
+            "required": ["tm_code", "product_type", "collection"],
+        },
+    },
+    {
         "name": "propose_prices",
         "description": (
             "Подготовить предложение по обновлению цен и показать его админу. Передай "
@@ -547,6 +655,12 @@ class PricingTools:
                 return await self._record_exclusives(inp)
             if name == "set_exclusive":
                 return await self._set_exclusive(inp)
+            if name == "get_1c_folders":
+                return await asyncio.to_thread(self._folders, inp)
+            if name == "get_1c_properties":
+                return await asyncio.to_thread(self._properties, inp)
+            if name == "propose_items":
+                return await self._propose_items(inp)
             if name == "propose_prices":
                 return await self._propose(inp)
             return f"Неизвестный инструмент: {name}"
@@ -977,23 +1091,40 @@ class PricingTools:
         _TM_NAMES.update({t.code: t.name for t in tms})   # чтобы звать марки по имени
         return json.dumps([{"name": t.name, "code": t.code} for t in tms], ensure_ascii=False)
 
-    def _nom(self, tm_code: str) -> Nomenclature:
-        hit = _NOM_CACHE.get(tm_code)
+    def _hidden(self) -> bool:
+        """Тянуть ли снятые с производства. Решает РЕЖИМ, а не место вызова.
+
+        Иначе в режиме «товары+цены» одна и та же марка читается ДВАЖДЫ: товарная ветка
+        просит выгрузку со снятыми, ценовая — без них, ключи кеша разные, и 1С опрашивается
+        второй раз по несколько секунд на марку. Один флаг на весь ход — один запрос.
+        """
+        return modes.with_items(self.mode)
+
+    def _nom(self, tm_code: str, with_hidden: bool | None = None) -> Nomenclature:
+        with_hidden = self._hidden() if with_hidden is None else with_hidden
+        # КЛЮЧ КЕША ВКЛЮЧАЕТ ФЛАГ. Выгрузка со снятыми с производства и без них — разные
+        # наборы, а не разный объём одного: сложив их в один ключ, мы бы отдали ценовому
+        # режиму снятые позиции (им цены не пишут), либо товарному — неполный справочник,
+        # и он завёл бы дубль вместо возврата из снятых.
+        key = (tm_code, with_hidden)
+        hit = _NOM_CACHE.get(key)
         if hit and time.monotonic() - hit[0] < NOM_CACHE_TTL:
             return hit[1]
         started = time.monotonic()
-        nom = self._onec.by_tm_all(tm_code)
-        logger.info("Номенклатура ТМ %s: %d поз. за %.1f c%s", tm_code, len(nom.items),
+        nom = self._onec.by_tm_all(tm_code, include_not_exported=with_hidden)
+        logger.info("Номенклатура ТМ %s%s: %d поз. за %.1f c%s", tm_code,
+                    " (со снятыми)" if with_hidden else "", len(nom.items),
                     time.monotonic() - started,
                     f", НЕ ОТДАНО 1С: {len(nom.errors)}" if nom.errors else "")
-        _NOM_CACHE[tm_code] = (time.monotonic(), nom)
+        _NOM_CACHE[key] = (time.monotonic(), nom)
         return nom
 
-    def _items(self, tm_code: str) -> list[NomItem]:
-        return self._nom(tm_code).items
+    def _items(self, tm_code: str, with_hidden: bool | None = None) -> list[NomItem]:
+        return self._nom(tm_code, with_hidden).items
 
     def _nomenclature(self, inp: dict) -> str:
         page, size = int(inp.get("page", 1)), int(inp.get("size", 200))
+        with_items = modes.with_items(self.mode)
         nom = self._nom(inp["tm_code"])
         items = nom.items
         # Сужение до коллекции — главный рычаг по токенам: марка на 900 позиций даёт
@@ -1017,8 +1148,168 @@ class PricingTools:
                 "purchase": i.purchase.value if i.purchase else None,
                 "retail": i.retail.value if i.retail else None,
                 "rrc": i.rrc.value if i.rrc else None,
+                **(self._item_fields(i) if with_items else {}),
             } for i in chunk],
         }, ensure_ascii=False)
+
+    @staticmethod
+    def _item_fields(i: NomItem) -> dict:
+        """Поля §19.3 — только в товарных режимах (§5.2).
+
+        В ценовом они не нужны ни одним байтом, а история диалога едет в КАЖДЫЙ следующий
+        запрос (§9.6.3): на марке в 900 позиций эти поля стоят десятки тысяч токенов за
+        шаг и не влияют ни на одно решение о цене.
+        """
+        return {
+            "full_name": i.full_name, "site_name": i.site_name,
+            "product_type_ref": i.product_type_ref,
+            "collection_code": i.collection_code,
+            "length_from": i.length_from, "length_to": i.length_to,
+            "width_from": i.width_from, "width_to": i.width_to,
+            "thickness": i.thickness, "not_exported": i.not_exported,
+            "properties": [{"property": p.property, "code": p.code,
+                            "value": p.value, "value_code": p.value_code}
+                           for p in i.properties],
+        }
+
+    # ------------------------------------------------------ справочник: чтение и правка
+
+    def _folders(self, inp: dict) -> str:
+        tree = self._onec.folders(product_type=(inp.get("product_type") or "").strip() or None,
+                                  tm=(inp.get("tm") or "").strip() or None)
+        return json.dumps({
+            "total": tree.total,
+            "not_returned_by_1c": tree.errors[:20],
+            "folders": [{
+                "ref": f.ref, "name": f.name, "parent_ref": f.parent_ref, "kind": f.kind,
+                "level": f.level, "not_exported": f.not_exported,
+                "product_type_ref": f.product_type_ref,
+                # доля марки считается ТОЛЬКО у папок ТМ (§19.6.1, порог 0.5); у папок
+                # коллекций она нулевая по построению, и решать по ней нельзя
+                "tm_ref": f.tm_ref, "tm_share": f.tm_share,
+            } for f in tree.items],
+        }, ensure_ascii=False)
+
+    def _properties(self, inp: dict) -> str:
+        cat = self._onec.properties_by_type(
+            inp["product_type"],
+            tm=(inp.get("tm") or "").strip() or None,
+            property_code=(inp.get("property") or "").strip() or None)
+        return json.dumps({
+            "product_type": cat.product_type,
+            "product_type_ref": cat.product_type_ref,
+            "matched_folder": cat.matched_folder,
+            "errors": cat.errors[:10],
+            "properties": [{
+                "property": p.property, "code": p.code,
+                "values": [{"value": v.value, "code": v.code} for v in p.values],
+            } for p in cat.properties],
+        }, ensure_ascii=False)
+
+    async def _propose_items(self, inp: dict) -> str:
+        """Предложение правок справочника по одной коллекции (§19.7).
+
+        Гейт тот же, что у цен: payload собирает КОД и кладёт в `pending_proposal`, а
+        запись делает обработчик по кнопке админа. Модель не может ни записать, ни
+        подменить payload после подтверждения — она вообще не видит `set-items`.
+        """
+        if not modes.with_items(self.mode):
+            return ("Сейчас режим «только цены» — справочник не правим. Расхождения по "
+                    "товарам не разбирай и админу не показывай. Сменить режим может "
+                    "только админ командой /mode.")
+
+        tm_code = str(inp.get("tm_code") or "").strip()
+        if not tm_code:
+            return "Не передан tm_code — без кода марки правку собрать нельзя."
+
+        scope = [c["category"] for c in await self._store.list_scope()]
+        # Снятые с производства НУЖНЫ: без них агент заведёт дубль вместо возврата (§19.3).
+        current = await asyncio.to_thread(self._items, tm_code)
+        plan = item_rules.plan_collection(inp, current, scope)
+        ops = plan.ops()
+
+        summary = item_rules.render(plan)
+        self.last_summary = summary
+
+        if not ops:
+            return (summary + "\n\n[Записывать нечего — кнопка не появится. "
+                    "Покажи текст админу и продолжай по очереди.]")
+
+        await self._store.save_proposal(
+            self._user_id, ops, summary,
+            digest=self._item_digest(plan, current, inp), kind="items")
+        return (summary + "\n\n[Правки сохранены, этот текст я уже показал админу — "
+                "ПЕРЕПИСЫВАТЬ ЕГО НЕ НУЖНО. Жди кнопки. После записи справочника "
+                "переходи к ценам по этой же коллекции, если режим их включает.]")
+
+    def _item_digest(self, plan, current: list, inp: dict) -> dict:
+        """Снимок правок для уведомлений (§19.9): после записи пересчитать неоткуда.
+
+        Форма — та же, что у ценового дайджеста, и это НЕ совпадение: `item_broadcast`
+        сворачивает правки по коллекции ровно так же, как `broadcast` сворачивает цены, и
+        второй формы для того же по смыслу сообщения быть не должно.
+
+        Нормализация попадает сюда ФЛАГОМ, а не списком правок: менеджерам про неё не
+        говорят вовсе, админу — одной строкой на коллекцию.
+        """
+        was = {i.ref: i for i in current}
+        coll = plan.collection.lower()
+        # «вся коллекция» должна означать именно всю: считаем, сколько позиций этой
+        # коллекции вообще есть в 1С, а не сколько модель прислала.
+        total = sum(1 for i in current
+                    if (i.collection or "").lower() == coll and not i.not_exported)
+        total = max(total, len(plan.items))
+
+        items = []
+        for item in plan.updated + plan.normalized:
+            changes: dict = {}
+            for change in item.real_changes:
+                if change.field == "parent_ref":
+                    changes["parent"] = [change.before, change.after]
+                elif change.field == "pack_coefficient":
+                    changes["pack"] = [change.before, change.after]
+            pair = self._size_pair(was.get(item.ref), item)
+            if pair:
+                changes["size"] = list(pair)
+            items.append({"ref": item.ref, "name": item.name, "changes": changes,
+                          "normalized": item.only_normalization})
+
+        for item in plan.created:
+            items.append({"ref": "", "name": item.name,
+                          "changes": {"collection": ["нет", plan.collection]},
+                          "normalized": False})
+
+        return {
+            "supplier": inp.get("supplier") or (self._file[0] if self._file else None),
+            "created": len(plan.created), "updated": len(plan.updated),
+            "normalized": len(plan.normalized),
+            "new_folder": plan.new_folder,
+            "groups": [{
+                "tm_code": plan.tm_code, "tm_name": plan.tm_name,
+                "collection": plan.collection, "total": total, "items": items,
+            }],
+        }
+
+    @staticmethod
+    def _size_pair(was, item) -> tuple[str, str] | None:
+        """«1219x228x3.5 → 1219x228x4» — только если размер действительно поехал.
+
+        Показываем размер ЦЕЛИКОМ, а не одну изменившуюся грань: менеджер сверяет его с
+        прайсом одной строкой, и «толщина 3.5 → 4» без остальных чисел ему ничего не даёт.
+        """
+        keys = ("length_from", "width_from", "thickness")
+        if not any(k in item.fields for k in keys):
+            return None
+
+        def fmt(source: dict) -> str:
+            parts = [source.get(k) for k in keys]
+            return "x".join("?" if p is None else
+                            (f"{p:g}" if isinstance(p, float) else str(p)) for p in parts)
+
+        before = {k: getattr(was, k, None) for k in keys} if was else {}
+        after = dict(before)
+        after.update({k: v for k, v in item.fields.items() if k in keys})
+        return fmt(before), fmt(after)
 
     # -------------------------------------------------------------- предложение
 
@@ -1036,7 +1327,15 @@ class PricingTools:
         proposed = {g.get("tm_code") for g in inp.get("groups") or []}
         planned = {t.get("code") for t in (run or {}).get("planned") or []}
         out = []
-        for tm_code, (_, nom) in _NOM_CACHE.items():
+        # КЛЮЧ КЕША — ПАРА (код ТМ, со снятыми ли), и одна марка может лежать в нём дважды.
+        # Берём выгрузку побольше: она включает вторую, а предупреждение про одну и ту же
+        # марку не должно приходить дважды.
+        seen: dict[str, object] = {}
+        for (tm_code, _hidden), (_, nom) in _NOM_CACHE.items():
+            best = seen.get(tm_code)
+            if best is None or len(nom.items) > len(best.items):
+                seen[tm_code] = nom
+        for tm_code, nom in seen.items():
             if tm_code in proposed or tm_code in planned or not nom.items:
                 continue
             kinds = {i.product_type for i in nom.items if i.product_type}
@@ -1079,13 +1378,16 @@ class PricingTools:
         # на 900+ позициях не хватает хода, и раньше она отдавала выбор админу вопросом.
         if tm_code and not (stage and stage.get("tm_code") == tm_code):
             nom = await asyncio.to_thread(self._nom, tm_code)
-            if len(nom.items) >= BIG_TM_ITEMS:
+            # порог считаем по ЖИВЫМ позициям: снятые с производства в товарных режимах
+            # тоже приходят, но дробить прогон по коллекциям из-за них незачем
+            live = [i for i in nom.items if not i.not_exported]
+            if len(live) >= BIG_TM_ITEMS:
                 colls = {}
-                for i in nom.items:
+                for i in live:
                     colls.setdefault(i.collection_ref or "",
                                      i.collection or i.parent or "без коллекции")
                 names = ", ".join(sorted(colls.values())[:15])
-                return (f"В этой марке {len(nom.items)} поз. и {len(colls)} коллекций — "
+                return (f"В этой марке {len(live)} поз. и {len(colls)} коллекций — "
                         "разбираем по коллекциям, целиком за один заход не берём. Вызови "
                         "start_tm_collections, перечислив коллекции марки, которые есть В "
                         f"ПРАЙСЕ (в 1С их: {names}"

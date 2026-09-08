@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS pending_proposal (
     summary     TEXT NOT NULL,          -- что показали админу
     item_count  INTEGER NOT NULL,
     created_at  TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'pending'   -- pending | applied | rejected
+    status      TEXT NOT NULL DEFAULT 'pending',  -- pending | applied | rejected
+    kind        TEXT NOT NULL DEFAULT 'prices'    -- prices (set-prices) | items (set-items)
 );
 CREATE INDEX IF NOT EXISTS ix_pending_user ON pending_proposal (user_id, status);
 {mappings}
@@ -185,6 +186,7 @@ class Proposal:
     summary: str
     item_count: int
     digest: dict | None = None     # снимок «было → стало» для рассылки и журнала (п.6)
+    kind: str = "prices"           # чем записывать: set-prices или set-items (§19.8)
 
 
 def _now() -> str:
@@ -209,6 +211,14 @@ class PricingStore:
             columns = {row[1] for row in await cur.fetchall()}
             if "digest" not in columns:
                 await db.execute("ALTER TABLE pending_proposal ADD COLUMN digest TEXT")
+            if "kind" not in columns:
+                # ПРЕДМЕТ ЗАПИСИ, а не её вид: 'prices' уходит в set-prices, 'items' — в
+                # set-items. Одно поле вместо второй таблицы потому, что предложения
+                # ВСЕГДА последовательны: сначала подтверждают правки справочника по
+                # коллекции, потом цены по ней же (§19.7). Двух висящих сразу не бывает,
+                # а «прежнее предложение отменяется» должно работать поверх обоих.
+                await db.execute("ALTER TABLE pending_proposal ADD COLUMN kind TEXT "
+                                 "NOT NULL DEFAULT 'prices'")
             cur = await db.execute("PRAGMA table_info(price_run)")
             run_columns = {row[1] for row in await cur.fetchall()}
             if "notes" not in run_columns:
@@ -296,23 +306,24 @@ class PricingStore:
     # ------------------------------------------------------- предложения к записи
 
     async def save_proposal(self, user_id: int, payload: list[dict], summary: str,
-                            digest: dict | None = None) -> int:
+                            digest: dict | None = None, kind: str = "prices") -> int:
         """Новое предложение заменяет предыдущее неподтверждённое."""
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute("UPDATE pending_proposal SET status = 'rejected' "
                              "WHERE user_id = ? AND status = 'pending'", (user_id,))
             cur = await db.execute(
                 "INSERT INTO pending_proposal (user_id, payload, summary, item_count, "
-                "created_at, digest) VALUES (?, ?, ?, ?, ?, ?)",
+                "created_at, digest, kind) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (user_id, json.dumps(payload, ensure_ascii=False), summary, len(payload),
-                 _now(), json.dumps(digest, ensure_ascii=False) if digest else None))
+                 _now(), json.dumps(digest, ensure_ascii=False) if digest else None, kind))
             await db.commit()
             return cur.lastrowid
 
     async def get_pending(self, user_id: int) -> Proposal | None:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT proposal_id, payload, summary, item_count, digest FROM pending_proposal "
+                "SELECT proposal_id, payload, summary, item_count, digest, kind "
+                "FROM pending_proposal "
                 "WHERE user_id = ? AND status = 'pending' ORDER BY proposal_id DESC LIMIT 1",
                 (user_id,))
             row = await cur.fetchone()
@@ -320,7 +331,8 @@ class PricingStore:
             return None
         return Proposal(proposal_id=row[0], user_id=user_id, payload=json.loads(row[1]),
                         summary=row[2], item_count=row[3],
-                        digest=json.loads(row[4]) if row[4] else None)
+                        digest=json.loads(row[4]) if row[4] else None,
+                        kind=row[5] or "prices")
 
     async def take_pending(self, user_id: int, proposal_id: int) -> Proposal | None:
         """Атомарно берёт предложение в работу: повторное нажатие кнопки не сработает.
@@ -333,7 +345,7 @@ class PricingStore:
             cur = await db.execute(
                 "UPDATE pending_proposal SET status = 'applying' "
                 "WHERE proposal_id = ? AND user_id = ? AND status = 'pending' "
-                "RETURNING payload, summary, item_count, digest",
+                "RETURNING payload, summary, item_count, digest, kind",
                 (proposal_id, user_id))
             row = await cur.fetchone()
             await db.commit()
@@ -341,7 +353,8 @@ class PricingStore:
             return None
         return Proposal(proposal_id=proposal_id, user_id=user_id, payload=json.loads(row[0]),
                         summary=row[1], item_count=row[2],
-                        digest=json.loads(row[3]) if row[3] else None)
+                        digest=json.loads(row[3]) if row[3] else None,
+                        kind=row[4] or "prices")
 
     async def mark_applied(self, proposal_id: int) -> None:
         async with aiosqlite.connect(self._db_path) as db:
