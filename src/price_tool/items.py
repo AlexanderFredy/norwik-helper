@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from src.price_tool import discontinued
 from src.price_tool.naming import (collection_case, ensure_type_prefix, tidy,
                                    violations)
 
@@ -288,6 +289,17 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
             "thickness": _num(raw.get("thickness")),
         }
 
+        target = _discontinued_target(wanted["parent_ref"],
+                                      str(inp.get("product_type") or ""))
+        if target:
+            # ЖЁСТКИЙ МАППИНГ «вид товара → папка снятых» (§19.2.5). В боевой базе папок
+            # снятых 23 штуки, разложены они исторически, и выбор «похожей» на глаз — это
+            # ровно тот способ, которым туда попала нынешняя каша. Папку назначает КОД.
+            if target != wanted["parent_ref"]:
+                item_warnings.append(
+                    f"перенос в снятые: папка исправлена на {target} по маппингу вида товара")
+                wanted["parent_ref"] = target
+
         changes: list[FieldChange] = []
         fields: dict = {}
 
@@ -413,3 +425,19 @@ def _grouped(items: list[ItemPlan]) -> dict:
         key = "; ".join(c.render() for c in i.real_changes)
         out.setdefault(key, []).append(i)
     return out
+
+
+def _discontinued_target(parent_ref: str, product_type_ref: str) -> str | None:
+    """Целевая папка снятых, если товар переносят именно туда. Иначе None.
+
+    Опознаём перенос по тому, что папка-получатель ЕСТЬ В МАППИНГЕ: список папок снятых
+    известен заранее, и определять их по имени («содержит СНЯТ») незачем — на именах уже
+    один раз обожглись, когда коллекция «Стародуб … снят с производства» была принята за
+    папку снятых.
+    """
+    if not parent_ref:
+        return None
+    known = {t.folder_ref for t in discontinued.MAPPING.values() if t.folder_ref}
+    if parent_ref not in known:
+        return None
+    return discontinued.folder_for(product_type_ref) or parent_ref

@@ -175,6 +175,28 @@ class PlanTest(unittest.TestCase):
         self.assertIn("папка", render(plan))
 
 
+class DiscontinuedTest(unittest.TestCase):
+    """Папку снятых назначает КОД по виду товара (§19.2.5), а не модель на глаз."""
+
+    def test_wrong_discontinued_folder_is_corrected(self):
+        # YO-00078918 — папка снятых для ОБОЕВ, а вид товара тут виниловый ламинат
+        plan = plan_collection(_inp(items=[
+            {"op": "update", "ref": "YO-1", "article": "LQ-01", "title": "Адана",
+             "tail": "LQ-01", "parent_ref": "YO-00078918"}
+        ]), current=[_nom()])
+        op = plan.ops()[0]
+        self.assertNotEqual(op["parent_ref"], "YO-00078918")
+        self.assertIn("папка исправлена", render(plan))
+
+    def test_ordinary_move_is_untouched(self):
+        """Обычный перенос между папками маппинг не трогает."""
+        plan = plan_collection(_inp(items=[
+            {"op": "update", "ref": "YO-1", "article": "LQ-01", "title": "Адана",
+             "tail": "LQ-01", "parent_ref": "YO-00078953"}
+        ]), current=[_nom()])
+        self.assertEqual(plan.ops()[0]["parent_ref"], "YO-00078953")
+
+
 class RenderTest(unittest.TestCase):
 
     def test_same_change_across_collection_is_one_line(self):
