@@ -6,7 +6,7 @@
 import unittest
 
 from src.price_tool.naming import (MARKUP, fix_caps, is_xml_safe, markup_chars,
-                                   violations, xml_safe)
+                                   tidy, violations, xml_safe)
 
 
 class ControlCharsTest(unittest.TestCase):
@@ -100,6 +100,28 @@ class CapsTest(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(fix_caps(None), "")
         self.assertEqual(fix_caps(""), "")
+
+
+class TidyTest(unittest.TestCase):
+    """Одна функция на всю молчаливую нормализацию (§19.5)."""
+
+    def test_spaces_and_caps_together(self):
+        self.assertEqual(tidy("Ламинат Peli  Дуб МЕДОВЫЙ  AN DSG 908"),
+                         "Ламинат Peli Дуб Медовый AN DSG 908")
+
+    def test_edges_trimmed(self):
+        self.assertEqual(tidy("  Дуб Милас  "), "Дуб Милас")
+
+    def test_control_chars_removed(self):
+        self.assertEqual(tidy("Дуб" + chr(0) + " Милас"), "Дуб Милас")
+
+    def test_markup_survives(self):
+        """Onyx&More — настоящее имя коллекции, чистка его не касается."""
+        self.assertEqual(tidy("Onyx&More"), "Onyx&More")
+
+    def test_clean_name_untouched(self):
+        name = "CAMSAN Platinum Plus Дуб Милас 1380x190x10"
+        self.assertEqual(tidy(name), name)
 
 
 if __name__ == "__main__":
