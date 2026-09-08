@@ -12,6 +12,7 @@ from pathlib import Path
 
 from src.agent.orchestrator import CACHE, _cached
 from src.agent.pricing_tools import PricingTools, clear_nomenclature_cache
+from src.bot import pricing_handlers as ph
 from src.bot.pricing_handlers import DUMP_STUB, NOM_STUB, _prune_file_dumps
 from src.storage.pricing import PricingStore
 from tests.test_pricing_flow import FakeOnec, item
@@ -205,6 +206,33 @@ class ProposalEchoTest(unittest.IsolatedAsyncioTestCase):
         # текст остаётся в ответе — иначе модель не сможет ответить на вопрос по нему
         self.assertIn("К записи:", text)
         self.assertIn("ПЕРЕПИСЫВАТЬ ЕГО НЕ НУЖНО", text)
+
+
+class PrunedImagesTest(unittest.TestCase):
+    """Картинки прайса едут в блоке выгрузки и обязаны уезжать вместе с ней.
+
+    Логотипы PDF-прайса стоят копейки поштучно, но история в ручном цикле пересылается
+    ЦЕЛИКОМ на каждый шаг: сорок картинок, оставшись висеть, повторяются столько раз,
+    сколько было запросов.
+    """
+
+    @staticmethod
+    def _dump(text: str, images: int = 0) -> dict:
+        content = [{"type": "text", "text": text}]
+        for _ in range(images):
+            content.append({"type": "image", "source": {"type": "base64",
+                                                        "media_type": "image/png",
+                                                        "data": "AAAA"}})
+        return {"role": "user", "content": [{"type": "tool_result", "content": content}]}
+
+    def test_images_leave_with_the_old_dump(self):
+        big = ph.SHEET_MARK + "x" * (ph.DUMP_MIN_CHARS + 10)
+        out = ph._prune_file_dumps([self._dump(big, images=3), self._dump(big, images=3)])
+        first = out[0]["content"][0]["content"]
+        self.assertIsInstance(first, str)                 # заглушка вместо блоков
+        self.assertIn("картинками", first)
+        last = out[1]["content"][0]["content"]
+        self.assertEqual(sum(1 for b in last if b["type"] == "image"), 3)
 
 
 if __name__ == "__main__":

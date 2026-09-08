@@ -208,12 +208,153 @@ def _parse_uncached(content: bytes, filename: str) -> list[Sheet]:
             return _from_xls(content)
         if ext == ".csv":
             return _from_csv(content)
+        if ext == ".pdf":
+            return _from_pdf(content)
     except Exception:
         logger.exception("Не удалось разобрать прайс %s", filename)
         return []
     logger.warning("Формат %s не поддержан парсером прайса", ext)
     return []
 
+
+
+# =====================================================================================
+# PDF-прайсы
+#
+# ПОЧЕМУ ЭТО ПОНАДОБИЛОСЬ ОТДЕЛЬНО. Прайс LINDERWOOD — PDF, и до сих пор `read_price_file`
+# на нём возвращал НОЛЬ листов: разбирались только xlsx, xls и csv. Разбор этого прайса
+# шёл руками, а агент его просто не видел.
+#
+# ЧИТАЕМ ТАБЛИЦУ, А НЕ СТРОКИ ТЕКСТА. `extract_text_lines()` на этом файле склеивает
+# колонки: строка «8 /33 VN-520 Çaykara Meşe … 949 ₽ 999 ₽» идёт вперемешку со строками,
+# где остались одни цены. `extract_tables()` возвращает нормальную таблицу — 75 строк на
+# 14 колонок с заголовками «Коллекция | Артикул | … | *РРЦ за м2», то есть ровно ту форму,
+# в которой прайс приходит из xlsx. Значит и весь остальной конвейер (маппинг колонок,
+# поиск по `contains`, чтение `from_row`) работает без единой правки.
+#
+# ЛИСТ — ЭТО СТРАНИЦА. Ключ запомненного маппинга колонок — пара `(сигнатура, лист)`
+# (§6.4), и имя листа обязано быть устойчивым от прайса к прайсу. Номер страницы устойчив,
+# порядковый номер таблицы внутри страницы — нет: стоит поставщику добавить рамку, и
+# таблиц станет две вместо одной.
+# =====================================================================================
+
+
+def _pdf_cell(value) -> str:
+    """Ячейка PDF-таблицы: `None` — это пустая ячейка, перенос внутри — пробел."""
+    if value is None:
+        return ""
+    return " ".join(str(value).split())
+
+
+def _from_pdf(content: bytes) -> list[Sheet]:
+    import pdfplumber
+
+    sheets: list[Sheet] = []
+    with pdfplumber.open(io.BytesIO(content)) as pdf:
+        for number, page in enumerate(pdf.pages, start=1):
+            rows = [row for row, _top in _pdf_rows(page)]
+            if rows:
+                sheets.append(Sheet(name=f"стр. {number}", rows=rows))
+    return sheets
+
+
+def _pdf_rows(page) -> list[tuple[list[str], float]]:
+    """Строки страницы вместе с их вертикальной координатой.
+
+    Координата нужна не разбору, а КАРТИНКАМ: логотип коллекции привязывается к строке по
+    тому, в чью полосу он попал (см. `pdf_image_anchors`). Возвращать её отсюда дешевле,
+    чем считать таблицы второй раз.
+    """
+    out: list[tuple[list[str], float]] = []
+
+    for table in page.find_tables():
+        # `table.extract()` отдаёт значения, `table.rows` — геометрию; идут они строго
+        # параллельно, поэтому сшиваем по индексу. Искать строку через `.index()` нельзя:
+        # объекты строк сравниваются не так, как ожидается, и поиск падает.
+        values = table.extract()
+        for index, row in enumerate(table.rows):
+            cells = [_pdf_cell(v) for v in (values[index] if index < len(values) else [])]
+            if any(cells):
+                out.append((_rtrim(cells), float(row.bbox[1])))
+
+    if out:
+        return out
+
+    # РЕЗЕРВ: таблицы не нашлись (в прайсе нет линеек). Тогда одна колонка на строку —
+    # это хуже, но всё же лучше пустого листа: агент хотя бы увидит текст.
+    for line in page.extract_text_lines():
+        text = " ".join((line.get("text") or "").split())
+        if text:
+            out.append(([text], float(line["top"])))
+    return out
+
+
+def pdf_image_anchors(content: bytes) -> dict[str, list[tuple[int, bytes, str]]]:
+    """Картинки PDF, привязанные к номерам строк: {лист: [(строка, байты, media_type)]}.
+
+    ДВЕ БИБЛИОТЕКИ, И ОБЕ НУЖНЫ. `pdfplumber` знает, ГДЕ картинка лежит (bbox), но отдаёт
+    сырой поток, из которого файл ещё надо собрать; `pypdf` собирает готовые PNG/JPEG, но
+    не говорит, где они на странице. Сопоставляем их по размеру в пикселях — он у картинки
+    свой и совпадений почти не даёт, а при совпадении берём по порядку.
+
+    Замер на боевом прайсе (09.09.2026): 40 логотипов = 560 входных токенов, по 14 на
+    штуку. Отбирать тут нечего — дешевле отдать все (§19.10).
+    """
+    import pdfplumber
+
+    out: dict[str, list[tuple[int, bytes, str]]] = {}
+    blobs = _pdf_blobs_by_size(content)
+
+    with pdfplumber.open(io.BytesIO(content)) as pdf:
+        for number, page in enumerate(pdf.pages, start=1):
+            rows = _pdf_rows(page)
+            if not rows:
+                continue
+            tops = [top for _cells, top in rows]
+            found: list[tuple[int, bytes, str]] = []
+
+            for image in sorted(page.images, key=lambda i: i["top"]):
+                key = tuple(image.get("srcsize") or ())
+                queue = blobs.get(key)
+                if not queue:
+                    continue
+                data, media = queue.pop(0)
+                found.append((_row_for_top(tops, float(image["top"])), data, media))
+
+            if found:
+                out[f"стр. {number}"] = found
+
+    return out
+
+
+def _pdf_blobs_by_size(content: bytes) -> dict[tuple, list[tuple[bytes, str]]]:
+    """Готовые файлы картинок из pypdf, разложенные по размеру в пикселях."""
+    out: dict[tuple, list[tuple[bytes, str]]] = {}
+    for _page, data, media in pdf_images(content, limit=200):
+        try:
+            from PIL import Image
+            with Image.open(io.BytesIO(data)) as im:
+                key = (im.width, im.height)
+        except Exception:
+            continue
+        out.setdefault(key, []).append((data, media))
+    return out
+
+
+def _row_for_top(tops: list[float], value: float) -> int:
+    """Номер строки (1-based), в чью полосу попадает координата.
+
+    Картинка часто стоит ВЫШЕ первой строки своего раздела — логотип рисуют над блоком.
+    Поэтому берём последнюю строку, начинающуюся не ниже картинки, а если такой нет —
+    первую: маркер должен оказаться перед разделом, а не после него.
+    """
+    row = 1
+    for index, top in enumerate(tops, start=1):
+        if top <= value + 1:
+            row = index
+        else:
+            break
+    return row
 
 def _rtrim(row: list[str]) -> list[str]:
     """Убирает хвостовые пустые ячейки (листы бывают «широкими» — сотни пустых колонок)."""

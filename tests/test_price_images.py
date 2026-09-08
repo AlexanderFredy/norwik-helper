@@ -23,11 +23,11 @@ PNG = base64.b64decode(
     "hQGAhKmMIQAAAABJRU5ErkJggg==")
 
 
-def png(color: tuple[int, int, int]) -> bytes:
+def png(color: tuple[int, int, int], size: int = 2) -> bytes:
     """Разные картинки — разные байты (одинаковые схлопывает дедуп)."""
     from PIL import Image
     buf = io.BytesIO()
-    Image.new("RGB", (2, 2), color).save(buf, format="PNG")
+    Image.new("RGB", (size, size), color).save(buf, format="PNG")
     return buf.getvalue()
 
 
@@ -100,7 +100,24 @@ class PriceImagesTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(pt, "MAX_IMAGES", 2):
             out = await self._read(workbook(image_rows=[5, 10, 15], images=three))
         self.assertEqual(len([b for b in out if b["type"] == "image"]), 2)
-        self.assertEqual(self._text(out).count("исчерпан лимит"), 1)
+        self.assertEqual(self._text(out).count("исчерпан бюджет"), 1)
+
+    async def test_pixel_budget_respected(self):
+        """Цена картинки — её ПЛОЩАДЬ, а не штука: лимит в 6 штук резал 40 логотипов PDF."""
+        two = [png((255, 0, 0)), png((0, 255, 0))]
+        with patch.object(pt, "MAX_IMAGE_PIXELS", 1):
+            out = await self._read(workbook(image_rows=[5, 10], images=two))
+        self.assertIsInstance(out, str)                    # ни одна не влезла
+        self.assertIn("исчерпан бюджет", out)
+
+    async def test_small_images_win_the_budget(self):
+        """Имена коллекций пишут на мелких логотипах, а не на крупных фотографиях."""
+        big, small = png((255, 0, 0), size=60), png((0, 255, 0), size=4)
+        with patch.object(pt, "MAX_IMAGE_PIXELS", 100):
+            out = await self._read(workbook(image_rows=[5, 10], images=[big, small]))
+        attached = [b for b in out if b["type"] == "image"]
+        self.assertEqual(len(attached), 1)
+        self.assertIn("исчерпан бюджет", self._text(out))
 
     async def test_total_budget_respected(self):
         two = [png((255, 0, 0)), png((0, 255, 0))]

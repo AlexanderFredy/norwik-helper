@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import logging
 import time
@@ -23,7 +24,8 @@ from src.price_tool.exclusive import (
     HINT_WORDS, WHERE_FOUND, annotate, find, resolve,
 )
 from src.price_tool.parser import (
-    extract_images, find_rows, non_empty_rows, parse_price_table, render_preview,
+    extract_images, find_rows, non_empty_rows, parse_price_table, pdf_image_anchors,
+    render_preview,
 )
 from src.price_tool import items as item_rules
 from src.price_tool import modes
@@ -37,7 +39,12 @@ logger = logging.getLogger(__name__)
 # Картинки едут в истории диалога (SQLite + каждый следующий запрос к модели), поэтому
 # лимиты жёсткие: логотипы весят десятки килобайт, всё крупное — это фото товаров.
 MAX_TEXT_CHARS = 40000
-MAX_IMAGES = 6
+# СЧИТАЕМ ПЛОЩАДЬ, А НЕ ШТУКИ. Картинка стоит примерно `ширина × высота / 750` входных
+# токенов — от числа копий её цена не зависит вовсе. Прежний лимит в 6 штук ставился под
+# xlsx-баннеры (в прайсе Монарха 93 копии одного логотипа на 2.7 МБ) и на PDF отрезал бы
+# 34 логотипа из 40 — при том что все 40 вместе стоят 560 токенов (замер 09.09.2026, §19.10).
+MAX_IMAGE_PIXELS = 1_500_000        # ≈ 2 000 входных токенов на весь прайс
+MAX_IMAGES = 60                     # страховка от структурного разбухания запроса
 MAX_IMAGE_BYTES = 1_500_000
 MAX_IMAGE_TOTAL_BYTES = 4_000_000
 
@@ -607,6 +614,20 @@ def _transitions(group: GroupResult, kind: str, label: str) -> list[str]:
     return out
 
 
+def _image_pixels(data: bytes) -> int:
+    """Площадь картинки в пикселях — мера её цены в токенах (примерно площадь / 750).
+
+    Не открылась — считаем дорогой: пропустить непонятную картинку дешевле, чем выбить
+    ею весь бюджет.
+    """
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as im:
+            return im.width * im.height
+    except Exception:
+        return MAX_IMAGE_PIXELS + 1
+
+
 class PricingTools:
     """Исполнитель инструментов режима цен. Живёт в рамках одного пользователя."""
 
@@ -1008,10 +1029,18 @@ class PricingTools:
         return text
 
     def _collect_images(self, content: bytes, filename: str, sheets: list) -> list[dict]:
-        if not filename.lower().endswith(".xlsx"):
-            return []
+        low = filename.lower()
         try:
-            by_sheet = extract_images(content)
+            if low.endswith(".xlsx"):
+                by_sheet = extract_images(content)
+            elif low.endswith(".pdf"):
+                # В PDF имя коллекции сплошь и рядом НАРИСОВАНО, а не написано: у
+                # LINDERWOOD «Quartz» есть только в логотипе, в тексте его нет. Без этой
+                # ветки агент назвал бы коллекцию словом из заголовка раздела — «SPC», то
+                # есть технологией вместо имени (§19.10).
+                by_sheet = pdf_image_anchors(content)
+            else:
+                return []
         except Exception:
             logger.warning("Не удалось извлечь изображения прайса", exc_info=True)
             return []
@@ -1033,7 +1062,14 @@ class PricingTools:
         seen: dict[bytes, dict] = {}
         attached: list[dict] = []
         budget = MAX_IMAGE_TOTAL_BYTES
-        for image in found:
+        pixels = MAX_IMAGE_PIXELS
+
+        # ПРИОРИТЕТ МЕЛКИМ. Обычная интуиция «показать самое крупное» здесь работает
+        # наоборот: имена коллекций пишут на логотипах, а логотип — это 60–220 px и
+        # единицы килобайт, тогда как фотография товара на порядок больше и не говорит
+        # ни о чём. Бюджет, набитый фотографиями, оставил бы агента без единого имени.
+        # Порядок ОТБОРА — по возрастанию площади, порядок МАРКЕРОВ — по строкам.
+        for image in sorted(found, key=lambda i: _image_pixels(i["data"])):
             digest = hashlib.sha1(image["data"]).digest()
             first = seen.get(digest)
             if first is not None:
@@ -1049,11 +1085,15 @@ class PricingTools:
             if size > MAX_IMAGE_BYTES:
                 image["label"] = (f"⟨ИЗОБРАЖЕНИЕ у строки {image['row']} — {size // 1024} КБ, "
                                   "слишком большое, не приложено⟩")
-            elif len(attached) >= MAX_IMAGES or size > budget:
+            elif (len(attached) >= MAX_IMAGES or size > budget
+                    or _image_pixels(image["data"]) > pixels):
+                # Говорим, что картинка ЕСТЬ, но не приложена: агент должен знать, что
+                # осталось непросмотренным, и при нужде спросить о ней админа.
                 image["label"] = (f"⟨ИЗОБРАЖЕНИЕ у строки {image['row']} — не приложено, "
-                                  f"исчерпан лимит в {MAX_IMAGES} картинок на прайс⟩")
+                                  "исчерпан бюджет картинок на прайс⟩")
             else:
                 budget -= size
+                pixels -= _image_pixels(image["data"])
                 image["n"] = len(attached) + 1
                 attached.append(image)
                 # Строка — это ЯКОРЬ (левый верхний угол) картинки: визуально она может
@@ -1064,6 +1104,13 @@ class PricingTools:
                     f"листа «{image['sheet']}» — приложено к этому же результату. "
                     "Картинка может перекрывать соседние строки: точную границу "
                     "раздела определи по заголовкам коллекций и формату артикулов⟩")
+
+        # НУМЕРУЕМ ПО ПОРЯДКУ В ПРАЙСЕ, а не по порядку отбора: «#22» должно значить
+        # «двадцать вторая сверху», иначе номер в маркере ничего не говорит о месте.
+        attached.sort(key=lambda i: (i["sheet"], i["row"]))
+        for number, image in enumerate(attached, start=1):
+            image["label"] = image["label"].replace(f"#{image['n']}", f"#{number}", 1)
+            image["n"] = number
 
         # маркеры вставляем с конца, чтобы не сдвинуть ещё не обработанные строки
         for image in sorted(found, key=lambda i: i["row"], reverse=True):
