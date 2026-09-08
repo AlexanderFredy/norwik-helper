@@ -5,8 +5,8 @@
 """
 import unittest
 
-from src.price_tool.naming import (MARKUP, is_xml_safe, markup_chars, violations,
-                                   xml_safe)
+from src.price_tool.naming import (MARKUP, fix_caps, is_xml_safe, markup_chars,
+                                   violations, xml_safe)
 
 
 class ControlCharsTest(unittest.TestCase):
@@ -71,6 +71,35 @@ class EdgeCasesTest(unittest.TestCase):
         for raw in ("A & B", "x <y> z", 'Он сказал "да"', "\x01\x02", "a\x00b"):
             with self.subTest(raw=raw):
                 self.assertTrue(is_xml_safe(xml_safe(raw)), raw)
+
+
+class CapsTest(unittest.TestCase):
+    """CAPS LOCK в карточке — опечатка ввода, а не смысл (§19.5)."""
+
+    def test_caps_word_becomes_capitalized(self):
+        self.assertEqual(fix_caps("Дуб МЕДОВЫЙ"), "Дуб Медовый")
+
+    def test_article_and_latin_survive(self):
+        """Латиница остаётся: там прописные осмысленны, а артикул переписывать нельзя."""
+        self.assertEqual(fix_caps("Peli Anatolia 8мм Дуб МЕДОВЫЙ AN DSG 908"),
+                         "Peli Anatolia 8мм Дуб Медовый AN DSG 908")
+        self.assertEqual(fix_caps("SPC LVT EIR UNILIN"), "SPC LVT EIR UNILIN")
+
+    def test_short_abbreviations_survive(self):
+        for abbr in ("ПВХ панель", "ЛДСП белая", "МДФ", "СПБ"):
+            with self.subTest(abbr=abbr):
+                self.assertEqual(fix_caps(abbr), abbr)
+
+    def test_mixed_case_word_untouched(self):
+        """«ДубМедовый» — чей-то стиль, а не CAPS LOCK; границы слов не угадываем."""
+        self.assertEqual(fix_caps("ДубМедовый"), "ДубМедовый")
+
+    def test_already_normal_untouched(self):
+        self.assertEqual(fix_caps("Дуб Медовый"), "Дуб Медовый")
+
+    def test_empty(self):
+        self.assertEqual(fix_caps(None), "")
+        self.assertEqual(fix_caps(""), "")
 
 
 if __name__ == "__main__":
