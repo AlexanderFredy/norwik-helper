@@ -114,3 +114,37 @@ def tidy(text: str | None) -> str:
     `updated` (§19.8.1). В справочнике чисто, в отчёте пусто.
     """
     return fix_caps(xml_safe(text))
+
+
+# --- вид товара в начале наименования -------------------------------------------------
+#
+# §19.5: `Наименование` = `Полное наименование` = `[тип] [ТМ] [коллекция] [название]
+# [размер]`, а `Наименование для сайта` = `[название]`. То есть вид товара обязан стоять
+# ПЕРВЫМ в двух полях и НЕ ДОЛЖЕН попадать в третье.
+#
+# Почему это разные функции, а не одна с флагом: правила противоположны, и переданный не
+# туда флаг молча испортил бы половину карточек.
+
+
+def ensure_type_prefix(name: str | None, product_type: str | None) -> str:
+    """Ставит вид товара в начало, если его там нет. Сравнение без учёта регистра."""
+    text = " ".join((name or "").split())
+    kind = " ".join((product_type or "").split())
+
+    if not kind:
+        return text
+    if text.lower().startswith(kind.lower()):
+        return text
+
+    return f"{kind} {text}".strip()
+
+
+def strip_type_prefix(name: str | None, product_type: str | None) -> str:
+    """Снимает вид товара с начала — для наименования на сайте, где он лишний."""
+    text = " ".join((name or "").split())
+    kind = " ".join((product_type or "").split())
+
+    if not kind or not text.lower().startswith(kind.lower()):
+        return text
+
+    return text[len(kind):].strip()

@@ -5,8 +5,9 @@
 """
 import unittest
 
-from src.price_tool.naming import (MARKUP, fix_caps, is_xml_safe, markup_chars,
-                                   tidy, violations, xml_safe)
+from src.price_tool.naming import (MARKUP, ensure_type_prefix, fix_caps, is_xml_safe,
+                                   markup_chars, strip_type_prefix, tidy, violations,
+                                   xml_safe)
 
 
 class ControlCharsTest(unittest.TestCase):
@@ -122,6 +123,44 @@ class TidyTest(unittest.TestCase):
     def test_clean_name_untouched(self):
         name = "CAMSAN Platinum Plus Дуб Милас 1380x190x10"
         self.assertEqual(tidy(name), name)
+
+
+class TypePrefixTest(unittest.TestCase):
+    """Вид товара первым в наименовании и полном, но НЕ в наименовании для сайта (§19.5)."""
+
+    def test_prefix_added_when_missing(self):
+        self.assertEqual(
+            ensure_type_prefix("Peli Anatolia Platinium Дуб Голд AN PLT 905", "Ламинат"),
+            "Ламинат Peli Anatolia Platinium Дуб Голд AN PLT 905")
+
+    def test_prefix_not_doubled(self):
+        name = "Ламинат Peli Vintage Ван Браун VN-511"
+        self.assertEqual(ensure_type_prefix(name, "Ламинат"), name)
+
+    def test_case_insensitive_check(self):
+        """«ЛАМИНАТ Peli …» уже начинается с вида товара — второй раз не ставим."""
+        self.assertEqual(ensure_type_prefix("ЛАМИНАТ Peli Дуб", "Ламинат"),
+                         "ЛАМИНАТ Peli Дуб")
+
+    def test_product_type_with_trailing_space(self):
+        """1С отдаёт вид товара с хвостовым пробелом — «Виниловый ламинат »."""
+        self.assertEqual(ensure_type_prefix("Peli Дуб", "Виниловый ламинат "),
+                         "Виниловый ламинат Peli Дуб")
+
+    def test_empty_type_leaves_name(self):
+        self.assertEqual(ensure_type_prefix("Peli Дуб", ""), "Peli Дуб")
+        self.assertEqual(ensure_type_prefix("Peli Дуб", None), "Peli Дуб")
+
+    def test_strip_for_site_name(self):
+        self.assertEqual(strip_type_prefix("Ламинат Дуб Голд", "Ламинат"), "Дуб Голд")
+
+    def test_strip_does_nothing_when_absent(self):
+        self.assertEqual(strip_type_prefix("Дуб Голд", "Ламинат"), "Дуб Голд")
+
+    def test_round_trip(self):
+        site = "Дуб Голд"
+        self.assertEqual(strip_type_prefix(ensure_type_prefix(site, "Ламинат"), "Ламинат"),
+                         site)
 
 
 if __name__ == "__main__":
