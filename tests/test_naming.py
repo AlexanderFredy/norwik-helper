@@ -202,5 +202,29 @@ class ArticleInNameTest(unittest.TestCase):
         self.assertEqual(fix_article_in_name("Дуб", None, self.KNOWN), "Дуб")
 
 
+class LegacyTypeWordTest(unittest.TestCase):
+    """«Водостойкий» — архаизм; вид товара в справочнике «Виниловый ламинат» (§19.5)."""
+
+    def test_legacy_word_replaced_not_prepended(self):
+        self.assertEqual(
+            ensure_type_prefix("Водостойкий ламинат Vinilam Дуб Брюссель 04018",
+                               "Виниловый ламинат"),
+            "Виниловый ламинат Vinilam Дуб Брюссель 04018")
+
+    def test_second_legacy_variant(self):
+        self.assertEqual(
+            ensure_type_prefix("Влагостойкий ламинат AQUAFLOOR Дуб", "Виниловый ламинат"),
+            "Виниловый ламинат AQUAFLOOR Дуб")
+
+    def test_canonical_untouched(self):
+        name = "Виниловый ламинат Peli SPC Адана LQ-01"
+        self.assertEqual(ensure_type_prefix(name, "Виниловый ламинат"), name)
+
+    def test_legacy_word_of_other_type_not_touched(self):
+        """«Водостойкий» не синоним «Ламината» — там дописываем, как обычно."""
+        self.assertEqual(ensure_type_prefix("Водостойкий ламинат Peli", "Ламинат"),
+                         "Ламинат Водостойкий ламинат Peli")
+
+
 if __name__ == "__main__":
     unittest.main()
