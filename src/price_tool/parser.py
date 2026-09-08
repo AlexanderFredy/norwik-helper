@@ -307,3 +307,43 @@ def parse_price_table(content: bytes, filename: str) -> list[Sheet]:
         _PARSED.pop(next(iter(_PARSED)))
     _PARSED[key] = sheets
     return _copy(sheets)
+
+
+def pdf_images(content: bytes, limit: int = 60) -> list[tuple[int, bytes, str]]:
+    """Встроенные картинки PDF: [(страница_1based, байты, media_type)].
+
+    ЗАЧЕМ. В PDF-прайсах названия коллекций сплошь и рядом нарисованы, а не написаны: у
+    LINDERWOOD имя коллекции `QUARTZ` есть ТОЛЬКО в логотипе слева от строк, в тексте его
+    нет ни в каком виде. Разбор, читающий один текст, такую коллекцию не увидит — и назовёт
+    её словом из заголовка раздела («SPC»), то есть технологией вместо имени.
+
+    Возвращаем ВСЁ, что нашли, и решение «что показать модели» оставляем вызывающему: на
+    одной странице этого прайса 40 логотипов, и отправить их скопом — десятки тысяч
+    токенов (§9.6.3).
+    """
+    out: list[tuple[int, bytes, str]] = []
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        logger.warning("pypdf недоступен — картинки PDF не извлекаются")
+        return out
+
+    try:
+        reader = PdfReader(io.BytesIO(content))
+    except Exception:
+        logger.exception("Не удалось открыть PDF для извлечения картинок")
+        return out
+
+    for number, page in enumerate(reader.pages, start=1):
+        try:
+            images = list(page.images)
+        except Exception:
+            continue
+        for image in images:
+            data = getattr(image, "data", None)
+            if data:
+                out.append((number, data, _media_type(data)))
+            if len(out) >= limit:
+                return out
+
+    return out
