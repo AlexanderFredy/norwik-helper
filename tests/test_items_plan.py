@@ -267,5 +267,89 @@ class MissingTitleTest(unittest.TestCase):
         self.assertEqual(len(names), 5, "имена схлопнулись в одно")
 
 
+class CollectionSplitTest(unittest.TestCase):
+    """Частичная правка имён оставляет коллекцию в двух написаниях — код это называет.
+
+    Прогон 10.09.2026: у коллекции свойство «Коллекция» равно `Platinium`, а имена собраны
+    как «Ламинат Peli **Anatolia** Platinium …». Агент чинил сломанное полное наименование
+    ОДНОЙ позиции и собрал ей имя по правилам §19.5, то есть без «Anatolia», — и был прав.
+    Но одиннадцать соседей остались в прежнем виде.
+    """
+
+    @staticmethod
+    def _twelve() -> list:
+        # Как на боевой базе: свойство «Коллекция» = `Platinium`, а лишнее «Anatolia»
+        # сидит в НАИМЕНОВАНИЯХ. Именно это расхождение и порождает разъезд.
+        return [_nom(ref=f"YO-{n}", article=f"AN PLT 9{n:02}",
+                     collection="Platinium",
+                     name=f"Ламинат Peli Anatolia Platinium Дуб {n} AN PLT 9{n:02}",
+                     product_type="Ламинат")
+                for n in range(12)]
+
+    def test_partial_rename_names_the_stragglers(self):
+        """Правку не блокируем — она нужна, — но говорим, что останется вразнобой."""
+        plan = plan_collection(_inp(
+            tm_name="Peli", product_type_name="Ламинат", collection="Platinium",
+            items=[{"op": "update", "ref": "YO-3", "article": "AN PLT 903",
+                    "title": "Дуб Сеньи", "tail": "AN PLT 903"}]), self._twelve())
+        self.assertIn("Ламинат Peli Platinium Дуб Сеньи", plan.ops()[0]["name"])
+        text = render(plan)
+        self.assertIn("11 поз.", text)
+        self.assertIn("двух написаниях", text)
+
+    def test_whole_collection_at_once_is_quiet(self):
+        """Приведение всей коллекции разом — законный шаг, поводов ворчать нет."""
+        current = self._twelve()
+        plan = plan_collection(_inp(
+            tm_name="Peli", product_type_name="Ламинат", collection="Platinium",
+            items=[{"op": "update", "ref": i.ref, "article": i.article,
+                    "title": "Дуб", "tail": i.article} for i in current]), current)
+        self.assertNotIn("двух написаниях", render(plan))
+
+    def test_already_uniform_collection_is_quiet(self):
+        current = [_nom(ref=f"YO-{n}", article=f"VN-{n}", collection="Vintage",
+                        product_type="Ламинат",
+                        name=f"Ламинат Peli Vintage Цвет {n} VN-{n}") for n in range(4)]
+        plan = plan_collection(_inp(
+            tm_name="Peli", product_type_name="Ламинат", collection="Vintage",
+            items=[{"op": "update", "ref": "YO-0", "article": "VN-0",
+                    "title": "Цвет 0", "tail": "VN-0", "thickness": 9}]), current)
+        self.assertNotIn("двух написаниях", render(plan))
+
+
+class UnfilledPropertiesTest(unittest.TestCase):
+    """Свойство, пустое у всей коллекции и заполненное у соседних, показывается фактом.
+
+    Фаска `V-Groove` стоит в прайсе на весь раздел; у Design и Platinium она в 1С
+    заполнена, у Vintage, Loft и Grand пуста. На одном прогоне агент это заметил, на
+    следующем прошёл мимо — правило жило только в промпте.
+    """
+
+    def test_gap_is_reported(self):
+        mine = [_nom(ref="YO-1", collection="Vintage", properties=())]
+        other = [_nom(ref="YO-2", collection="Design",
+                      properties=(ItemProperty("Фаска", "0000008",
+                                               "4-х сторонняя", "0000016"),))]
+        plan = plan_collection(_inp(collection="Vintage", items=[]), mine + other)
+        self.assertIn("Фаска", render(plan))
+        self.assertIn("Не заполнено ни у одной", render(plan))
+
+    def test_no_noise_when_filled(self):
+        prop = (ItemProperty("Фаска", "0000008", "4-х сторонняя", "0000016"),)
+        current = [_nom(ref="YO-1", collection="Vintage", properties=prop),
+                   _nom(ref="YO-2", collection="Design", properties=prop)]
+        plan = plan_collection(_inp(collection="Vintage", items=[]), current)
+        self.assertNotIn("Не заполнено ни у одной", render(plan))
+
+    def test_partially_filled_collection_is_not_reported(self):
+        """Хотя бы одна заполненная позиция — коллекция не «слепое пятно»."""
+        prop = (ItemProperty("Фаска", "0000008", "4-х сторонняя", "0000016"),)
+        current = [_nom(ref="YO-1", collection="Vintage", properties=prop),
+                   _nom(ref="YO-2", collection="Vintage", properties=()),
+                   _nom(ref="YO-3", collection="Design", properties=prop)]
+        plan = plan_collection(_inp(collection="Vintage", items=[]), current)
+        self.assertNotIn("Не заполнено ни у одной", render(plan))
+
+
 if __name__ == "__main__":
     unittest.main()

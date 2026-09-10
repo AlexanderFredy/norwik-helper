@@ -263,6 +263,15 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
 
     plans: list[ItemPlan] = []
 
+    # СОСТАВ КОЛЛЕКЦИЙ В 1С и то, что план вообще трогает: нужно, чтобы не расщепить
+    # коллекцию частичным переименованием (см. `_keep_collection` ниже).
+    members: dict[str, set] = {}
+    for existing in current:
+        if not existing.not_exported:
+            members.setdefault(_form(existing.collection), set()).add(existing.ref)
+    plan_refs = {str(r.get("ref") or "").strip()
+                 for r in inp.get("items") or [] if r.get("ref")}
+
     for raw in inp.get("items") or []:
         op = "update" if str(raw.get("op") or "").startswith("upd") else "create"
         ref = str(raw.get("ref") or "").strip()
@@ -270,15 +279,15 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
         title = str(raw.get("title") or "").strip()
         tail = str(raw.get("tail") or "").strip()
 
+        was = by_ref.get(ref) if op == "update" else None
+
+        item_warnings: list[str] = []
         name = build_name(type_name, tm_name, collection, title, tail)
         full = str(raw.get("full_name") or "").strip() or name
         site = site_name(title)
 
-        item_warnings: list[str] = []
         for bad in violations(name):
             item_warnings.append(f"имя содержит {bad}")
-
-        was = by_ref.get(ref) if op == "update" else None
         if op == "update" and was is None:
             item_warnings.append(
                 f"позиции {ref or '(без кода)'} нет в выгрузке 1С — правку не отправляю")
@@ -372,6 +381,9 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
             parent_ref=wanted["parent_ref"], changes=changes,
             warnings=item_warnings, fields=fields))
 
+    warnings += _name_split(type_name, tm_name, collection, current, plan_refs, plans)
+    warnings += _unfilled_properties(collection, current)
+
     folder = inp.get("new_folder") or None
     if folder and folder.get("parent_ref"):
         folder = {"parent_ref": str(folder["parent_ref"]),
@@ -384,6 +396,83 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
         product_type=str(inp.get("product_type") or ""), product_type_name=type_name,
         collection=collection, items=plans, new_folder=folder, warnings=warnings)
 
+
+
+def _name_split(type_name: str, tm_name: str, collection: str, current: list,
+                plan_refs: set, plans: list) -> list[str]:
+    """Останется ли коллекция единообразной после правки. Иначе — предупреждение.
+
+    СЛУЧАЙ, ПОРОДИВШИЙ ПРОВЕРКУ (10.09.2026). У коллекции Anatolia Platinium свойство
+    «Коллекция» в 1С равно `Platinium`, а наименования собраны как «Ламинат Peli **Anatolia**
+    Platinium …» — лишнее слово попало в имена, но не в свойство. Агент чинил сломанное
+    полное наименование ОДНОЙ позиции и собрал ей имя по правилам §19.5, то есть без
+    «Anatolia». Он был прав: канон строится из свойства. Но одиннадцать соседей остались в
+    прежнем виде, и коллекция, до того единообразная, разъехалась на два написания.
+
+    Блокировать нельзя — правка была нужна, а запрет оставил бы сломанное имя как есть.
+    Поэтому код не мешает, а НАЗЫВАЕТ последствие: сколько позиций останется в другом виде
+    и какие. Дальше это видит и админ в предложении, и модель в ответе инструмента —
+    следующим шагом коллекция приводится целиком.
+    """
+    touched = {p.ref for p in plans if p.ref and not p.blocked}
+    if not touched:
+        return []
+
+    prefix = build_name(type_name, tm_name, collection, "").strip()
+    if not prefix:
+        return []
+
+    stale = [i for i in current
+             if _form(i.collection) == _form(collection)
+             and not i.not_exported
+             and i.ref not in touched and i.ref not in plan_refs
+             and not _form(i.name).startswith(_form(prefix))]
+
+    if not stale:
+        return []
+
+    shown = ", ".join(i.article or i.ref for i in stale[:6])
+    return [f"⚠️ Наименования {len(stale)} поз. коллекции собраны иначе, чем правленые "
+            f"({shown}{', …' if len(stale) > 6 else ''}). Коллекция останется в двух "
+            f"написаниях. Если канон — «{prefix} …», передай в этом же вызове и остальные "
+            "позиции; если прежний вид верен, значит расходится свойство «Коллекция»."]
+
+
+def _unfilled_properties(collection: str, current: list) -> list[str]:
+    """Свойства, пустые у ВСЕЙ коллекции, но заполненные у других коллекций марки.
+
+    ЭТО ФАКТ ИЗ ДАННЫХ, А НЕ НАПОМИНАНИЕ В ПРОМПТЕ. Прайс LINDERWOOD указывает фаску
+    `V-Groove` на весь раздел, и у Design с Platinium она в 1С стоит, а у Vintage, Loft и
+    Grand пуста — 19 позиций. На одном прогоне агент это заметил и предложил заполнить, на
+    следующем прошёл мимо: правило жило только в тексте промпта. Теперь пробел виден в
+    самом ответе инструмента, каждый раз и без исключений.
+
+    Сравниваем именно с другими коллекциями МАРКИ: набор свойств у вида товара широкий, и
+    ругаться на всё незаполненное значило бы шуметь. А вот свойство, которое у соседних
+    коллекций той же марки заполнено, у этой пустое не просто так.
+    """
+    wanted = _form(collection)
+    mine = [i for i in current if _form(i.collection) == wanted and not i.not_exported]
+    if not mine:
+        return []
+
+    filled_here = {p.property for i in mine for p in i.properties if p.value}
+    filled_elsewhere: dict[str, int] = {}
+    for item in current:
+        if _form(item.collection) == wanted or item.not_exported:
+            continue
+        for prop in item.properties:
+            if prop.value:
+                filled_elsewhere[prop.property] = filled_elsewhere.get(prop.property, 0) + 1
+
+    gaps = sorted(name for name in filled_elsewhere if name not in filled_here)
+    if not gaps:
+        return []
+
+    return [f"ℹ️ Не заполнено ни у одной из {len(mine)} поз. коллекции: "
+            + ", ".join(gaps)
+            + ". У других коллекций этой марки заполнено — проверь прайс: если значение "
+              "там есть, проставь его этим же вызовом."]
 
 def _in_scope(product_type: str, scope: list[str]) -> bool:
     """Нестрогое сравнение, как в `scope.py`: «плитка» покрывает «Керамическую плитку»."""
