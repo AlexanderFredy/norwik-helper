@@ -1316,6 +1316,19 @@ class PricingTools:
         await self._store.mark_items_checked(
             self._user_id, _collection_keys(inp, plan, current))
 
+        # ПРЕЖНЕЕ ПРЕДЛОЖЕНИЕ ГАСНЕТ — и админ должен узнать об этом от нас, а не по
+        # мёртвой кнопке. Такое происходит штатно: админ отвечает на вопрос агента текстом
+        # (не нажимая кнопку), агент складывает ответ в правки и предлагает заново (§19.7).
+        # У цен это уже сказано теми же словами; двух разных формулировок про одно и то же
+        # в диалоге быть не должно.
+        if ops:
+            previous = await self._store.get_pending(self._user_id)
+            if previous:
+                plan.warnings.append(
+                    f"⚠️ Прежнее предложение ({previous.item_count} поз.) отменяется — "
+                    "кнопка под ним больше не сработает. Нажимайте кнопку под ЭТИМ "
+                    "сообщением: в нём учтён ваш ответ.")
+
         summary = item_rules.render(plan)
         self.last_summary = summary
 

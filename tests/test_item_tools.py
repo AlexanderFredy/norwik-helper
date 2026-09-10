@@ -137,6 +137,26 @@ class ToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Расхождений нет", text)
         self.assertIsNone(await self.store.get_pending(42))
 
+    async def test_new_proposal_warns_that_the_old_button_is_dead(self):
+        """Админ отвечает текстом, не нажимая кнопку, — агент предлагает заново (§19.7).
+
+        Прежняя кнопка после этого не срабатывает, и узнать об этом админ должен из
+        сообщения, а не по молчанию бота.
+        """
+        await self.tools.execute("propose_items", proposal_input())
+        first = await self.store.get_pending(42)
+        text = await self.tools.execute("propose_items", proposal_input(
+            items=[{"op": "update", "ref": "YO-1", "article": "LQ-01",
+                    "title": "Адана", "tail": "LQ-01", "pack_coefficient": 2.5}]))
+        self.assertIn("Прежнее предложение", text)
+        second = await self.store.get_pending(42)
+        self.assertNotEqual(first.proposal_id, second.proposal_id)
+        self.assertIsNone(await self.store.take_pending(42, first.proposal_id))
+
+    async def test_no_warning_when_nothing_was_pending(self):
+        text = await self.tools.execute("propose_items", proposal_input())
+        self.assertNotIn("Прежнее предложение", text)
+
     async def test_missing_tm_code_refuses(self):
         text = await self.tools.execute("propose_items", proposal_input(tm_code=""))
         self.assertIn("tm_code", text)
