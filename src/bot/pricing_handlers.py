@@ -11,7 +11,8 @@ from datetime import date
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+                           Message, MessageEntity)
 
 from src.agent.pricing_tools import (
     PRICING_TOOLS, PricingTools, clear_nomenclature_cache, next_step, queue_tail,
@@ -95,10 +96,66 @@ def _chunks(text: str) -> list[str]:
     return [text[i:i + 4096] for i in range(0, len(text), 4096)] or [""]
 
 
-async def _send(message: Message, text: str, markup=None) -> None:
+# ПОДСКАЗКИ АДМИНУ — курсивом в конце сообщения.
+#
+# Бот показывает состояние, но не всегда очевидно, ЧТО от админа нужно: после обрыва связи
+# — написать «продолжай», под предложением с вопросом — ответить текстом, а не нажать
+# кнопку (нажатие записало бы в 1С версию без ответа, §19.7). Подсказка снимает этот
+# вопрос там, где он возникает.
+#
+# КУРСИВ ДЕЛАЕТСЯ `entities`, А НЕ `parse_mode`. Разметка потребовала бы экранировать весь
+# текст предложения, а в нём живут «ёлочки», стрелки и амперсанды из имён коллекций
+# (`Onyx&More` — 414 позиций на боевой базе): одна неэкранированная пара — и сообщение не
+# уйдёт вовсе. `entities` задают курсив смещением и не трогают текст.
+#
+# Смещение считается в единицах UTF-16, как требует Telegram: в тексте есть символы вне
+# BMP, и обычная длина строки Python здесь не подходит.
+
+
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _with_hint(text: str, hint: str) -> tuple[str, list | None]:
+    """Текст с курсивной подсказкой в конце. Пустая подсказка ничего не меняет."""
+    if not hint:
+        return text, None
+    body = text.rstrip()
+    full = f"{body}\n\n{hint}"
+    return full, [MessageEntity(type="italic",
+                                offset=_utf16_len(full) - _utf16_len(hint),
+                                length=_utf16_len(hint))]
+
+
+async def _send(message: Message, text: str, markup=None, hint: str = "") -> None:
     parts = _chunks(text)
     for i, chunk in enumerate(parts):
-        await message.answer(chunk, reply_markup=markup if i == len(parts) - 1 else None)
+        last = i == len(parts) - 1
+        entities = None
+        if last and hint:
+            if len(chunk) + len(hint) + 2 <= 4096:
+                chunk, entities = _with_hint(chunk, hint)
+            else:
+                # Подсказка не влезла — уходит отдельным сообщением, но не теряется.
+                await message.answer(chunk, reply_markup=markup)
+                tail, tail_entities = _with_hint("", hint)
+                await message.answer(tail.strip(), entities=tail_entities)
+                return
+        # `entities` передаём ТОЛЬКО когда они есть: без подсказки вызов должен остаться
+        # ровно таким, каким был, — лишний именованный аргумент ломает и заглушки в
+        # тестах, и любой другой вызывающий код.
+        extra = {"entities": entities} if entities else {}
+        await message.answer(chunk, reply_markup=markup if last else None, **extra)
+
+
+async def _edit_with_hint(target: Message, text: str, hint: str = "",
+                          markup=None) -> None:
+    """То же для правки статусного сообщения — им отвечают на ошибки."""
+    body, entities = _with_hint(text, hint)
+    extra = {"entities": entities} if entities else {}
+    if markup is not None:
+        extra["reply_markup"] = markup
+    await target.edit_text(body, **extra)
 
 
 async def _deliver(progress: Message, message: Message, text: str) -> None:
@@ -243,6 +300,18 @@ def _prune_file_dumps(messages: list[dict], keep_last: int = 1) -> list[dict]:
     return list(reversed(out))
 
 
+
+async def _resume_hint(store: PricingStore, user_id: int) -> str:
+    """Чем именно продолжить прогон после сбоя. Читается из плана, а не угадывается."""
+    try:
+        run = await store.get_run(user_id)
+    except Exception:                                  # noqa: BLE001
+        run = None
+
+    step = next_step(run)
+    where = f" с {step}" if step else ""
+    return (f"Разбор не потерян: напишите текстом «продолжай{where}» — пойдём с той же "
+            "точки. Файл присылать заново не нужно, если бот не перезапускали.")
 async def _run(message: Message, user_text: str, orchestrator, onec, store: PricingStore,
                status_msg: Message, user_id: int | None = None) -> None:
     # user_id передаётся явно, когда ход инициирует не админ, а мы сами — после нажатия
@@ -272,8 +341,15 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
                 extra_tools=PRICING_TOOLS, extra_executor=tools, base_tools=False)
         except Exception as exc:                       # noqa: BLE001
             logger.exception("Ошибка обработки прайса")
-            await step_status.edit_text(describe_api_error(
-                exc, "Ошибка при обработке прайса. Подробности в логах."))
+            # ХОД НЕ СОХРАНЁН — `save_messages` ниже, сюда мы до него не дошли. Значит
+            # повтор пойдёт с той же точки и ничего не задвоит; админу остаётся сказать
+            # «продолжай». Подсказку даём с ИМЕНЕМ следующего шага: после обрыва не
+            # очевидно, докуда дошли, а план лежит в базе и знает это точно.
+            await _edit_with_hint(
+                step_status,
+                describe_api_error(exc, "Ошибка при обработке прайса. "
+                                        "Подробности в логах."),
+                hint=await _resume_hint(store, user_id))
             return
 
         await store.save_messages(user_id, _prune_file_dumps(history))
@@ -289,14 +365,21 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
         # кодом, и переписывание его моделью стоило ~2 000 выходных токенов на шаг, а
         # заодно теряло строки. Ответ модели добавляем, только если она сказала что-то
         # своё — вопрос или замечание сверх предложения.
+        hint = ""
         if pending and tools.last_summary:
             extra = (answer or "").strip()
             text = tools.last_summary
             if extra and extra[:40] not in tools.last_summary:
                 text += "\n\n" + extra
+                # Агент сказал что-то СВЕРХ предложения — почти всегда это вопрос
+                # («какое написание фаски верное?»). Отвечать на него надо ТЕКСТОМ:
+                # нажатие записало бы в 1С версию без ответа, и правка уехала бы
+                # отдельным кругом (§19.7).
+                hint = ("Ответ агенту пишите текстом, не нажимая кнопку — предложение "
+                        "пересоберётся с учётом ответа, и кнопка появится новая.")
         else:
             text = answer
-        await _send(message, text, markup)
+        await _send(message, text, markup, hint=hint)
         if pending is not None:
             return                       # ждём кнопку админа
 
