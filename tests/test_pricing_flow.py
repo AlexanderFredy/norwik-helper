@@ -36,6 +36,24 @@ async def propose_prices(tools, payload):
         keys.append(group.get("collection_ref") or "")
         keys.append(" ".join(str(group.get("collection") or "").split()).lower())
     await tools._store.mark_items_checked(tools._user_id, keys)
+
+    # И открываем очередь коллекций, если она нужна: в товарных режимах марка идёт ПО
+    # КОЛЛЕКЦИЯМ (§19.7), иначе первое же предложение закрыло бы её целиком. Очередь из
+    # одной коллекции ведёт себя как прежний шаг по марке: закрылась коллекция — закрылась
+    # и марка, — поэтому тесты очереди марок продолжают проверять именно то, что проверяли.
+    run = await tools._store.get_run(tools._user_id)
+    groups = payload.get("groups") or []
+    tm = next((g.get("tm_code") for g in groups if g.get("tm_code")), None)
+    planned = {t.get("code") for t in (run or {}).get("planned") or []}
+    stage = (run or {}).get("stage")
+    if tm and tm in planned and not (stage and stage.get("tm_code") == tm):
+        colls = [{"ref": g.get("collection_ref"),
+                  "name": g.get("collection") or g.get("collection_ref")}
+                 for g in groups if g.get("collection_ref")]
+        if colls:
+            await tools._store.start_stage(tools._user_id, tm,
+                                           groups[0].get("tm_name") or tm, colls)
+
     return await tools.execute("propose_prices", payload)
 
 

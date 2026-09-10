@@ -315,6 +315,47 @@ class PriceGateTest(unittest.IsolatedAsyncioTestCase):
         text = await self.tools.execute("propose_prices", self._prices())
         self.assertNotIn("справочник ещё не проверялся", text)
 
+    async def test_group_without_a_collection_is_refused(self):
+        """Дыра, найденная на прогоне Most Floor 10.09.2026.
+
+        Группа без `collection_ref` и без `collection` давала пустой набор ключей, и
+        проверка «сверял ли справочник» превращалась в «проверять нечего» — то есть в
+        разрешение. Цены по всей марке уходили мимо правок товара.
+        """
+        payload = self._prices()
+        payload["groups"] = [{"tm_code": TM, "purchase": 1200, "rrc": 1800}]
+        text = await self.tools.execute("propose_prices", payload)
+        self.assertIn("не указана коллекция", text)
+        self.assertIsNone(await self.store.get_pending(42))
+
+    async def test_queue_required_when_the_mark_is_in_the_plan(self):
+        """Без очереди коллекций первая же коллекция закрыла бы всю марку.
+
+        Так 10.09.2026 у Most Flooring из восьми коллекций разобралась одна, а прайс был
+        объявлен обработанным полностью.
+        """
+        await self.store.start_run(42, "Most Floor", "price.pdf",
+                                   [{"code": TM, "name": "Linderwood"}])
+        await self.store.mark_items_checked(42, ["YO-00078954"])
+        text = await self.tools.execute("propose_prices", self._prices())
+        self.assertIn("разбираем по коллекциям", text)
+        self.assertIsNone(await self.store.get_pending(42))
+
+    async def test_queue_open_lets_prices_through(self):
+        await self.store.start_run(42, "Most Floor", "price.pdf",
+                                   [{"code": TM, "name": "Linderwood"}])
+        await self.store.start_stage(42, TM, "Linderwood",
+                                     [{"ref": "YO-00078954", "name": "Quartz"}])
+        await self.store.mark_items_checked(42, ["YO-00078954"])
+        text = await self.tools.execute("propose_prices", self._prices())
+        self.assertNotIn("разбираем по коллекциям", text)
+
+    async def test_mark_outside_the_plan_needs_no_queue(self):
+        """Простой однобрендовый прайс без объявленного плана работает как прежде."""
+        await self.store.mark_items_checked(42, ["YO-00078954"])
+        text = await self.tools.execute("propose_prices", self._prices())
+        self.assertNotIn("разбираем по коллекциям", text)
+
     async def test_several_collections_refused(self):
         payload = self._prices()
         payload["groups"].append({"tm_code": TM, "collection_ref": "YO-OTHER",

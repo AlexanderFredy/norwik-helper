@@ -111,8 +111,18 @@ class BigTmSplitTest(unittest.IsolatedAsyncioTestCase):
             {"tm_code": "T1", "tm_name": "Atlas Concorde Rus",
              "collection_ref": coll, "purchase": 999}]})
 
-    async def test_big_tm_is_refused_until_split(self):
-        text = await self._propose(self._tools(big()))
+    async def test_tm_is_refused_until_split(self):
+        """Без открытой очереди марка к ценам не пускается.
+
+        Зовём инструмент НАПРЯМУЮ, минуя тестовый помощник: он открывает очередь сам, а
+        здесь проверяется именно отказ. Отметку о проверке справочника ставим руками —
+        она к этому отказу отношения не имеет.
+        """
+        tools = self._tools(big())
+        await self.store.mark_items_checked(42, ["YO-A"])
+        text = await tools.execute("propose_prices", {"groups": [
+            {"tm_code": "T1", "tm_name": "Atlas Concorde Rus",
+             "collection_ref": "YO-A", "purchase": 999}]})
         self.assertIn("разбираем по коллекциям", text)
         self.assertIn("start_tm_collections", text)
         self.assertIsNone(await self.store.get_pending(42))
