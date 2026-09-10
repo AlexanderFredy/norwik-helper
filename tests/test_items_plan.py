@@ -229,5 +229,43 @@ class RenderTest(unittest.TestCase):
         self.assertIn("и ещё 5", text)
 
 
+class MissingTitleTest(unittest.TestCase):
+    """Без названия расцветки имя схлопывается до общего — трогать имена нельзя.
+
+    Реальный случай прогона 10.09.2026: модель не передала `title`, и `build_name` собрал
+    «Ламинат Peli Vintage» — одинаковое для всех пяти позиций коллекции. План принял бы это
+    за законное переименование и стёр расцветки разом. Модель тогда заметила сама и
+    переслала предложение, но правка молчаливая и разрушительная: после записи «было»
+    взять уже неоткуда.
+    """
+
+    def test_names_are_left_alone(self):
+        plan = plan_collection(_inp(items=[
+            {"op": "update", "ref": "YO-1", "article": "LQ-01", "thickness": 5}
+        ]), current=[_nom()])
+        op = plan.ops()[0]
+        self.assertEqual(op["name"], _nom().name)          # имя не тронуто
+        self.assertEqual(op["site_name"], "Адана")
+        self.assertEqual(op["thickness"], 5)               # остальное поехало как обычно
+        self.assertIn("название расцветки", render(plan))
+
+    def test_creation_is_refused(self):
+        plan = plan_collection(_inp(items=[
+            {"op": "create", "article": "LQ-09", "unit": "м2"}
+        ]), current=[])
+        self.assertEqual(plan.ops(), [])
+        self.assertIn("позицию не создаю", render(plan))
+
+    def test_whole_collection_would_have_collapsed(self):
+        """Проверка того самого сценария: пять позиций получили бы одно имя на всех."""
+        current = [_nom(ref=f"YO-{n}", name=f"Ламинат Peli Vintage Цвет {n}",
+                        collection="Vintage") for n in range(5)]
+        plan = plan_collection(_inp(collection="Vintage", items=[
+            {"op": "update", "ref": f"YO-{n}", "article": f"VN-{n}"} for n in range(5)
+        ]), current=current)
+        names = {op["name"] for op in plan.ops()}
+        self.assertEqual(len(names), 5, "имена схлопнулись в одно")
+
+
 if __name__ == "__main__":
     unittest.main()

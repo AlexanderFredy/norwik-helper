@@ -121,6 +121,11 @@ class ItemPlan:
     changes: list[FieldChange] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     fields: dict = field(default_factory=dict)     # что уйдёт в set-items
+    # ОТКАЗ — не то же самое, что «нечего менять». Позиция разобрана, правка нужна, но
+    # отправить её нельзя: не хватает данных, и запись сделала бы хуже, чем бездействие.
+    # Отдельный флаг нужен, потому что у создания «нечего менять» не бывает — оно всегда
+    # попало бы в операции.
+    blocked: bool = False
 
     @property
     def real_changes(self) -> list[FieldChange]:
@@ -148,15 +153,16 @@ class CollectionPlan:
 
     @property
     def created(self) -> list[ItemPlan]:
-        return [i for i in self.items if i.op == "create"]
+        return [i for i in self.items if i.op == "create" and not i.blocked]
 
     @property
     def updated(self) -> list[ItemPlan]:
-        return [i for i in self.items if i.op == "update" and i.real_changes]
+        return [i for i in self.items
+                if i.op == "update" and i.real_changes and not i.blocked]
 
     @property
     def normalized(self) -> list[ItemPlan]:
-        return [i for i in self.items if i.only_normalization]
+        return [i for i in self.items if i.only_normalization and not i.blocked]
 
     @property
     def touched(self) -> list[ItemPlan]:
@@ -276,6 +282,32 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
         if op == "update" and was is None:
             item_warnings.append(
                 f"позиции {ref or '(без кода)'} нет в выгрузке 1С — правку не отправляю")
+
+        # НЕТ НАЗВАНИЯ РАСЦВЕТКИ — НАИМЕНОВАНИЯ НЕ ТРОГАЕМ.
+        #
+        # `build_name` собирает строку из частей, и без `title` она схлопывается до
+        # «Ламинат Peli Vintage»: одинаковой для всей коллекции и без единого признака
+        # позиции. План принял бы это за законное переименование и стёр расцветки у всех
+        # пяти позиций разом. На прогоне 10.09.2026 модель так и сделала — заметила сама и
+        # прислала предложение заново, но полагаться на это нельзя: правка молчаливая и
+        # разрушительная, а «было» после записи взять уже неоткуда.
+        #
+        # Отказываем ТОЛЬКО в части имён: остальные поля позиции (свойства, размеры,
+        # упаковка) от этого не портятся, и терять их из-за одного пропущенного поля незачем.
+        if not title:
+            if op == "create":
+                item_warnings.append(
+                    "не передано название расцветки (title) — позицию не создаю: "
+                    "имя вышло бы одинаковым для всей коллекции")
+                plans.append(ItemPlan(
+                    op=op, ref=ref, article=article, name=name, full_name=full,
+                    site_name=site, warnings=item_warnings, blocked=True))
+                continue
+            name = getattr(was, "name", "") or name
+            full = getattr(was, "full_name", "") or full
+            site = getattr(was, "site_name", "") or site
+            item_warnings.append(
+                "не передано название расцветки (title) — наименования оставил как есть")
 
         length_from, length_to = _span(raw, "length")
         width_from, width_to = _span(raw, "width")
