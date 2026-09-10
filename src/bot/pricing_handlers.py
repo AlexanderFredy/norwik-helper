@@ -6,6 +6,8 @@
 """
 import asyncio
 import io
+import re
+from pathlib import Path
 import logging
 from datetime import date
 
@@ -24,6 +26,8 @@ from src.price_tool.item_broadcast import build_item_broadcast
 from src.price_tool import modes
 from src.price_tool.exclusive import resolve
 from src.price_tool.history import LABELS
+from src.price_tool.parser import parse_price_table
+from src.price_tool.signature import price_signature
 from src.storage import price_files
 from src.storage.pricing import PricingStore
 from src.storage.users import UserStore
@@ -101,6 +105,79 @@ async def _in_stage(store: PricingStore, user_id: int) -> bool:
 # Теперь файл кладётся на диск сразу (тем же механизмом, что и под отложенные задачи), а в
 # базе остаётся строка «этот админ разбирает вот этот прайс». При старте бота строки
 # читаются обратно в `_files`.
+
+
+_DIGITS = re.compile(r"\d+")
+
+def price_key(filename: str, content: bytes) -> str:
+    """Ключ «это тот же прайс, только свежее» (§9.8).
+
+    Сигнатура формата (§6.5.2) заменяет числа на «#», поэтому «Прайс 01.09» и «Прайс 15.09»
+    одного поставщика дают ОДНУ сигнатуру — на этом и держится замена версии. К ней
+    добавлено имя файла без цифр: два разных поставщика со случайно одинаковым скелетом не
+    должны съесть прайсы друг друга.
+
+    Не разобрался файл — ключом остаётся одно имя. Хуже, чем по скелету, но лучше, чем
+    общий ключ на всё: без него разные прайсы вытесняли бы друг друга из очереди.
+    """
+    base = _DIGITS.sub("#", Path(filename or "прайс").stem).strip().lower()
+    base = " ".join(base.split())
+    try:
+        sheets = parse_price_table(content, filename)
+        signature = price_signature(sheets) if sheets else ""
+    except Exception:                                  # noqa: BLE001
+        logger.warning("Сигнатуру прайса %s посчитать не удалось", filename, exc_info=True)
+        signature = ""
+    return f"{base}|{signature}"
+
+
+async def _enqueue(store: PricingStore, user_id: int, filename: str,
+                   content: bytes, source: str = "telegram") -> str:
+    """Поставить прайс в очередь за тем, что уже в работе. Текст ответа админу."""
+    path = price_files.save(store.db_path, filename, content)
+    if not path:
+        return ("Прайс не удалось сохранить на сервере, а сейчас в работе другой — "
+                "пришлите этот файл заново, когда текущий будет обработан.")
+
+    result = await store.enqueue_price(user_id, filename, str(path),
+                                       price_key(filename, content), source)
+    old = result.get("old_path")
+    if old and not await store.price_file_in_use(old):
+        price_files.forget([old])
+
+    waiting = len(await store.list_queue(user_id))
+    active = await store.get_active_price(user_id)
+    now = f"Сейчас в работе «{active['filename']}»." if active else ""
+
+    if result["status"] == "replaced":
+        return (f"Прайс «{filename}» заменил в очереди прежнюю версию — разбирать будем "
+                f"свежую. {now} В очереди: {waiting}.").strip()
+    return (f"Прайс «{filename}» поставлен в очередь. {now} "
+            f"В очереди: {waiting}.").strip()
+
+
+async def _start_next(message: Message, store: PricingStore, user_id: int,
+                      orchestrator, onec) -> bool:
+    """Взять следующий прайс из очереди и начать разбор. False — очередь пуста."""
+    nxt = await store.take_next_price(user_id)
+    if not nxt:
+        return False
+
+    content = price_files.load(nxt.get("path"))
+    if not content:
+        await message.answer(f"Прайс «{nxt['filename']}» из очереди не читается — "
+                             "пришлите его заново.")
+        return await _start_next(message, store, user_id, orchestrator, onec)
+
+    await _remember_file(store, user_id, nxt["filename"], content)
+    await store.reset(user_id)
+    await store.clear_run(user_id)
+    clear_nomenclature_cache()
+
+    status = await message.answer(f"Беру следующий из очереди: «{nxt['filename']}»...")
+    await _run(message, f"Прислан прайс «{nxt['filename']}».",
+               orchestrator, onec, store, status, user_id=user_id)
+    return True
 
 
 async def _remember_file(store: PricingStore, user_id: int, filename: str,
@@ -230,7 +307,7 @@ async def _deliver(progress: Message, message: Message, text: str) -> None:
 
 
 async def _finish_run(message: Message, store: PricingStore, user_id: int,
-                      force: bool = False) -> bool:
+                      force: bool = False, orchestrator=None, onec=None) -> bool:
     """Завершить прогон: отложенные замечания, итог, выход из режима прайса.
 
     Один выход на оба пути — и когда последняя марка записана кнопкой, и когда по ней
@@ -265,7 +342,16 @@ async def _finish_run(message: Message, store: PricingStore, user_id: int,
     await _forget_file(store, user_id)
     await store.reset(user_id)
     await store.clear_run(user_id)
+
+    # ОЧЕРЕДЬ ДВИГАЕТСЯ САМА (§9.8). Пока админ разбирал этот прайс, могли прийти другие;
+    # просить «пришлите следующий файл», когда файл уже лежит на сервере, — лишний шаг.
+    waiting = await store.list_queue(user_id)
+    if waiting:
+        lines[-1] = f"В очереди ещё {len(waiting)} — беру следующий."
     await _send(message, "\n".join(lines))
+
+    if waiting and orchestrator is not None:
+        await _start_next(message, store, user_id, orchestrator, onec)
     return True
 
 
@@ -450,7 +536,7 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
                      f"{tools.advanced_to}.")
         status_msg = await message.answer(f"Перехожу к {tools.advanced_to}...")
 
-    await _finish_run(message, store, user_id)
+    await _finish_run(message, store, user_id, orchestrator=orchestrator, onec=onec)
 
 
 @router.message(F.document)
@@ -476,8 +562,16 @@ async def handle_price_document(message: Message, orchestrator, onec, pricing_st
     buf = io.BytesIO()
     file_info = await message.bot.get_file(doc.file_id)
     await message.bot.download_file(file_info.file_path, destination=buf)
-    await _remember_file(pricing_store, message.from_user.id,
-                         doc.file_name, buf.getvalue())
+    user_id = message.from_user.id
+
+    # ЗАНЯТО — В ОЧЕРЕДЬ, А НЕ ВМЕСТО. Прежде новый файл затирал текущий вместе с диалогом
+    # и планом: недоразобранный прайс исчезал молча (§9.8).
+    if user_id in _files or await pricing_store.get_active_price(user_id):
+        await status_msg.edit_text(
+            await _enqueue(pricing_store, user_id, doc.file_name, buf.getvalue()))
+        return
+
+    await _remember_file(pricing_store, user_id, doc.file_name, buf.getvalue())
     await pricing_store.reset(message.from_user.id)   # новый прайс — новый диалог
     await pricing_store.clear_run(message.from_user.id)   # и новый план по маркам
     clear_nomenclature_cache()                        # и свежие цены из 1С
@@ -489,10 +583,22 @@ async def handle_price_document(message: Message, orchestrator, onec, pricing_st
 
 @router.message(Command("cancel_price"))
 async def cmd_cancel(message: Message, pricing_store: PricingStore) -> None:
-    await _forget_file(pricing_store, message.from_user.id)
-    await pricing_store.reset(message.from_user.id)
-    await pricing_store.clear_run(message.from_user.id)
-    await message.answer("Работа с прайсом прекращена, предложение отменено.")
+    user_id = message.from_user.id
+    await _forget_file(pricing_store, user_id)
+    await pricing_store.reset(user_id)
+    await pricing_store.clear_run(user_id)
+
+    # ОЧЕРЕДЬ ОТМЕНА НЕ ТРОГАЕТ: админ отменил ЭТОТ прайс, а не всё, что накопилось.
+    # И следующий сам не запускаем — отменяют обычно чтобы отойти, а не чтобы немедленно
+    # получить новый разбор.
+    waiting = await pricing_store.list_queue(user_id)
+    tail = ""
+    if waiting:
+        names = ", ".join(f"«{w['filename']}»" for w in waiting[:5])
+        tail = (f"\n\nВ очереди ещё {len(waiting)}: {names}"
+                + (", …" if len(waiting) > 5 else "")
+                + ".\nКоманда /next_price возьмёт следующий.")
+    await message.answer("Работа с прайсом прекращена, предложение отменено." + tail)
 
 
 def _describe(entry: dict) -> str:
@@ -506,6 +612,73 @@ def _describe(entry: dict) -> str:
     if m.get("basis") and m["basis"] != "base_unit":
         parts.append(f"база: {m['basis']}")
     return ", ".join(parts)
+
+
+@router.message(Command("queue"))
+async def cmd_queue(message: Message, pricing_store: PricingStore, is_admin: bool) -> None:
+    """Что ждёт разбора (§9.8)."""
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+
+    user_id = message.from_user.id
+    active = await pricing_store.get_active_price(user_id)
+    waiting = await pricing_store.list_queue(user_id)
+
+    lines = [f"В работе: «{active['filename']}»." if active else "В работе ничего нет."]
+    if waiting:
+        lines.append(f"\nВ очереди {len(waiting)}:")
+        for n, row in enumerate(waiting, 1):
+            source = "почта" if row.get("source") == "mail" else "Telegram"
+            lines.append(f"  {n}. «{row['filename']}» — {source}, "
+                         f"{(row.get('added_at') or '')[:10]}")
+        lines.append("\n/next_price — взять следующий, /queue_clear — очистить очередь.")
+    else:
+        lines.append("Очередь пуста.")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("next_price"))
+async def cmd_next_price(message: Message, orchestrator, onec,
+                         pricing_store: PricingStore, is_admin: bool) -> None:
+    """Взять следующий прайс из очереди.
+
+    Если что-то уже в работе, ничего не подменяем: два прайса одновременно разбирать
+    нельзя, а молча выбросить начатый — ровно та беда, ради которой очередь и заведена.
+    """
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+
+    user_id = message.from_user.id
+    if user_id in _files or await pricing_store.get_active_price(user_id):
+        active = await pricing_store.get_active_price(user_id)
+        name = active["filename"] if active else "текущий прайс"
+        await message.answer(
+            f"Сейчас в работе «{name}» — сначала закончите его или отмените "
+            "командой /cancel_price.")
+        return
+
+    if not await _start_next(message, pricing_store, user_id, orchestrator, onec):
+        await message.answer("Очередь пуста — присылайте прайс файлом.")
+
+
+@router.message(Command("queue_clear"))
+async def cmd_queue_clear(message: Message, pricing_store: PricingStore,
+                          is_admin: bool) -> None:
+    """Очистить очередь. Прайс В РАБОТЕ не трогает — для него есть /cancel_price."""
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+
+    paths = await pricing_store.clear_queue(message.from_user.id)
+    kept = []
+    for path in paths:
+        if not await pricing_store.price_file_in_use(path):
+            kept.append(path)
+    price_files.forget(kept)
+    await message.answer(f"Очередь очищена: убрано {len(paths)}."
+                         if paths else "Очередь и так пуста.")
 
 
 @router.message(Command("mappings"))
@@ -1148,7 +1321,8 @@ async def _continue_or_finish(message: Message, store: PricingStore, user_id: in
     """Двинуть очередь дальше либо закрыть прогон. Один хвост на все три кнопки."""
     nxt = next_step(run)
     if not nxt:
-        await _finish_run(message, store, user_id, force=True)
+        await _finish_run(message, store, user_id, force=True,
+                          orchestrator=orchestrator, onec=onec)
         return
     # прайс разобран не весь: продолжаем тем же диалогом — файл и история на месте,
     # иначе админу пришлось бы присылать файл заново на каждый шаг (§9.6)

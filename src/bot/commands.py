@@ -19,6 +19,8 @@ COMMON_COMMANDS = [
 ADMIN_COMMANDS = COMMON_COMMANDS + [
     BotCommand(command="mode", description="Режим: товары и/или цены"),
     BotCommand(command="cancel_price", description="Прекратить работу с прайсом"),
+    BotCommand(command="queue", description="Прайсы, ждущие разбора"),
+    BotCommand(command="next_price", description="Взять следующий прайс из очереди"),
     BotCommand(command="mappings", description="Запомненные форматы прайсов"),
     BotCommand(command="mapping_forget", description="Забыть формат прайса"),
     BotCommand(command="categories", description="Категории товаров, которые анализируем"),
@@ -56,6 +58,8 @@ _ADMIN_HELP = """
 <b>Цены запишутся только после нажатия кнопки «Записать в 1С».</b>
 
 /cancel_price — прекратить работу с текущим прайсом
+/queue — что ждёт разбора (и что сейчас в работе)
+/next_price — взять следующий прайс из очереди
 /mappings — какие форматы прайсов я уже разбираю без вопросов
 /mapping_forget &lt;номер&gt; — забыть формат, чтобы снова спросил про колонки
 (трактовка запоминается по каждому листу отдельно — мультилистовой прайс

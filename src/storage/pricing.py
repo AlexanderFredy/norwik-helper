@@ -66,6 +66,29 @@ CREATE TABLE IF NOT EXISTS active_price (
     saved_at   TEXT NOT NULL
 );
 
+-- Очередь прайсов, ждущих разбора (§9.8).
+--
+-- Пока админ думает над одним прайсом, приходят другие — сейчас из Telegram, в будущем из
+-- почты. Прежде новый файл ВЫТЕСНЯЛ текущий: `handle_price_document` затирал `_files` и
+-- сбрасывал диалог, то есть недоразобранный прайс молча терялся. Теперь он встаёт в
+-- очередь и дожидается своей очереди.
+--
+-- `key` — «тот же прайс»: сигнатура формата (§6.5.2) плюс имя файла без цифр. Сигнатура
+-- считается по скелету и заменяет числа на «#», поэтому «Прайс 01.09» и «Прайс 15.09»
+-- дают один ключ — ровно то, что нужно: НОВАЯ ВЕРСИЯ ЗАМЕНЯЕТ СТАРУЮ, пока разбор по ней
+-- не начат. Имя добавлено к ключу, чтобы два разных поставщика со случайно одинаковым
+-- скелетом не съели друг друга.
+CREATE TABLE IF NOT EXISTS price_queue (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id  INTEGER NOT NULL,
+    filename TEXT NOT NULL,
+    path     TEXT NOT NULL,
+    key      TEXT NOT NULL,
+    source   TEXT NOT NULL DEFAULT 'telegram',   -- telegram | mail
+    added_at TEXT NOT NULL,
+    UNIQUE (user_id, key)
+);
+
 -- Коллекции, по которым агент УЖЕ проверил справочник (§19.7). Гейт `propose_prices`
 -- в товарных режимах смотрит сюда: цены идут ПОСЛЕ правок товара, а не вместо них.
 --
@@ -310,6 +333,15 @@ class PricingStore:
         except ValueError:
             return []
         age_min = (datetime.now(timezone.utc) - updated).total_seconds() / 60
+
+        # ПОКА ПРАЙС В РАБОТЕ, ДИАЛОГ НЕ ПРОТУХАЕТ. TTL нужен, чтобы случайная фраза через
+        # неделю не попала в старый разговор, — но у начатого разбора нет «случайных»
+        # пауз: админ думает над коллекцией, ждёт ответа поставщика, уходит на обед.
+        # Потерять здесь переписку значит потерять и неотвеченный вопрос агента, и всё,
+        # о чём уже договорились. Контекст живёт, пока прайс не обработан, не отложен и
+        # не отменён — все три случая стирают строку активного прайса.
+        if age_min > DIALOG_TTL_MINUTES and await self.get_active_price(user_id):
+            age_min = 0
         if age_min > DIALOG_TTL_MINUTES:
             return []
         return json.loads(row[0])
@@ -726,8 +758,9 @@ class PricingStore:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
                 "SELECT 1 FROM deferred_tasks WHERE file_path = ? "
-                "UNION ALL SELECT 1 FROM active_price WHERE path = ? LIMIT 1",
-                (str(path), str(path)))
+                "UNION ALL SELECT 1 FROM active_price WHERE path = ? "
+                "UNION ALL SELECT 1 FROM price_queue WHERE path = ? LIMIT 1",
+                (str(path), str(path), str(path)))
             return await cur.fetchone() is not None
 
     async def clear_active_price(self, user_id: int) -> str | None:
@@ -742,6 +775,68 @@ class PricingStore:
             row = await cur.fetchone()
             await db.commit()
         return row[0] if row else None
+
+    # ------------------------------------------------- очередь прайсов (§9.8)
+
+    async def enqueue_price(self, user_id: int, filename: str, path: str, key: str,
+                            source: str = "telegram") -> dict:
+        """Поставить прайс в очередь. Тот же `key` — замена, а не второй экземпляр.
+
+        Возвращает `{"status": "queued"|"replaced", "old_path": …}`: путь прежней версии
+        отдаётся наружу, потому что удалять файл здесь нельзя — на него может ссылаться
+        отложенная задача (§9.7).
+        """
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT id, path FROM price_queue WHERE user_id = ? AND key = ?",
+                (user_id, key))
+            row = await cur.fetchone()
+
+            if row:
+                await db.execute(
+                    "UPDATE price_queue SET filename = ?, path = ?, source = ?, "
+                    "added_at = ? WHERE id = ?",
+                    (filename, str(path), source, _now(), row[0]))
+                await db.commit()
+                return {"status": "replaced",
+                        "old_path": row[1] if row[1] != str(path) else None}
+
+            await db.execute(
+                "INSERT INTO price_queue (user_id, filename, path, key, source, added_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, filename, str(path), key, source, _now()))
+            await db.commit()
+            return {"status": "queued", "old_path": None}
+
+    async def list_queue(self, user_id: int) -> list[dict]:
+        """Очередь в порядке поступления."""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT id, filename, path, source, added_at FROM price_queue "
+                "WHERE user_id = ? ORDER BY id", (user_id,))
+            rows = await cur.fetchall()
+        return [{"id": r[0], "filename": r[1], "path": r[2], "source": r[3],
+                 "added_at": r[4]} for r in rows]
+
+    async def take_next_price(self, user_id: int) -> dict | None:
+        """Взять из очереди самый ранний прайс и убрать его оттуда."""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "DELETE FROM price_queue WHERE id = ("
+                "  SELECT id FROM price_queue WHERE user_id = ? ORDER BY id LIMIT 1"
+                ") RETURNING filename, path, source", (user_id,))
+            row = await cur.fetchone()
+            await db.commit()
+        return {"filename": row[0], "path": row[1], "source": row[2]} if row else None
+
+    async def clear_queue(self, user_id: int) -> list[str]:
+        """Очистить очередь; возвращает пути — файлы удаляет вызывающий."""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "DELETE FROM price_queue WHERE user_id = ? RETURNING path", (user_id,))
+            rows = await cur.fetchall()
+            await db.commit()
+        return [r[0] for r in rows]
 
     # ------------------------------------------- проверка справочника по коллекции (§19.7)
 
