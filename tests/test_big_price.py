@@ -18,7 +18,7 @@ from src.bot import pricing_handlers as ph
 from src.bot.pricing_handlers import DUMP_STUB, _prune_file_dumps
 from src.price_tool.parser import find_rows, parse_price_table
 from src.storage.pricing import PricingStore
-from tests.test_pricing_flow import FakeOnec, item
+from tests.test_pricing_flow import FakeOnec, item, propose_prices
 
 TMS = [{"code": "T1", "name": "APE"}, {"code": "T2", "name": "Ceracasa"},
        {"code": "T3", "name": "Imola"}]
@@ -122,7 +122,7 @@ class FakeOrchestrator:
                           extra_executor=None, **kw):
         self.prompts.append(history[-1]["content"])
         self._box.append(extra_executor)
-        await extra_executor.execute("propose_prices", {"groups": [{
+        await propose_prices(extra_executor, {"groups": [{
             "tm_code": self._box[-1]._next_tm, "tm_name": "X",
             "collection_ref": "YO-C", "purchase": 949}]})
         return "марка без изменений", history
@@ -152,7 +152,7 @@ class AutoAdvanceTest(unittest.IsolatedAsyncioTestCase):
             async def handle_turn(self, history, **kw):
                 self.prompts.append(history[-1]["content"])
                 tools = kw["extra_executor"]
-                await tools.execute("propose_prices", {"groups": [{
+                await propose_prices(tools, {"groups": [{
                     "tm_code": next(codes), "tm_name": "X",
                     "collection_ref": "YO-C", "purchase": 949}]})
                 return "менять нечего", history

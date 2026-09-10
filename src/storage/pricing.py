@@ -51,6 +51,19 @@ CREATE INDEX IF NOT EXISTS ix_pending_user ON pending_proposal (user_id, status)
 {mappings}
 -- Прогон прайса по маркам (§9.6): что запланировали и что уже записали. Живёт между
 -- ходами диалога И нажатиями кнопки, поэтому в БД, а не в памяти процесса.
+-- Коллекции, по которым агент УЖЕ проверил справочник (§19.7). Гейт `propose_prices`
+-- в товарных режимах смотрит сюда: цены идут ПОСЛЕ правок товара, а не вместо них.
+--
+-- Отдельная таблица, а не поле в `price_run`, по двум причинам. Во-первых, отметка
+-- ставится раньше, чем прогон вообще может существовать: `propose_items` вызывают и без
+-- очереди марок. Во-вторых, ключей на коллекцию несколько (имя и код папки), а списком в
+-- JSON их пришлось бы читать-писать целиком на каждую отметку.
+CREATE TABLE IF NOT EXISTS items_checked (
+    user_id    INTEGER NOT NULL,
+    key        TEXT NOT NULL,       -- нормализованное имя коллекции ИЛИ код её папки
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, key)
+);
 CREATE TABLE IF NOT EXISTS price_run (
     user_id    INTEGER PRIMARY KEY,
     supplier   TEXT,
@@ -299,6 +312,7 @@ class PricingStore:
     async def reset(self, user_id: int) -> None:
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute("DELETE FROM dialog_state WHERE user_id = ?", (user_id,))
+            await db.execute("DELETE FROM items_checked WHERE user_id = ?", (user_id,))
             await db.execute("UPDATE pending_proposal SET status = 'rejected' "
                              "WHERE user_id = ? AND status = 'pending'", (user_id,))
             await db.commit()
@@ -657,7 +671,34 @@ class PricingStore:
     async def clear_run(self, user_id: int) -> None:
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute("DELETE FROM price_run WHERE user_id = ?", (user_id,))
+            await db.execute("DELETE FROM items_checked WHERE user_id = ?", (user_id,))
             await db.commit()
+
+    # ------------------------------------------- проверка справочника по коллекции (§19.7)
+
+    async def mark_items_checked(self, user_id: int, keys: list[str]) -> None:
+        """Отметить, что по коллекции справочник проверен.
+
+        Отметка ставится в момент ВЫЗОВА `propose_items`, а не после кнопки админа. Гейт
+        отвечает на вопрос «агент вообще смотрел справочник этой коллекции», а не «админ
+        согласился»: пропуск и отказ — это решение админа, и запирать из-за них цены
+        нельзя. Порядок «сначала правки, потом цены» держит другой механизм — пока висит
+        неподтверждённое предложение, ход не продолжается.
+        """
+        rows = [(user_id, k, _now()) for k in {k for k in keys if k}]
+        if not rows:
+            return
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.executemany(
+                "INSERT OR IGNORE INTO items_checked (user_id, key, created_at) "
+                "VALUES (?, ?, ?)", rows)
+            await db.commit()
+
+    async def items_checked(self, user_id: int) -> set[str]:
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute("SELECT key FROM items_checked WHERE user_id = ?",
+                                   (user_id,))
+            return {row[0] for row in await cur.fetchall()}
 
     # -------------------------------------------------- настройки (§5.2)
 

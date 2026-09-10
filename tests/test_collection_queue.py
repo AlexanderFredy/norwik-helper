@@ -12,7 +12,7 @@ from src.agent.pricing_tools import (
     BIG_TM_ITEMS, PricingTools, clear_nomenclature_cache, next_step, queue_tail,
 )
 from src.storage.pricing import PricingStore
-from tests.test_pricing_flow import FakeOnec, item
+from tests.test_pricing_flow import FakeOnec, item, propose_prices
 
 TMS = [{"code": "T1", "name": "Atlas Concorde Rus"}, {"code": "T2", "name": "Azteca"}]
 COLLS = [{"ref": "YO-A", "name": "Allure"}, {"ref": "YO-D", "name": "Drift"}]
@@ -107,7 +107,7 @@ class BigTmSplitTest(unittest.IsolatedAsyncioTestCase):
         return PricingTools(FakeOnec(items), self.store, user_id=42)
 
     async def _propose(self, tools, coll="YO-A"):
-        return await tools.execute("propose_prices", {"groups": [
+        return await propose_prices(tools, {"groups": [
             {"tm_code": "T1", "tm_name": "Atlas Concorde Rus",
              "collection_ref": coll, "purchase": 999}]})
 
@@ -135,7 +135,7 @@ class BigTmSplitTest(unittest.IsolatedAsyncioTestCase):
         tools = self._tools(big())
         await tools.execute("start_tm_collections", {
             "tm_code": "T1", "collections": COLLS})
-        text = await tools.execute("propose_prices", {"groups": [
+        text = await propose_prices(tools, {"groups": [
             {"tm_code": "T1", "collection_ref": "YO-A", "purchase": 999},
             {"tm_code": "T1", "collection_ref": "YO-D", "purchase": 999}]})
         self.assertIn("ОДНУ коллекцию за вызов", text)
@@ -144,7 +144,7 @@ class BigTmSplitTest(unittest.IsolatedAsyncioTestCase):
         tools = self._tools(big())
         await tools.execute("start_tm_collections", {
             "tm_code": "T1", "collections": COLLS})
-        text = await tools.execute("propose_prices", {"groups": [
+        text = await propose_prices(tools, {"groups": [
             {"tm_code": "T1", "collection_ref": "YO-A", "purchase": 949}]})
         self.assertEqual(tools.advanced_to, "Drift")
         self.assertIn("продолжай: Drift", text)

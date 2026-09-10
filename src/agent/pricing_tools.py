@@ -614,6 +614,40 @@ def _transitions(group: GroupResult, kind: str, label: str) -> list[str]:
     return out
 
 
+def _norm_key(name: str) -> str:
+    """Ключ коллекции по имени: регистр и лишние пробелы значения не имеют.
+
+    «Elegance large» в 1С и «Elegance Large» в предложении — одна и та же коллекция, и
+    гейт не должен разводить их из-за регистра.
+    """
+    return " ".join(str(name or "").split()).lower()
+
+
+def _collection_keys(inp: dict, plan, current: list) -> list[str]:
+    """Все имена, под которыми эта коллекция может прийти обратно в propose_prices.
+
+    Их несколько намеренно: модель зовёт коллекцию так, как та названа в ПРАЙСЕ, а в
+    ценовом предложении фигурирует `collection_ref` — код папки из 1С. Плюс имя в
+    справочнике может отличаться регистром или написанием. Кладём все — лишний ключ
+    безвреден, недостающий запер бы цены намертво.
+    """
+    keys = [_norm_key(inp.get("collection")), _norm_key(plan.collection)]
+
+    wanted = {_norm_key(inp.get("collection")), _norm_key(plan.collection)}
+    touched = {i.ref for i in plan.items if i.ref}
+    for item in current:
+        if item.ref in touched or _norm_key(item.collection) in wanted:
+            if item.collection_ref:
+                keys.append(item.collection_ref)
+            keys.append(_norm_key(item.collection))
+
+    for item in plan.items:
+        if item.parent_ref:
+            keys.append(item.parent_ref)
+
+    return [k for k in keys if k]
+
+
 def _image_pixels(data: bytes) -> int:
     """Площадь картинки в пикселях — мера её цены в токенах (примерно площадь / 750).
 
@@ -1275,6 +1309,13 @@ class PricingTools:
         plan = item_rules.plan_collection(inp, current, scope)
         ops = plan.ops()
 
+        # СПРАВОЧНИК ПО ЭТОЙ КОЛЛЕКЦИИ ПРОВЕРЕН — открываем ей дорогу к ценам (§19.7).
+        # Отмечаем ДО того, как разошлись пути «есть что писать» / «нечего»: проверка
+        # состоялась в обоих случаях, а «расхождений нет» — такой же её результат, как
+        # список правок.
+        await self._store.mark_items_checked(
+            self._user_id, _collection_keys(inp, plan, current))
+
         summary = item_rules.render(plan)
         self.last_summary = summary
 
@@ -1421,6 +1462,20 @@ class PricingTools:
         stage = (run or {}).get("stage")
         tm_code = next(iter(tms), None)
 
+        # ЦЕНЫ — ПОСЛЕ ПРАВОК ТОВАРА, ПО ОДНОЙ КОЛЛЕКЦИИ (§19.7). Раньше порядок держался
+        # на одном тексте промпта, и модель обошла его законным путём: `propose_prices`
+        # отказывал только при нескольких ТМ, а несколько коллекций одной марки принимал
+        # спокойно. На боевом прогоне 10.09.2026 агент проверил справочник ОДНОЙ коллекции
+        # Peli из шести, остальные пять ушли сразу в цены — и незаполненная фаска у 21
+        # позиции осталась лежать, хотя он сам её и заметил.
+        #
+        # Порог считает КОД, а не модель — по тем же причинам, что и порог крупной марки
+        # (§9.6.2): у модели на длинном прогоне не хватает хода, и она сводит шаги в один.
+        if modes.with_items(self.mode):
+            refusal = await self._items_gate(inp)
+            if refusal:
+                return refusal
+
         # Крупная марка разбирается по коллекциям (§9.6.2). Порог проверяет КОД: у модели
         # на 900+ позициях не хватает хода, и раньше она отдавала выбор админу вопросом.
         if tm_code and not (stage and stage.get("tm_code") == tm_code):
@@ -1545,6 +1600,40 @@ class PricingTools:
         # итоговый блок и выход из режима печатает обработчик — он один на оба пути
         return summary + "\n\n[Записывать нечего — кнопка подтверждения не появится.]"
 
+    async def _items_gate(self, inp: dict) -> str | None:
+        """Пускать ли к ценам. Строка — отказ с объяснением, None — можно.
+
+        Две проверки, обе про порядок §19.7:
+          * одна коллекция за вызов — иначе марка снова уедет одним куском;
+          * по этой коллекции уже вызывали `propose_items`.
+        """
+        groups = inp.get("groups") or []
+        names = {(g.get("collection") or "").strip() for g in groups}
+        refs = {(g.get("collection_ref") or "").strip() for g in groups}
+        names.discard("")
+        refs.discard("")
+
+        if max(len(names), len(refs)) > 1:
+            listed = ", ".join(sorted(names or refs))
+            # Формулировка та же, что у правила очереди коллекций ниже: смысл один, и
+            # двух разных фраз про одно и то же в ответах быть не должно.
+            return (f"Передано несколько коллекций сразу ({listed}) — передавай в "
+                    "propose_prices ОДНУ коллекцию за вызов. В режиме с правкой товаров "
+                    "порядок такой: propose_items по коллекции, потом propose_prices по "
+                    "ней же, и только затем следующая.")
+
+        checked = await self._store.items_checked(self._user_id)
+        keys = {_norm_key(n) for n in names} | refs
+        if keys and not (keys & checked):
+            name = next(iter(sorted(names or refs)))
+            return (f"По коллекции «{name}» справочник ещё не проверялся — цены пока не "
+                    "принимаю (§19.7). Сверь позиции этой коллекции с прайсом (наличие в "
+                    "1С, наименования, размеры, коэффициент упаковки, свойства из прайса) "
+                    "и вызови propose_items. Если расхождений нет — вызови его всё равно, "
+                    "с пустым items: это и будет ответ «сверил, править нечего». После "
+                    "этого возвращайся к ценам по этой коллекции.")
+
+        return None
     def _digest(self, inp: dict, results: list[GroupResult]) -> dict:
         """Снимок «было → стало» по товарам — для рассылки менеджерам и журнала (п.6).
 

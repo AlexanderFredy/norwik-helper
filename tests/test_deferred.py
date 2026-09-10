@@ -14,7 +14,7 @@ from src.agent.pricing_tools import PricingTools, clear_nomenclature_cache
 from src.bot import pricing_handlers as ph
 from src.storage import price_files
 from src.storage.pricing import PricingStore
-from tests.test_pricing_flow import FakeOnec, item
+from tests.test_pricing_flow import FakeOnec, item, propose_prices
 
 TMS = [{"code": "T1", "name": "Atlas Concorde Rus"}, {"code": "T2", "name": "Azteca"}]
 
@@ -257,7 +257,7 @@ class ButtonsTest(unittest.IsolatedAsyncioTestCase):
         ph._files[42] = ("Price.xls", b"price bytes")
         tools = PricingTools(self.onec, self.store, user_id=42)
         tools.set_file("Price.xls", b"price bytes")
-        await tools.execute("propose_prices", {"groups": [
+        await propose_prices(tools, {"groups": [
             {"tm_code": "T1", "tm_name": "Atlas Concorde Rus",
              "collection_ref": "YO-C", "purchase": 999}]})
         self.pending = await self.store.get_pending(42)

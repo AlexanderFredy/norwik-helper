@@ -11,7 +11,7 @@ from pathlib import Path
 from src.agent.pricing_tools import PricingTools, clear_nomenclature_cache
 from src.bot import pricing_handlers as ph
 from src.storage.pricing import PricingStore
-from tests.test_pricing_flow import FakeOnec, item
+from tests.test_pricing_flow import FakeOnec, item, propose_prices
 
 TMS = [{"code": "T1", "name": "Egger"}, {"code": "T2", "name": "Classen"},
        {"code": "T3", "name": "AGT"}]
@@ -79,13 +79,13 @@ class ProposePerTmTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("начни с «Egger»", text)
 
     async def test_two_tms_at_once_refused(self):
-        text = await self.tools.execute("propose_prices", {
+        text = await propose_prices(self.tools, {
             "groups": [self._group("T1"), self._group("T2")]})
         self.assertIn("Обрабатывай по одной", text)
         self.assertIsNone(await self.store.get_pending(42))
 
     async def test_single_tm_lists_whats_left(self):
-        text = await self.tools.execute("propose_prices", {"groups": [self._group("T1")]})
+        text = await propose_prices(self.tools, {"groups": [self._group("T1")]})
         self.assertIn("Осталось обработать: Classen, AGT.", text)
         self.assertIn("сам не иди", text)
         self.assertIn("ПЕРЕПИСЫВАТЬ ЕГО НЕ НУЖНО", text)
@@ -93,8 +93,8 @@ class ProposePerTmTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_nothing_to_write_closes_tm_and_moves_on(self):
         """Кнопки не будет — значит марку закрываем сами, иначе прогон встанет."""
-        text = await self.tools.execute("propose_prices",
-                                        {"groups": [self._group("T1", purchase=949)]})
+        text = await propose_prices(
+            self.tools, {"groups": [self._group("T1", purchase=949)]})
         self.assertIn("продолжай: Classen", text)
         run = await self.store.get_run(42)
         self.assertEqual([t["name"] for t in run["remaining"]], ["Classen", "AGT"])
@@ -103,15 +103,15 @@ class ProposePerTmTest(unittest.IsolatedAsyncioTestCase):
         """Итог печатает обработчик — инструмент только закрывает марку."""
         for code in ("T1", "T2"):
             await self.store.mark_tm_done(42, code)
-        text = await self.tools.execute("propose_prices",
-                                        {"groups": [self._group("T3", purchase=949)]})
+        text = await propose_prices(
+            self.tools, {"groups": [self._group("T3", purchase=949)]})
         self.assertNotIn("Осталось обработать", text)
         self.assertEqual((await self.store.get_run(42))["remaining"], [])
 
     async def test_works_without_a_run(self):
         """Прогон мог не стартовать (простой однобрендовый прайс) — не падаем."""
         await self.store.clear_run(42)
-        text = await self.tools.execute("propose_prices", {"groups": [self._group("T1")]})
+        text = await propose_prices(self.tools, {"groups": [self._group("T1")]})
         self.assertNotIn("Осталось обработать", text)
         self.assertIn("К записи:", text)
 
@@ -138,7 +138,7 @@ class PlannedTmNotFlaggedTest(unittest.IsolatedAsyncioTestCase):
         self._dir.cleanup()
 
     async def _propose(self, tm="T1"):
-        return await self.tools.execute("propose_prices", {"groups": [
+        return await propose_prices(self.tools, {"groups": [
             {"tm_code": tm, "tm_name": tm, "collection_ref": "YO-C", "purchase": 999}]})
 
     async def test_other_planned_tms_are_silent(self):
@@ -192,7 +192,7 @@ class FinalNotesTest(unittest.IsolatedAsyncioTestCase):
     async def test_notes_are_kept_out_of_the_current_proposal(self):
         text = await self._note("Бренды не в выгрузке: Betta, Aura")
         self.assertIn("Отложено до конца прайса: 1", text)
-        proposal = await self.tools.execute("propose_prices", {"groups": [
+        proposal = await propose_prices(self.tools, {"groups": [
             {"tm_code": "T1", "tm_name": "Egger", "collection_ref": "YO-C",
              "purchase": 999}]})
         self.assertNotIn("Betta", proposal)
@@ -299,7 +299,7 @@ class ContinueAfterApplyTest(unittest.IsolatedAsyncioTestCase):
         self.onec = FakeOnec([item("YO-1", 949, 1649, 1139)])
         self.tools = PricingTools(self.onec, self.store, user_id=42)
         await self.store.start_run(42, "Монарх", "Монарх-логистик", TMS)
-        await self.tools.execute("propose_prices", {
+        await propose_prices(self.tools, {
             "groups": [{"tm_code": "T1", "tm_name": "Egger", "collection_ref": "YO-C",
                         "purchase": 999}]})
         self.pending = await self.store.get_pending(42)

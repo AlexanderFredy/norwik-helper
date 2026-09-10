@@ -15,7 +15,7 @@ from src.agent.pricing_tools import PricingTools, clear_nomenclature_cache
 from src.bot import pricing_handlers as ph
 from src.bot.pricing_handlers import DUMP_STUB, NOM_STUB, _prune_file_dumps
 from src.storage.pricing import PricingStore
-from tests.test_pricing_flow import FakeOnec, item
+from tests.test_pricing_flow import FakeOnec, item, propose_prices
 
 
 def sheet_dump(n=400):
@@ -192,7 +192,7 @@ class ProposalEchoTest(unittest.IsolatedAsyncioTestCase):
         self._dir.cleanup()
 
     async def test_last_summary_holds_the_admin_text(self):
-        await self.tools.execute("propose_prices", {"groups": [
+        await propose_prices(self.tools, {"groups": [
             {"tm_code": "T1", "tm_name": "Peli", "collection_ref": "YO-C",
              "purchase": 999}]})
         self.assertIn("К записи:", self.tools.last_summary)
@@ -200,7 +200,7 @@ class ProposalEchoTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("ПЕРЕПИСЫВАТЬ", self.tools.last_summary)
 
     async def test_model_is_told_not_to_repeat(self):
-        text = await self.tools.execute("propose_prices", {"groups": [
+        text = await propose_prices(self.tools, {"groups": [
             {"tm_code": "T1", "tm_name": "Peli", "collection_ref": "YO-C",
              "purchase": 999}]})
         # текст остаётся в ответе — иначе модель не сможет ответить на вопрос по нему

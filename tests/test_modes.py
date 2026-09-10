@@ -15,7 +15,7 @@ from src.agent.pricing_tools import PricingTools, clear_nomenclature_cache
 from src.bot import pricing_handlers as ph
 from src.price_tool import modes
 from src.storage.pricing import PricingStore
-from tests.test_pricing_flow import FakeOnec, item
+from tests.test_pricing_flow import FakeOnec, item, propose_prices
 
 TM, COLL = "000000298", "YO-C"
 
@@ -121,7 +121,7 @@ class ProposalByModeTest(unittest.IsolatedAsyncioTestCase):
 
     async def _propose(self, mode, **extra):
         self.tools.mode = mode
-        return await self.tools.execute("propose_prices", {
+        return await propose_prices(self.tools, {
             "supplier": "Монарх", "groups": [
                 {"tm_code": TM, "tm_name": "Peli", "collection_ref": COLL,
                  "purchase": 999, "rrc": 1649}], **extra})
@@ -158,12 +158,12 @@ class ProposalByModeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_collection_is_an_item_note(self):
         self.tools.mode = modes.PRICES_ONLY
-        text = await self.tools.execute("propose_prices", {"groups": [
+        text = await propose_prices(self.tools, {"groups": [
             {"tm_code": TM, "collection_ref": "YO-НЕТ", "purchase": 999}]})
         self.assertNotIn("не найдена у ТМ", text)
 
         self.tools.mode = modes.ITEMS_PRICES
-        text = await self.tools.execute("propose_prices", {"groups": [
+        text = await propose_prices(self.tools, {"groups": [
             {"tm_code": TM, "collection_ref": "YO-НЕТ", "purchase": 999}]})
         self.assertIn("не найдена у ТМ", text)
 

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from src.agent.pricing_tools import PricingTools, clear_nomenclature_cache
 from src.onec.client import NomItem, Nomenclature, Price
+from src.price_tool import modes
 from src.storage.pricing import PricingStore
 
 
@@ -20,6 +21,22 @@ def item(ref, purchase, rrc=None, retail=None, coll="YO-C"):
                    product_type="Ламинат", collection="Vintage", parent="Vintage",
                    collection_ref=coll, alt_units={}, purchase=p(purchase),
                    retail=p(retail), rrc=p(rrc))
+
+
+async def propose_prices(tools, payload):
+    """`propose_prices` с уже пройденной проверкой справочника (§19.7).
+
+    В боевом потоке цены идут ПОСЛЕ `propose_items`, и гейт в товарных режимах этого
+    требует. Тесты ниже проверяют ЦЕНОВУЮ механику — арифметику, предупреждения, очередь,
+    — а не порядок шагов, поэтому отметку о проверке ставим за них. Сам порядок закреплён
+    отдельно, в `test_item_tools.py`.
+    """
+    keys = []
+    for group in payload.get("groups") or []:
+        keys.append(group.get("collection_ref") or "")
+        keys.append(" ".join(str(group.get("collection") or "").split()).lower())
+    await tools._store.mark_items_checked(tools._user_id, keys)
+    return await tools.execute("propose_prices", payload)
 
 
 class FakeOnec:
@@ -57,7 +74,7 @@ class PricingFlowTest(unittest.IsolatedAsyncioTestCase):
         self._dir.cleanup()
 
     async def _propose(self, purchase=999, rrc=1649):
-        return await self.tools.execute("propose_prices", {
+        return await propose_prices(self.tools, {
             "supplier": "LINDERWOOD",
             "groups": [{"tm_code": "000000298", "tm_name": "Peli",
                         "collection_ref": "YO-C", "purchase": purchase, "rrc": rrc}],
@@ -148,9 +165,14 @@ class PricingFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("«самовывоз»", text)
 
     async def test_unchanged_collections_are_collapsed(self):
-        """Коллекции без изменений не должны прятать собой то, что меняется."""
+        """Коллекции без изменений не должны прятать собой то, что меняется.
+
+        Режим «только цены»: несколько коллекций в одном предложении возможны лишь здесь —
+        в товарных режимах гейт §19.7 требует по одной, чтобы справочник каждой был сверен.
+        """
+        self.tools.mode = modes.PRICES_ONLY
         self.onec._items = [item("YO-1", 949, coll="YO-A"), item("YO-2", 500, coll="YO-B")]
-        text = await self.tools.execute("propose_prices", {
+        text = await propose_prices(self.tools, {
             "supplier": "X",
             "groups": [
                 {"tm_code": "T", "tm_name": "TM", "collection_ref": "YO-A", "purchase": 949},

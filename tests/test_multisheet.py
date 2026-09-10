@@ -15,7 +15,7 @@ from openpyxl import Workbook
 
 from src.agent.pricing_tools import PricingTools, clear_nomenclature_cache
 from src.storage.pricing import PricingStore
-from tests.test_pricing_flow import FakeOnec, item
+from tests.test_pricing_flow import FakeOnec, item, propose_prices
 
 
 def book(*sheets: str) -> bytes:
@@ -165,7 +165,7 @@ class ProposalGuardsTest(unittest.IsolatedAsyncioTestCase):
         self._dir.cleanup()
 
     async def _propose(self, tm="000000298", coll="YO-C"):
-        return await self.tools.execute("propose_prices", {
+        return await propose_prices(self.tools, {
             "supplier": "Монарх Логистик",
             "groups": [{"tm_code": tm, "tm_name": "Peli", "collection_ref": coll,
                         "purchase": 999, "rrc": 1649}]})

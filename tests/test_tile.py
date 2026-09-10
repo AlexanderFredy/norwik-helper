@@ -14,7 +14,7 @@ from src.agent.pricing_tools import PricingTools, clear_nomenclature_cache
 from src.onec.client import NomItem, Price
 from src.price_tool.changes import build_payload, plan_items
 from src.storage.pricing import PricingStore
-from tests.test_pricing_flow import FakeOnec
+from tests.test_pricing_flow import FakeOnec, propose_prices
 
 TM, COLL = "000000150", "YO-TILE"
 TODAY = date(2026, 8, 27)
@@ -101,7 +101,7 @@ class TileThroughToolTest(unittest.IsolatedAsyncioTestCase):
         self._dir.cleanup()
 
     async def _propose(self, items):
-        return await self.tools.execute("propose_prices", {
+        return await propose_prices(self.tools, {
             "supplier": "Плиточник",
             "groups": [{"tm_code": TM, "tm_name": "Cersanit", "collection_ref": COLL,
                         "items": items}]})
@@ -131,7 +131,7 @@ class TileThroughToolTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_collection_price_still_works_for_laminate(self):
         """Старый путь не сломан: у ламината коллекция однородна."""
-        text = await self.tools.execute("propose_prices", {
+        text = await propose_prices(self.tools, {
             "supplier": "Монарх",
             "groups": [{"tm_code": TM, "tm_name": "Cersanit", "collection_ref": COLL,
                         "purchase": 990}]})

@@ -7,7 +7,7 @@ from src.agent.pricing_tools import PricingTools
 from src.bot import pricing_handlers as ph
 from src.price_tool.broadcast import build_broadcast, journal_rows
 from src.storage.pricing import PricingStore
-from tests.test_pricing_flow import FakeOnec, item
+from tests.test_pricing_flow import FakeOnec, item, propose_prices
 
 DIGEST = {
     "supplier": "Монарх Логистик", "price_doc": "Монарх-логистик",
@@ -93,7 +93,7 @@ class JournalTest(unittest.IsolatedAsyncioTestCase):
         """Дайджест должен доехать до кнопки: после подтверждения пересчитать его негде."""
         onec = FakeOnec([item("YO-1", 949, 1649, 1139)])
         tools = PricingTools(onec, self.store, user_id=42)
-        await tools.execute("propose_prices", {
+        await propose_prices(tools, {
             "supplier": "LINDERWOOD", "price_doc": "ЛИНДЕРВУД", "price_date": "2026-08-01",
             "groups": [{"tm_code": "T", "tm_name": "Peli", "collection_ref": "YO-C",
                         "purchase": 999}]})

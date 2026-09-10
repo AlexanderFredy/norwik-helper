@@ -10,7 +10,7 @@ from src.price_tool.broadcast import build_broadcast
 from src.price_tool.exclusive import resolve
 from src.price_tool.history import describe_group
 from src.storage.pricing import PricingStore
-from tests.test_pricing_flow import FakeOnec, item
+from tests.test_pricing_flow import FakeOnec, item, propose_prices
 
 TM = "000000298"
 COLL = "YO-C"
@@ -39,7 +39,7 @@ class ExclusiveFlowTest(unittest.IsolatedAsyncioTestCase):
             "items": items if items is not None else [entry()]})
 
     async def _propose(self):
-        return await self.tools.execute("propose_prices", {
+        return await propose_prices(self.tools, {
             "supplier": "Монарх Логистик",
             "groups": [{"tm_code": TM, "tm_name": "Peli", "collection_ref": COLL,
                         "purchase": 999, "rrc": 1649}]})

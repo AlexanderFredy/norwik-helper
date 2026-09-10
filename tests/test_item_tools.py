@@ -248,5 +248,82 @@ class DigestTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1219x228x4 → 1219x228x5", build_item_broadcast(digest))
 
 
+class PriceGateTest(unittest.IsolatedAsyncioTestCase):
+    """§19.7: цены идут ПОСЛЕ правок товара и по ОДНОЙ коллекции.
+
+    Раньше порядок держался на одном тексте промпта, и модель обошла его законным путём:
+    `propose_prices` отказывал только при нескольких ТМ, а несколько коллекций одной марки
+    принимал спокойно. На боевом прогоне 10.09.2026 агент проверил справочник одной
+    коллекции Peli из шести — незаполненная фаска у 21 позиции осталась лежать, хотя он сам
+    её и заметил.
+    """
+
+    async def asyncSetUp(self):
+        clear_nomenclature_cache()
+        self._dir = tempfile.TemporaryDirectory()
+        self.store = PricingStore(Path(self._dir.name) / "t.db")
+        await self.store.init()
+        self.onec = FakeOnec([nom_item()])
+        self.tools = PricingTools(self.onec, self.store, user_id=42)
+        self.tools.mode = modes.ITEMS_PRICES
+
+    async def asyncTearDown(self):
+        self._dir.cleanup()
+
+    def _prices(self, **kw) -> dict:
+        group = {"tm_code": TM, "tm_name": "Linderwood",
+                 "collection_ref": "YO-00078954", "collection": "Quartz",
+                 "purchase": 1200, "rrc": 1800}
+        group.update(kw)
+        return {"supplier": "LINDERWOOD", "groups": [group]}
+
+    async def test_prices_refused_before_items_check(self):
+        text = await self.tools.execute("propose_prices", self._prices())
+        self.assertIn("справочник ещё не проверялся", text)
+        self.assertIsNone(await self.store.get_pending(42))
+
+    async def test_prices_allowed_after_propose_items(self):
+        await self.tools.execute("propose_items", proposal_input())
+        await self.store.reject(42, (await self.store.get_pending(42)).proposal_id)
+        text = await self.tools.execute("propose_prices", self._prices())
+        self.assertNotIn("справочник ещё не проверялся", text)
+
+    async def test_check_counts_even_when_nothing_to_fix(self):
+        """«Сверил, править нечего» — такой же результат проверки, как список правок."""
+        await self.tools.execute("propose_items", proposal_input(items=[]))
+        self.assertIsNone(await self.store.get_pending(42))
+        text = await self.tools.execute("propose_prices", self._prices())
+        self.assertNotIn("справочник ещё не проверялся", text)
+
+    async def test_several_collections_refused(self):
+        payload = self._prices()
+        payload["groups"].append({"tm_code": TM, "collection_ref": "YO-OTHER",
+                                  "collection": "Vintage", "purchase": 900})
+        text = await self.tools.execute("propose_prices", payload)
+        self.assertIn("несколько коллекций", text)
+        self.assertIsNone(await self.store.get_pending(42))
+
+    async def test_collection_matched_by_name_ignoring_case(self):
+        """«Elegance large» в 1С и «Elegance Large» в предложении — одна коллекция."""
+        await self.store.mark_items_checked(42, ["elegance large"])
+        text = await self.tools.execute("propose_prices",
+                                        self._prices(collection="Elegance Large",
+                                                     collection_ref=""))
+        self.assertNotIn("справочник ещё не проверялся", text)
+
+    async def test_gate_is_off_in_prices_only_mode(self):
+        """В режиме «только цены» справочник не трогаем вовсе — запирать нечем."""
+        self.tools.mode = modes.PRICES_ONLY
+        text = await self.tools.execute("propose_prices", self._prices())
+        self.assertNotIn("справочник ещё не проверялся", text)
+
+    async def test_new_price_list_clears_the_marks(self):
+        """Отметки живут в рамках одного прайса: новый файл — новая проверка."""
+        await self.tools.execute("propose_items", proposal_input(items=[]))
+        await self.store.reset(42)
+        text = await self.tools.execute("propose_prices", self._prices())
+        self.assertIn("справочник ещё не проверялся", text)
+
+
 if __name__ == "__main__":
     unittest.main()
