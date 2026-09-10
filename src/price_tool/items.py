@@ -28,8 +28,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from src.price_tool import discontinued
-from src.price_tool.naming import (collection_case, ensure_type_prefix, tidy,
-                                   violations)
+from src.price_tool.naming import (collection_case, drop_own_article,
+                                   ensure_type_prefix, tidy, violations)
 
 # Поля, изменение которых показывается админу и менеджерам поимённо (§19.9).
 WATCHED = ("parent_ref", "collection", "article", "unit", "pack_coefficient",
@@ -65,11 +65,17 @@ def _form(value) -> str:
 
 def build_name(product_type: str, tm: str, collection: str, title: str,
                tail: str = "") -> str:
-    """Наименование из частей: `[вид товара] [ТМ] [коллекция] [название] [хвост]`.
+    """Наименование из частей: `[вид товара] [ТМ] [коллекция] [название] [размер]`.
 
-    `tail` — то, чем поставщик различает позиции внутри расцветки: артикул или размер.
-    Что именно, решает вызывающий: у ламината это артикул, у плитки размер, а у дверей
-    размера в имени нет вовсе (§19.5). Пустой хвост — нормальный случай, а не пропуск.
+    `tail` — РАЗМЕР, и только он: `60x60`, `1290x190x12`. Артикула в шаблоне нет (§19.5) —
+    он лежит в отдельном реквизите, по которому идёт сопоставление с прайсом, и в имени
+    только занимает место. Раньше этот параметр был описан как «артикул или размер», и
+    агент честно ставил туда артикул: на боевой базе так вышло 53 позиции.
+
+    Размер нужен там, где он РАЗЛИЧАЕТ позиции, — у керамики «Мадейра» это сразу несколько
+    товаров с разными форматами. У ламината он одинаков на всю коллекцию и место ему в
+    имени папки (§19.5), а не в каждой карточке. У дверей размер не пишется вовсе.
+    Пустой хвост — нормальный случай, а не пропуск.
 
     Вид товара ставится ЧЕРЕЗ `ensure_type_prefix`, а не простой склейкой: он же чинит
     архаизмы («Водостойкий ламинат» → «Виниловый ламинат»), иначе старое имя не заменялось
@@ -282,9 +288,13 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
         was = by_ref.get(ref) if op == "update" else None
 
         item_warnings: list[str] = []
-        name = build_name(type_name, tm_name, collection, title, tail)
-        full = str(raw.get("full_name") or "").strip() or name
-        site = site_name(title)
+        # СВОЙ артикул вычищаем ПОСЛЕ сборки, а не полагаемся на то, что модель не
+        # передаст его в `tail`: она уже передавала, и молча.
+        name = drop_own_article(
+            build_name(type_name, tm_name, collection, title, tail), article)
+        full = drop_own_article(
+            str(raw.get("full_name") or "").strip() or name, article)
+        site = drop_own_article(site_name(title), article)
 
         for bad in violations(name):
             item_warnings.append(f"имя содержит {bad}")

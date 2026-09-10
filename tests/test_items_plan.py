@@ -12,12 +12,12 @@ from src.price_tool.items import (build_name, plan_collection, render, significa
 
 
 def _nom(**kw) -> NomItem:
-    base = dict(ref="YO-1", id="1", name="Виниловый ламинат Linderwood Quartz Адана LQ-01",
+    base = dict(ref="YO-1", id="1", name="Виниловый ламинат Linderwood Quartz Адана",
                 article="LQ-01", unit="м2", size="1219x228x4",
                 product_type="Виниловый ламинат", collection="Quartz",
                 parent="Quartz", collection_ref="YO-00078954",
                 alt_units={"упак": 2.23}, purchase=None, retail=None, rrc=None,
-                full_name="Виниловый ламинат Linderwood Quartz Адана LQ-01",
+                full_name="Виниловый ламинат Linderwood Quartz Адана",
                 site_name="Адана", product_type_ref="000000002",
                 collection_code="0004046", length_from=1219.0, length_to=1219.0,
                 width_from=228.0, width_to=228.0, thickness=4.0,
@@ -36,9 +36,10 @@ def _inp(**kw) -> dict:
 class BuildNameTest(unittest.TestCase):
 
     def test_parts_assembled_in_order(self):
+        """Хвост — РАЗМЕР, а не артикул (§19.5)."""
         self.assertEqual(
-            build_name("Виниловый ламинат", "Linderwood", "QUARTZ", "Адана", "LQ-01"),
-            "Виниловый ламинат Linderwood Quartz Адана LQ-01")
+            build_name("Виниловый ламинат", "Linderwood", "QUARTZ", "Адана", "1219x228x4"),
+            "Виниловый ламинат Linderwood Quartz Адана 1219x228x4")
 
     def test_legacy_type_replaced_not_appended(self):
         """«Водостойкий ламинат» — архаизм; дописать вид товара спереди было бы порчей."""
@@ -72,14 +73,14 @@ class PlanTest(unittest.TestCase):
 
     def test_creation_builds_full_operation(self):
         plan = plan_collection(_inp(items=[
-            {"op": "create", "article": "LQ-09", "title": "Ялова", "tail": "LQ-09",
+            {"op": "create", "article": "LQ-09", "title": "Ялова",
              "unit": "м2", "pack_coefficient": 2.23, "length": 1219, "width": 228,
              "thickness": 4,
              "properties": [{"property": "0000002", "value_code": "0000017"}]}
         ]), current=[])
         op = plan.ops()[0]
         self.assertEqual(op["op"], "create_item")
-        self.assertEqual(op["name"], "Виниловый ламинат Linderwood Quartz Ялова LQ-09")
+        self.assertEqual(op["name"], "Виниловый ламинат Linderwood Quartz Ялова")
         self.assertEqual(op["site_name"], "Ялова")
         self.assertEqual(op["manufacturer"], "000000325")
         self.assertEqual((op["length_from"], op["length_to"]), (1219.0, 1219.0))
@@ -118,8 +119,8 @@ class PlanTest(unittest.TestCase):
 
     def test_case_only_rename_is_normalization(self):
         """Правка есть, но вся она — регистр: админу одной строкой, в историю ничего."""
-        old = _nom(name="Виниловый ламинат Linderwood QUARTZ Адана LQ-01",
-                   full_name="Виниловый ламинат Linderwood QUARTZ Адана LQ-01")
+        old = _nom(name="Виниловый ламинат Linderwood QUARTZ Адана",
+                   full_name="Виниловый ламинат Linderwood QUARTZ Адана")
         plan = plan_collection(_inp(items=[
             {"op": "update", "ref": "YO-1", "article": "LQ-01", "title": "Адана",
              "tail": "LQ-01"}

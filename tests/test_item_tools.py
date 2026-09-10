@@ -23,11 +23,11 @@ TM = "000000325"
 
 def nom_item(ref="YO-1", **kw) -> NomItem:
     base = dict(ref=ref, id="1",
-                name="Виниловый ламинат Linderwood Quartz Адана LQ-01", article="LQ-01",
+                name="Виниловый ламинат Linderwood Quartz Адана", article="LQ-01",
                 unit="м2", size="1219x228x4", product_type="Виниловый ламинат",
                 collection="Quartz", parent="Quartz", collection_ref="YO-00078954",
                 alt_units={"упак": 1.84}, purchase=None, retail=None, rrc=None,
-                full_name="Виниловый ламинат Linderwood Quartz Адана LQ-01",
+                full_name="Виниловый ламинат Linderwood Quartz Адана",
                 site_name="Адана", product_type_ref="000000002",
                 collection_code="0004046", length_from=1219.0, length_to=1219.0,
                 width_from=228.0, width_to=228.0, thickness=4.0,

@@ -5,7 +5,8 @@
 """
 import unittest
 
-from src.price_tool.naming import (MARKUP, collection_case, ensure_type_prefix,
+from src.price_tool.naming import (MARKUP, collection_case, drop_own_article,
+                                   ensure_type_prefix,
                                    fix_article_in_name, fix_caps, fix_collection_in_name,
                                    is_xml_safe, markup_chars, strip_type_prefix, tidy,
                                    violations, xml_safe)
@@ -294,6 +295,45 @@ class CollectionInName(unittest.TestCase):
     def test_empty_collection(self):
         name = "Ламинат Peli Дуб"
         self.assertEqual(fix_collection_in_name(name, ""), name)
+
+
+class DropOwnArticleTest(unittest.TestCase):
+    """§19.5: артикула в наименовании нет — он лежит в отдельном реквизите.
+
+    Источник ошибки был не в модели, а в описании параметра сборки имени: «артикул ИЛИ
+    размер». Агент честно ставил артикул, и на боевой базе так вышло 53 позиции.
+    """
+
+    def test_trailing_article_removed(self):
+        self.assertEqual(
+            drop_own_article("Ламинат Peli Vintage Ван Браун VN-511", "VN-511"),
+            "Ламинат Peli Vintage Ван Браун")
+
+    def test_multiword_article(self):
+        self.assertEqual(
+            drop_own_article("Ламинат Peli Platinium Сеньи AN PLT 911", "AN PLT 911"),
+            "Ламинат Peli Platinium Сеньи")
+
+    def test_article_in_the_middle(self):
+        self.assertEqual(
+            drop_own_article("Ламинат Peli LE-263 Натуральный венгерский", "LE-263"),
+            "Ламинат Peli Натуральный венгерский")
+
+    def test_case_insensitive(self):
+        self.assertEqual(drop_own_article("Плитка Roma lq-01", "LQ-01"), "Плитка Roma")
+
+    def test_similar_word_survives(self):
+        """Сравнение по токенам: похожая подстрока внутри слова не режется."""
+        self.assertEqual(drop_own_article("Ламинат Peli LE-2630 Дуб", "LE-263"),
+                         "Ламинат Peli LE-2630 Дуб")
+
+    def test_name_without_article_untouched(self):
+        name = "Ламинат Peli Vintage Ван Браун"
+        self.assertEqual(drop_own_article(name, "VN-511"), name)
+
+    def test_empty_article(self):
+        name = "Ламинат Peli Vintage Ван Браун"
+        self.assertEqual(drop_own_article(name, ""), name)
 
 
 if __name__ == "__main__":
