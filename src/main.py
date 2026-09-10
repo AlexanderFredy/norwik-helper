@@ -6,6 +6,7 @@ from aiogram import Bot, Dispatcher
 
 from src.agent.orchestrator import Orchestrator
 from src.agent.tools import ToolExecutor
+from src.bot import pricing_handlers
 from src.bot.auth import AuthMiddleware
 from src.bot.commands import setup_bot_commands
 from src.bot.handlers import router
@@ -32,6 +33,13 @@ async def main() -> None:
     await store.init()
     pricing_store = PricingStore(config.db_path)
     await pricing_store.init()
+
+    # Прайсы, которые админы разбирали до перезапуска, поднимаем обратно в память: история
+    # диалога лежит в базе и рестарт переживает, а файл до 10.09.2026 не переживал — и
+    # текст админа переставал считаться ответом по прайсу (§9.7).
+    restored = await pricing_handlers.restore_active_prices(pricing_store)
+    if restored:
+        logger.info("Возобновлены прайсы в работе: %d", restored)
 
     onec = None
     if config.onec_base_url and config.onec_token:

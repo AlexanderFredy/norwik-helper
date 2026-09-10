@@ -51,6 +51,21 @@ CREATE INDEX IF NOT EXISTS ix_pending_user ON pending_proposal (user_id, status)
 {mappings}
 -- Прогон прайса по маркам (§9.6): что запланировали и что уже записали. Живёт между
 -- ходами диалога И нажатиями кнопки, поэтому в БД, а не в памяти процесса.
+-- Прайс, который админ разбирает ПРЯМО СЕЙЧАС (§9.7).
+--
+-- Раньше активный прайс жил только в памяти процесса, и перезапуск бота его терял: история
+-- диалога в базе оставалась, а файла не было — текст админа переставал считаться ответом
+-- по прайсу и уходил менеджерскому агенту, который про прайс ничего не знает. Ровно так
+-- 10.09.2026 на «продолжай дальше» бот ответил «не вижу, какой товар искать».
+--
+-- Строка одна на админа: прайс в работе один за раз, как и прогон.
+CREATE TABLE IF NOT EXISTS active_price (
+    user_id    INTEGER PRIMARY KEY,
+    filename   TEXT NOT NULL,
+    path       TEXT NOT NULL,       -- файл рядом с базой, как у отложенных задач
+    saved_at   TEXT NOT NULL
+);
+
 -- Коллекции, по которым агент УЖЕ проверил справочник (§19.7). Гейт `propose_prices`
 -- в товарных режимах смотрит сюда: цены идут ПОСЛЕ правок товара, а не вместо них.
 --
@@ -673,6 +688,60 @@ class PricingStore:
             await db.execute("DELETE FROM price_run WHERE user_id = ?", (user_id,))
             await db.execute("DELETE FROM items_checked WHERE user_id = ?", (user_id,))
             await db.commit()
+
+    # ------------------------------------------------- активный прайс (§9.7)
+
+    async def set_active_price(self, user_id: int, filename: str, path: str) -> None:
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO active_price (user_id, filename, path, saved_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+                "filename = excluded.filename, path = excluded.path, "
+                "saved_at = excluded.saved_at",
+                (user_id, filename, str(path), _now()))
+            await db.commit()
+
+    async def get_active_price(self, user_id: int) -> dict | None:
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT filename, path FROM active_price WHERE user_id = ?", (user_id,))
+            row = await cur.fetchone()
+        return {"filename": row[0], "path": row[1]} if row else None
+
+    async def list_active_prices(self) -> list[dict]:
+        """Все активные прайсы — читается один раз при старте бота."""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute("SELECT user_id, filename, path FROM active_price")
+            rows = await cur.fetchall()
+        return [{"user_id": r[0], "filename": r[1], "path": r[2]} for r in rows]
+
+    async def price_file_in_use(self, path: str) -> bool:
+        """Ссылается ли на файл ещё кто-нибудь — отложенная задача или другой админ.
+
+        Без этой проверки завершение прогона стирало бы прайс из-под отложенной задачи, и
+        вернуться к ней было бы уже не с чем (§9.7).
+        """
+        if not path:
+            return False
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT 1 FROM deferred_tasks WHERE file_path = ? "
+                "UNION ALL SELECT 1 FROM active_price WHERE path = ? LIMIT 1",
+                (str(path), str(path)))
+            return await cur.fetchone() is not None
+
+    async def clear_active_price(self, user_id: int) -> str | None:
+        """Забыть активный прайс. Возвращает путь — файл удаляет вызывающий.
+
+        Удалять здесь нельзя: на тот же файл может ссылаться отложенная задача, и
+        подчистка идёт через общий учёт ссылок (`price_files.forget`).
+        """
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "DELETE FROM active_price WHERE user_id = ? RETURNING path", (user_id,))
+            row = await cur.fetchone()
+            await db.commit()
+        return row[0] if row else None
 
     # ------------------------------------------- проверка справочника по коллекции (§19.7)
 

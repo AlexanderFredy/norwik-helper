@@ -91,6 +91,53 @@ async def _in_stage(store: PricingStore, user_id: int) -> bool:
     return bool((run or {}).get("stage"))
 
 
+# АКТИВНЫЙ ПРАЙС ПЕРЕЖИВАЕТ ПЕРЕЗАПУСК БОТА.
+#
+# `_files` — кэш в памяти процесса, и до 10.09.2026 он был единственным местом, где жил
+# разбираемый прайс. История диалога при этом лежала в базе. Рестарт бота рвал пару: история
+# есть, файла нет — и текст админа переставал считаться ответом по прайсу, уходя
+# менеджерскому агенту. На «продолжай дальше» бот отвечал «не вижу, какой товар искать».
+#
+# Теперь файл кладётся на диск сразу (тем же механизмом, что и под отложенные задачи), а в
+# базе остаётся строка «этот админ разбирает вот этот прайс». При старте бота строки
+# читаются обратно в `_files`.
+
+
+async def _remember_file(store: PricingStore, user_id: int, filename: str,
+                         content: bytes) -> None:
+    """Запомнить прайс: в памяти — для скорости, на диске — чтобы пережить рестарт."""
+    _files[user_id] = (filename, content)
+    path = price_files.save(store.db_path, filename, content)
+    if path:
+        await store.set_active_price(user_id, filename, str(path))
+    else:
+        # Записать не вышло — работаем как раньше, из памяти. Разбор из-за этого срывать
+        # незачем: рестарт всего лишь вернёт прежнее поведение.
+        logger.warning("Прайс %s не сохранён на диск — переживёт только текущий запуск",
+                       filename)
+
+
+async def _forget_file(store: PricingStore, user_id: int) -> None:
+    """Прайс отработан или отменён: забыть и убрать файл, если он больше никому не нужен."""
+    _files.pop(user_id, None)
+    path = await store.clear_active_price(user_id)
+    if path and not await store.price_file_in_use(path):
+        price_files.forget([path])
+
+
+async def restore_active_prices(store: PricingStore) -> int:
+    """Поднять активные прайсы в память при старте бота. Возвращает число поднятых."""
+    restored = 0
+    for row in await store.list_active_prices():
+        content = price_files.load(row.get("path"))
+        if content:
+            _files[row["user_id"]] = (row.get("filename") or "прайс", content)
+            restored += 1
+        else:
+            await store.clear_active_price(row["user_id"])
+    return restored
+
+
 def _chunks(text: str) -> list[str]:
     """Разбивка под лимит сообщения Telegram (4096)."""
     return [text[i:i + 4096] for i in range(0, len(text), 4096)] or [""]
@@ -215,7 +262,7 @@ async def _finish_run(message: Message, store: PricingStore, user_id: int,
                  else "Работа с прайсом завершена.")
     lines.append("Пришлите следующий файл, когда понадобится.")
 
-    _files.pop(user_id, None)
+    await _forget_file(store, user_id)
     await store.reset(user_id)
     await store.clear_run(user_id)
     await _send(message, "\n".join(lines))
@@ -386,7 +433,7 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
         # админ решил обновить этот прайс вручную — из режима выходим, в отложенные он
         # НЕ идёт и считается обработанным (§6.10)
         if tools.handled_manually:
-            _files.pop(user_id, None)
+            await _forget_file(store, user_id)
             await store.reset(user_id)
             await store.clear_run(user_id)
             clear_nomenclature_cache()
@@ -429,7 +476,8 @@ async def handle_price_document(message: Message, orchestrator, onec, pricing_st
     buf = io.BytesIO()
     file_info = await message.bot.get_file(doc.file_id)
     await message.bot.download_file(file_info.file_path, destination=buf)
-    _files[message.from_user.id] = (doc.file_name, buf.getvalue())
+    await _remember_file(pricing_store, message.from_user.id,
+                         doc.file_name, buf.getvalue())
     await pricing_store.reset(message.from_user.id)   # новый прайс — новый диалог
     await pricing_store.clear_run(message.from_user.id)   # и новый план по маркам
     clear_nomenclature_cache()                        # и свежие цены из 1С
@@ -441,7 +489,7 @@ async def handle_price_document(message: Message, orchestrator, onec, pricing_st
 
 @router.message(Command("cancel_price"))
 async def cmd_cancel(message: Message, pricing_store: PricingStore) -> None:
-    _files.pop(message.from_user.id, None)
+    await _forget_file(pricing_store, message.from_user.id)
     await pricing_store.reset(message.from_user.id)
     await pricing_store.clear_run(message.from_user.id)
     await message.answer("Работа с прайсом прекращена, предложение отменено.")
@@ -795,7 +843,7 @@ async def cmd_deferred_resume(message: Message, command: CommandObject, orchestr
 
     user_id = message.from_user.id
     name = task.get("price_doc") or "прайс"
-    _files[user_id] = (name, content)
+    await _remember_file(pricing_store, user_id, name, content)
     await pricing_store.reset(user_id)          # чистый диалог: старой истории здесь нет
     await pricing_store.clear_run(user_id)
     clear_nomenclature_cache()
