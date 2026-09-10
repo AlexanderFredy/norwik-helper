@@ -222,6 +222,99 @@ def strip_type_prefix(name: str | None, product_type: str | None) -> str:
     return text[len(kind):].strip()
 
 
+# --- размер: где он пишется, а где нет ------------------------------------------------
+#
+# §19.5, решение админа 10.09.2026. Размер — не украшение имени, а СПОСОБ РАЗЛИЧИТЬ товары,
+# и пишется он ровно там, где различает.
+#
+# В НАИМЕНОВАНИИ товара — только у керамики. У неё в одной коллекции лежат форматы 30x60,
+# 60x60 и 20x20, и «Мадейра» без размера — это сразу несколько разных карточек с разными
+# ценами. У ламината и паркета формат один на всю коллекцию: в каждой карточке он был бы
+# повторён сорок раз и не сказал бы ничего.
+#
+# В НАИМЕНОВАНИИ ПАПКИ коллекции — у восьми напольных категорий, и ТОЛЬКО когда размер
+# одинаков у всех позиций. Условие существенное: папка описывает коллекцию целиком, и
+# приписать ей «1290x190x8», когда внутри лежат два формата, значит соврать в справочнике.
+#
+# Керамика попадает в оба списка, и это не противоречие: у однородной по формату коллекции
+# размер уместен и в папке, и в карточках.
+
+SIZE_IN_NAME_TYPES = frozenset({"керамическая плитка", "керамогранит"})
+
+SIZE_IN_FOLDER_TYPES = frozenset({
+    "паркетная доска", "ламинат", "массивная доска", "виниловый ламинат",
+    "штучный паркет", "инженерная доска", "керамогранит", "керамическая плитка",
+})
+
+SIZE_IN_NAME_CODES = frozenset({"000000010", "000000011"})
+
+SIZE_IN_FOLDER_CODES = frozenset({
+    "000000005", "000000003", "000000004", "000000002",
+    "000000009", "000000006", "000000011", "000000010",
+})
+
+
+def _type_key(product_type: str | None) -> str:
+    return " ".join(str(product_type or "").split()).lower()
+
+
+def size_in_name(product_type: str | None = None, code: str | None = None) -> bool:
+    """Пишется ли размер в наименование товара. Только керамика."""
+    if code:
+        return str(code).strip() in SIZE_IN_NAME_CODES
+    return _type_key(product_type) in SIZE_IN_NAME_TYPES
+
+
+def size_in_folder(product_type: str | None = None, code: str | None = None) -> bool:
+    """Дописывается ли размер к имени папки коллекции — при едином размере внутри."""
+    if code:
+        return str(code).strip() in SIZE_IN_FOLDER_CODES
+    return _type_key(product_type) in SIZE_IN_FOLDER_TYPES
+
+
+def _num(value) -> str:
+    """Число без хвостовых нулей: 8.0 → «8», 3.5 → «3.5»."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return f"{number:g}"
+
+
+def format_size(length, width, thickness=None) -> str:
+    """`ДxШxТ` в мм. Пусто, если нет длины или ширины — половина размера бессмысленна.
+
+    Толщина необязательна: у обоев её не заполняют вовсе, у керамики — только когда она
+    явно указана в прайсе (§19.5).
+    """
+    parts = [_num(length), _num(width)]
+    if not all(parts):
+        return ""
+    thick = _num(thickness)
+    if thick:
+        parts.append(thick)
+    return "x".join(parts)
+
+
+def uniform_size(sizes) -> str:
+    """Единый размер коллекции. Пусто, если размеры разные или хоть один неизвестен.
+
+    НЕИЗВЕСТНЫЙ РАЗМЕР — ЭТО НЕ СОВПАДЕНИЕ. Позиция без заполненных длины и ширины могла
+    бы оказаться какой угодно, и приписывать папке размер по остальным значило бы выдавать
+    незнание за факт.
+    """
+    seen = {str(s or "").strip() for s in sizes}
+    if not seen or "" in seen or len(seen) > 1:
+        return ""
+    return seen.pop()
+
+
+def folder_name(collection: str | None, size: str | None = None) -> str:
+    """Имя папки коллекции: `Vintage 1290x190x8`. Без размера — просто имя коллекции."""
+    name = collection_case(collection)
+    tail = " ".join(str(size or "").split())
+    return f"{name} {tail}".strip() if tail else name
+
 # --- СВОЙ артикул в наименовании ------------------------------------------------------
 #
 # §19.5: `Наименование` = `[тип] [ТМ] [коллекция] [название] [размер]`. Артикула в шаблоне

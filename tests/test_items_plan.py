@@ -352,5 +352,95 @@ class UnfilledPropertiesTest(unittest.TestCase):
         self.assertNotIn("Не заполнено ни у одной", render(plan))
 
 
+class SizeRulesTest(unittest.TestCase):
+    """§19.5: где пишется размер, а где нет (решение админа 10.09.2026).
+
+    Размер — способ РАЗЛИЧИТЬ товары, и пишется там, где различает: в наименовании только
+    у керамики, в имени папки — у восьми напольных категорий и только при едином размере.
+    """
+
+    @staticmethod
+    def _tile(**kw) -> dict:
+        base = dict(tm_code="T", tm_name="Equipe", product_type="000000010",
+                    product_type_name="Керамическая плитка", collection="Lanse", items=[])
+        base.update(kw)
+        return base
+
+    def test_size_stays_in_ceramic_name(self):
+        plan = plan_collection(self._tile(items=[
+            {"op": "create", "article": "L-1", "title": "Мадейра", "tail": "60x60"}]), [])
+        self.assertEqual(plan.ops()[0]["name"],
+                         "Керамическая плитка Equipe Lanse Мадейра 60x60")
+
+    def test_size_dropped_from_laminate_name(self):
+        """У ламината формат один на всю коллекцию — в карточке он лишний."""
+        plan = plan_collection(_inp(
+            tm_name="Peli", product_type="000000003", product_type_name="Ламинат",
+            collection="Vintage",
+            items=[{"op": "create", "article": "VN-1", "title": "Ван Браун",
+                    "tail": "1290x190x8"}]), [])
+        self.assertEqual(plan.ops()[0]["name"], "Ламинат Peli Vintage Ван Браун")
+
+    def test_site_name_never_carries_size(self):
+        plan = plan_collection(self._tile(items=[
+            {"op": "create", "article": "L-1", "title": "Мадейра", "tail": "60x60"}]), [])
+        self.assertEqual(plan.ops()[0]["site_name"], "Мадейра")
+
+    def test_folder_gets_size_when_uniform(self):
+        plan = plan_collection(_inp(
+            tm_name="Peli", product_type="000000003", product_type_name="Ламинат",
+            collection="Vintage",
+            new_folder={"parent_ref": "YO-P", "name": "Vintage"},
+            items=[{"op": "create", "article": f"VN-{n}", "title": f"Цвет {n}",
+                    "length": 1290, "width": 190, "thickness": 8} for n in range(3)]), [])
+        self.assertEqual(plan.ops()[0]["name"], "Vintage 1290x190x8")
+
+    def test_folder_without_size_when_formats_differ(self):
+        """Два формата внутри — приписать папке один значило бы соврать в справочнике."""
+        plan = plan_collection(_inp(
+            tm_name="Peli", product_type="000000003", product_type_name="Ламинат",
+            collection="Vintage",
+            new_folder={"parent_ref": "YO-P", "name": "Vintage"},
+            items=[{"op": "create", "article": "VN-1", "title": "А",
+                    "length": 1290, "width": 190, "thickness": 8},
+                   {"op": "create", "article": "VN-2", "title": "Б",
+                    "length": 1290, "width": 240, "thickness": 8}]), [])
+        self.assertEqual(plan.ops()[0]["name"], "Vintage")
+
+    def test_unknown_size_is_not_a_match(self):
+        """Позиция без размеров могла быть какой угодно — незнание не выдаём за факт."""
+        plan = plan_collection(_inp(
+            tm_name="Peli", product_type="000000003", product_type_name="Ламинат",
+            collection="Vintage",
+            new_folder={"parent_ref": "YO-P", "name": "Vintage"},
+            items=[{"op": "create", "article": "VN-1", "title": "А",
+                    "length": 1290, "width": 190, "thickness": 8},
+                   {"op": "create", "article": "VN-2", "title": "Б"}]), [])
+        self.assertEqual(plan.ops()[0]["name"], "Vintage")
+
+    def test_folder_size_skipped_for_other_categories(self):
+        """Обои в список восьми категорий не входят."""
+        plan = plan_collection(_inp(
+            tm_name="AdaWall", product_type="000000028", product_type_name="Обои",
+            collection="Octagon",
+            new_folder={"parent_ref": "YO-P", "name": "Octagon"},
+            items=[{"op": "create", "article": "1201-1", "title": "Бежевый",
+                    "length": 10050, "width": 1060}]), [])
+        self.assertEqual(plan.ops()[0]["name"], "Octagon")
+
+    def test_existing_items_count_toward_uniformity(self):
+        """Дозаводим позицию в существующую коллекцию — судить по одному предложению нельзя."""
+        current = [_nom(ref="YO-9", collection="Vintage", product_type="Ламинат",
+                        length_from=1290.0, width_from=240.0, thickness=8.0,
+                        name="Ламинат Peli Vintage Старый")]
+        plan = plan_collection(_inp(
+            tm_name="Peli", product_type="000000003", product_type_name="Ламинат",
+            collection="Vintage",
+            new_folder={"parent_ref": "YO-P", "name": "Vintage"},
+            items=[{"op": "create", "article": "VN-1", "title": "Новый",
+                    "length": 1290, "width": 190, "thickness": 8}]), current)
+        self.assertEqual(plan.ops()[0]["name"], "Vintage")
+
+
 if __name__ == "__main__":
     unittest.main()

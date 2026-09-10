@@ -29,7 +29,9 @@ from dataclasses import dataclass, field
 
 from src.price_tool import discontinued
 from src.price_tool.naming import (collection_case, drop_own_article,
-                                   ensure_type_prefix, tidy, violations)
+                                   ensure_type_prefix, folder_name, format_size,
+                                   size_in_folder, size_in_name, tidy, uniform_size,
+                                   violations)
 
 # Поля, изменение которых показывается админу и менеджерам поимённо (§19.9).
 WATCHED = ("parent_ref", "collection", "article", "unit", "pack_coefficient",
@@ -288,6 +290,13 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
         was = by_ref.get(ref) if op == "update" else None
 
         item_warnings: list[str] = []
+        # РАЗМЕР В ИМЕНИ — ТОЛЬКО У КЕРАМИКИ (§19.5). У ламината и паркета формат один на
+        # всю коллекцию: в каждой карточке он повторился бы сорок раз и не сказал бы
+        # ничего, а место ему в имени ПАПКИ. Отбрасываем молча — это правило, а не ошибка
+        # ввода, и ругаться на него в каждой позиции значит топить настоящие замечания.
+        if tail and not size_in_name(type_name, inp.get("product_type")):
+            tail = ""
+
         # СВОЙ артикул вычищаем ПОСЛЕ сборки, а не полагаемся на то, что модель не
         # передаст его в `tail`: она уже передавала, и молча.
         name = drop_own_article(
@@ -397,7 +406,9 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
     folder = inp.get("new_folder") or None
     if folder and folder.get("parent_ref"):
         folder = {"parent_ref": str(folder["parent_ref"]),
-                  "name": collection_case(folder.get("name") or collection)}
+                  "name": _folder_title(
+                      folder.get("name") or collection, type_name,
+                      inp.get("product_type"), inp, current, collection)}
     else:
         folder = None
 
@@ -483,6 +494,35 @@ def _unfilled_properties(collection: str, current: list) -> list[str]:
             + ", ".join(gaps)
             + ". У других коллекций этой марки заполнено — проверь прайс: если значение "
               "там есть, проставь его этим же вызовом."]
+
+
+def _folder_title(name, type_name: str, type_code, inp: dict, current: list,
+                  collection: str) -> str:
+    """Имя папки коллекции; у восьми напольных категорий — с размером (§19.5).
+
+    РАЗМЕР ДОПИСЫВАЕТСЯ ТОЛЬКО ПРИ ЕДИНОМ РАЗМЕРЕ ВСЕЙ КОЛЛЕКЦИИ. Папка описывает
+    коллекцию целиком, и приписать ей «1290x190x8», когда внутри два формата, значит
+    соврать в справочнике — причём соврать заметно: имя папки видно в дереве.
+
+    Размеры берём и из предложения, и из уже лежащих в 1С позиций коллекции: папку заводят
+    под новую коллекцию, но дозавести позицию в существующую тоже можно, и тогда судить по
+    одному предложению нельзя.
+    """
+    if not size_in_folder(type_name, type_code):
+        return collection_case(name)
+
+    sizes = []
+    for raw in inp.get("items") or []:
+        length, _ = _span(raw, "length")
+        width, _ = _span(raw, "width")
+        sizes.append(format_size(length, width, _num(raw.get("thickness"))))
+
+    wanted = _form(collection)
+    for item in current:
+        if _form(item.collection) == wanted and not item.not_exported:
+            sizes.append(format_size(item.length_from, item.width_from, item.thickness))
+
+    return folder_name(name, uniform_size(sizes))
 
 def _in_scope(product_type: str, scope: list[str]) -> bool:
     """Нестрогое сравнение, как в `scope.py`: «плитка» покрывает «Керамическую плитку»."""
