@@ -500,8 +500,10 @@ async def _resume_hint(store: PricingStore, user_id: int) -> str:
 
     step = next_step(run)
     where = f" с {step}" if step else ""
+    # Оговорка «если бот не перезапускали» ушла вместе с причиной: прайс лежит на сервере
+    # и поднимается при старте (§9.8). Обещаем только то, что подтверждено состоянием.
     return (f"Разбор не потерян: напишите текстом «продолжай{where}» — пойдём с той же "
-            "точки. Файл присылать заново не нужно, если бот не перезапускали.")
+            "точки. Файл присылать заново не нужно, он сохранён на сервере.")
 async def _run(message: Message, user_text: str, orchestrator, onec, store: PricingStore,
                status_msg: Message, user_id: int | None = None) -> None:
     # user_id передаётся явно, когда ход инициирует не админ, а мы сами — после нажатия

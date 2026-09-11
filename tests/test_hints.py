@@ -115,6 +115,28 @@ class ResumeHintTest(unittest.IsolatedAsyncioTestCase):
     async def test_says_the_file_need_not_be_resent(self):
         hint = await ph._resume_hint(self.store, 42)
         self.assertIn("присылать заново не нужно", hint)
+        # Оговорки про перезапуск быть не должно: прайс поднимается при старте (§9.8).
+        self.assertNotIn("перезапускали", hint)
+
+
+class ErrorTextTest(unittest.TestCase):
+    """Текст ошибки называет причину; как продолжить — дело подсказки.
+
+    Совет «пришлите файл заново» жил в сообщении о нехватке средств и пережил появление
+    сохранения прайсов на диск: в одном сообщении админ читал «пришлите заново» и тут же
+    «присылать заново не нужно».
+    """
+
+    def test_billing_message_gives_no_stale_recovery_advice(self):
+        from src.bot.errors import _BILLING
+        self.assertIn("пополните баланс", _BILLING)
+        self.assertNotIn("пришлите файл заново", _BILLING)
+
+    def test_error_and_hint_do_not_contradict(self):
+        from src.bot.errors import _BILLING
+        text, _ = ph._with_hint(_BILLING, hint="Файл присылать заново не нужно.")
+        self.assertEqual(text.count("присылать заново"), 1)
+        self.assertNotIn("пришлите файл заново", text)
 
 
 if __name__ == "__main__":

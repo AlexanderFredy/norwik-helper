@@ -23,7 +23,12 @@ class DescribeApiErrorTest(unittest.TestCase):
                          "Please go to Plans & Billing to upgrade or purchase credits.")
         text = describe_api_error(exc)
         self.assertIn("Закончились средства", text)
-        self.assertIn("пришлите файл заново", text)
+        self.assertIn("Plans & Billing", text)
+        # СОВЕТОВ ПО ВОССТАНОВЛЕНИЮ ЗДЕСЬ НЕТ. Раньше сообщение заканчивалось «пришлите
+        # файл заново»; прайсы стали сохраняться на диск, совет устарел и начал
+        # противоречить подсказке в том же сообщении. Что делать дальше, говорит
+        # `_resume_hint` — она читает состояние, а текст ошибки статичен.
+        self.assertNotIn("заново", text)
 
     def test_other_400_stays_generic(self):
         """Прочие 400 — это наша ошибка запроса, админу от текста API толку нет."""
