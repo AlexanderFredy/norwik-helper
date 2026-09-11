@@ -403,20 +403,24 @@ PRICING_TOOLS = [
     {
         "name": "find_1c_items",
         "description": (
-            "Поиск позиции ПО ВСЕЙ номенклатуре 1С — по артикулу и/или части имени, "
+            "Поиск позиций ПО ВСЕЙ номенклатуре 1С — по артикулам и/или части имени, "
             "включая СНЯТЫЕ С ПРОИЗВОДСТВА и товары ЧУЖИХ марок. "
-            "ВЫЗЫВАЙ ПЕРЕД СОЗДАНИЕМ КАЖДОЙ НОВОЙ ПОЗИЦИИ: выгрузка по ТМ показывает только "
-            "свою марку, а товар мог быть заведён раньше под другой — тогда создавать "
-            "нельзя, надо возвращать существующий (сменой папки). "
-            "Параметры: article, name (хотя бы один; article от 2 символов, name от 3), "
-            "необязательные tm и limit (по умолчанию 50). "
+            "ЗОВИ ОДИН РАЗ НА КОЛЛЕКЦИЮ, ПЕРЕДАВАЯ `articles` СПИСКОМ — все артикулы, "
+            "которые собираешься создавать. НЕ вызывай по одной позиции: каждый вызов "
+            "инструмента стоит отдельного запроса к модели со всей историей, и поштучная "
+            "проверка дороже всего прогона прайса. До 100 артикулов за раз. "
+            "Зачем: выгрузка по ТМ показывает только свою марку, а товар мог быть заведён "
+            "раньше под другой — тогда создавать нельзя, надо возвращать существующий. "
+            "Что нашлось — сопоставляй с запросом по полю `article` в ответе. "
             "Поиск по ВХОЖДЕНИЮ, лишние кандидаты — норма: отбрасывай их по имени и марке. "
             "`not_exported: true` — позиция в невыгружаемой ветке, почти наверняка снятая."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "article": {"type": "string", "description": "артикул или его часть"},
+                "articles": {"type": "array", "items": {"type": "string"},
+                             "description": "артикулы пачкой — основной способ"},
+                "article": {"type": "string", "description": "один артикул, если он один"},
                 "name": {"type": "string", "description": "часть наименования"},
                 "tm": {"type": "string", "description": "код ТМ, если надо сузить"},
                 "limit": {"type": "integer"},
@@ -1307,16 +1311,25 @@ class PricingTools:
         """
         article = (inp.get("article") or "").strip()
         name = (inp.get("name") or "").strip()
-        if not article and not name:
-            return json.dumps({"error": "Нужен article или name"}, ensure_ascii=False)
+        raw = inp.get("articles") or []
+        articles = [str(a).strip() for a in raw if str(a).strip()]
+        if not article and not name and not articles:
+            return json.dumps({"error": "Нужен articles, article или name"},
+                              ensure_ascii=False)
+
+        # Потолок держим и здесь: 1С откажет на сотне с лишним, а узнать об этом лучше до
+        # похода в неё — ответ с ошибкой стоит того же круга цикла, что и полезный.
+        if len(articles) > 100:
+            return json.dumps({"error": "Больше 100 артикулов за раз: разбейте на части",
+                               "got": len(articles)}, ensure_ascii=False)
 
         found = self._onec.find_items(
-            article=article, name=name,
+            article=article, name=name, articles=articles,
             tm=(inp.get("tm") or "").strip() or None,
             limit=int(inp.get("limit") or 50))
 
         return json.dumps({
-            "query": {"article": article, "name": name},
+            "query": {"article": article, "articles": articles, "name": name},
             "total": found.total,
             # «Не нашлось» и «не поместилось» — разные ответы, и решать по ним надо по-разному
             "truncated": found.truncated,

@@ -92,6 +92,35 @@ class ToolTest(Base):
         self.assertEqual((await self.find(article="A001"))["total"], 2)
         self.assertEqual((await self.find(article="A001", tm="T9"))["total"], 1)
 
+    async def test_batch_checks_a_whole_collection_in_one_call(self):
+        """Главная мера экономии: один вызов на коллекцию вместо одного на позицию.
+
+        Цена определяется ЧИСЛОМ вызовов, а не объёмом ответа: круг ручного цикла несёт всю
+        историю и на боевом прогоне стоил $0.097, тогда как сам ответ — $0.0002. Поштучная
+        проверка 53 позиций LINDERWOOD обошлась бы дороже всего прогона.
+        """
+        self.onec.catalogue = [found("YO-1", "Дуб Верона", article="A001"),
+                               found("YO-2", "Дуб Медовый", article="A007")]
+        out = await self.find(articles=["A001", "A002", "A003", "A007"])
+        self.assertEqual(len(self.onec.searches), 1)          # один поход в 1С
+        self.assertEqual(out["total"], 2)
+        self.assertEqual({i["article"] for i in out["items"]}, {"A001", "A007"})
+
+    async def test_batch_query_is_echoed_for_matching_up(self):
+        """Ответ должен позволять сопоставить найденное с запрошенным."""
+        out = await self.find(articles=["A001", "A002"])
+        self.assertEqual(out["query"]["articles"], ["A001", "A002"])
+
+    async def test_batch_is_capped_before_going_to_1c(self):
+        out = await self.find(articles=[f"A{i:04}" for i in range(150)])
+        self.assertIn("error", out)
+        self.assertEqual(self.onec.searches, [])
+
+    async def test_blank_entries_in_the_batch_are_ignored(self):
+        self.onec.catalogue = [found("YO-1", "Дуб", article="A001")]
+        out = await self.find(articles=["A001", "", "   "])
+        self.assertEqual(out["total"], 1)
+
     async def test_truncated_is_distinct_from_empty(self):
         """«Не нашлось» и «не поместилось» — разные ответы."""
         self.onec.catalogue = [found(f"YO-{i}", "Ламинат", article="A001")

@@ -78,19 +78,21 @@ class FakeOnec:
                            selling=t[2] if len(t) > 2 else True) for t in self.tms]
         return marks if all_marks else [m for m in marks if m.selling]
 
-    def find_items(self, article="", name="", tm=None, limit=50):
+    def find_items(self, article="", name="", tm=None, limit=50, articles=None):
         """Поиск по всей номенклатуре (§19.11) — вхождением, как в 1С.
 
         Ищет по ВСЕМУ `catalogue`, а не по `_items`: смысл инструмента как раз в том, что
-        он видит за пределами текущей марки.
+        он видит за пределами текущей марки. `article` — частный случай `articles`.
         """
         from src.onec.client import FoundItems
-        self.searches.append({"article": article, "name": name, "tm": tm})
+        self.searches.append({"article": article, "articles": list(articles or []),
+                              "name": name, "tm": tm})
+        needles = [a for a in ([article] if article else []) + list(articles or []) if a]
         hits = []
         for it in self.catalogue:
             if tm and it.tm_code != tm:
                 continue
-            if article and article.lower() in (it.article or "").lower():
+            if any(n.lower() in (it.article or "").lower() for n in needles):
                 hits.append(it)
             elif name and name.lower() in (it.name or "").lower():
                 hits.append(it)
