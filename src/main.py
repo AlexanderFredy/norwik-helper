@@ -61,6 +61,9 @@ async def main() -> None:
     orchestrator = Orchestrator(
         api_key=config.anthropic_api_key,
         executor=ToolExecutor(mail, norwik, onec=onec, pricing_store=pricing_store),
+        # Учёт расхода токенов (§9.6.3): журнал хранилища и есть приёмник. Метки к строке
+        # добавляют обработчики — только они знают, чей это вызов и по какому прайсу.
+        on_usage=pricing_store.record_usage,
     )
 
     bot = Bot(token=config.telegram_bot_token)

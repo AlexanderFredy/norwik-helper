@@ -135,7 +135,11 @@ async def _process_query(message: Message, text: str, orchestrator, status_msg,
     try:
         answer = await orchestrator.handle_query(
             text, on_tool=on_tool,
-            system=build_system_prompt(await _exclusives(pricing_store)))
+            system=build_system_prompt(await _exclusives(pricing_store)),
+            # Менеджерский запрос — вторая нагрузка после прайсовой, и шаг у неё много
+            # дешевле. Разделяем их сразу, иначе в отчёте одно растворится в другом.
+            usage_labels={"kind": "manager",
+                          "user_id": message.from_user.id if message.from_user else None})
     except Exception as exc:                           # noqa: BLE001
         logger.exception("Ошибка обработки запроса")
         await status_msg.edit_text(describe_api_error(

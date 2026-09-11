@@ -55,19 +55,50 @@ def _cached(messages: list[dict]) -> list[dict]:
 
 
 class Orchestrator:
-    def __init__(self, api_key: str, executor: ToolExecutor) -> None:
+    def __init__(self, api_key: str, executor: ToolExecutor,
+                 on_usage: Callable[[dict], Awaitable[None]] | None = None) -> None:
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
         self._executor = executor
+        # Приёмник расхода токенов (§9.6.3). Оркестратор НЕ знает про хранилище: он отдаёт
+        # голые счётчики, а метки («чей вызов», поставщик, прайс) подмешивает вызывающий —
+        # там, где этот контекст и живёт.
+        self._on_usage = on_usage
+
+    async def _record_usage(self, response, labels: dict | None, iteration: int) -> None:
+        """Снять расход одного вызова. Сбой учёта не имеет права трогать прогон.
+
+        Прайсовый прогон идёт по живой 1С и стоит дорого; потерять его из-за сбоя журнала
+        было бы обменом ценного на бесплатное.
+        """
+        if self._on_usage is None:
+            return
+        try:
+            usage = response.usage
+            await self._on_usage({
+                **(labels or {}),
+                "model": getattr(response, "model", MODEL),
+                "iteration": iteration,
+                "tools": ",".join(b.name for b in response.content
+                                  if b.type == "tool_use") or None,
+                "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+                "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+                "cache_read": getattr(usage, "cache_read_input_tokens", 0) or 0,
+                "cache_write": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+            })
+        except Exception:                                  # noqa: BLE001
+            logger.warning("Не удалось записать расход токенов", exc_info=True)
 
     async def handle_query(
         self,
         query: str,
         on_tool: Callable[[str, dict], Awaitable[None]] | None = None,
         system: str | None = None,
+        usage_labels: dict | None = None,
     ) -> str:
         """Обрабатывает один запрос менеджера и возвращает текст ответа."""
         text, _ = await self.handle_turn([{"role": "user", "content": query}],
-                                         on_tool=on_tool, system=system)
+                                         on_tool=on_tool, system=system,
+                                         usage_labels=usage_labels)
         return text
 
     async def handle_turn(
@@ -78,6 +109,7 @@ class Orchestrator:
         extra_tools: list[dict] | None = None,
         extra_executor=None,
         base_tools: bool = True,
+        usage_labels: dict | None = None,
     ) -> tuple[str, list[dict]]:
         """Ход диалога поверх истории. Возвращает (ответ, обновлённая история).
 
@@ -89,7 +121,7 @@ class Orchestrator:
         messages = list(messages)
         tools = (list(TOOL_DEFINITIONS) if base_tools else []) + list(extra_tools or [])
 
-        for _ in range(MAX_ITERATIONS):
+        for iteration in range(1, MAX_ITERATIONS + 1):
             response = await self._client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
@@ -104,6 +136,11 @@ class Orchestrator:
                 tools=tools,
                 messages=_cached(messages),
             )
+
+            # Расход снимаем ДО любых ветвлений: ниже есть и `continue` (pause_turn), и
+            # ранний `return` (refusal), и оба уже оплачены. Учёт только на успешном пути
+            # давал бы тихий и систематический недосчёт.
+            await self._record_usage(response, usage_labels, iteration)
 
             content = [b.model_dump() for b in response.content]   # для персистентности
 

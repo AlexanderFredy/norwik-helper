@@ -9,7 +9,7 @@ import io
 import re
 from pathlib import Path
 import logging
-from datetime import date
+from datetime import date, timedelta
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
@@ -20,6 +20,7 @@ from src.agent.pricing_tools import (
     PRICING_TOOLS, PricingTools, clear_nomenclature_cache, next_step, queue_tail,
 )
 from src.agent.prompts import PRICING_PROMPT
+from src.agent import usage
 from src.bot.errors import describe_api_error
 from src.price_tool.broadcast import build_broadcast, journal_rows
 from src.price_tool.item_broadcast import build_item_broadcast
@@ -363,6 +364,27 @@ async def _deliver(progress: Message, message: Message, text: str) -> None:
             logger.exception("Не доставлена часть отчёта о записи цен")
 
 
+async def _run_cost(store: PricingStore, user_id: int, run: dict | None) -> str:
+    """Строка «прогон стоил …» для итога. Пусто, если считать не из чего.
+
+    Сбой учёта не имеет права помешать завершению прогона: итог с замечаниями и
+    отложенными задачами админу нужнее, чем цифра расхода.
+    """
+    started = (run or {}).get("started_at")
+    if not started:
+        return ""
+    try:
+        rows = await store.usage_totals(since=started, user_id=user_id, kind="pricing")
+        s = usage.summarize(rows)
+        if not s["calls"]:
+            return ""
+        return (f"Прогон стоил {usage.money(s['amount'])} "
+                f"({s['calls']} обращений к модели, {s['cache_share']}% из кеша).")
+    except Exception:                                  # noqa: BLE001
+        logger.warning("Не удалось посчитать расход прогона", exc_info=True)
+        return ""
+
+
 async def _finish_run(message: Message, store: PricingStore, user_id: int,
                       force: bool = False, orchestrator=None, onec=None) -> bool:
     """Завершить прогон: отложенные замечания, итог, выход из режима прайса.
@@ -394,6 +416,11 @@ async def _finish_run(message: Message, store: PricingStore, user_id: int,
     doc = (run or {}).get("price_doc") or (run or {}).get("supplier")
     lines.append(f"Прайс «{doc}» обработан полностью." if doc
                  else "Работа с прайсом завершена.")
+    # Стоимость прогона — ДО очистки: сумма считается от `started_at`, а `clear_run` ниже
+    # прогон удаляет вместе с этой датой.
+    spent = await _run_cost(store, user_id, run)
+    if spent:
+        lines.append(spent)
     lines.append("Пришлите следующий файл, когда понадобится.")
 
     await _forget_file(store, user_id)
@@ -527,10 +554,18 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
         history = await store.load_messages(user_id)
         history.append({"role": "user", "content": user_text})
 
+        # Метки для учёта расхода (§9.6.3). Берём из прогона: по ним потом видно, во что
+        # обошёлся конкретный прайс, а не «сколько всего потрачено за день».
+        run_now = await store.get_run(user_id)
+        labels = {"kind": "pricing", "user_id": user_id,
+                  "supplier": (run_now or {}).get("supplier"),
+                  "price_doc": (run_now or {}).get("price_doc")}
+
         try:
             answer, history = await orchestrator.handle_turn(
                 history, on_tool=on_tool, system=PRICING_PROMPT,
-                extra_tools=PRICING_TOOLS, extra_executor=tools, base_tools=False)
+                extra_tools=PRICING_TOOLS, extra_executor=tools, base_tools=False,
+                usage_labels=labels)
         except Exception as exc:                       # noqa: BLE001
             logger.exception("Ошибка обработки прайса")
             # ХОД НЕ СОХРАНЁН — `save_messages` ниже, сюда мы до него не дошли. Значит
@@ -836,6 +871,66 @@ async def cmd_mode(message: Message, command: CommandObject, pricing_store: Pric
     elif picked == modes.ITEMS_ONLY:
         note = "\nПредложений по ценам и кнопки записи в 1С не будет."
     await message.answer(f"Режим: {modes.title(picked)}.{note}")
+
+
+@router.message(Command("tokens"))
+async def cmd_tokens(message: Message, pricing_store: PricingStore, is_admin: bool) -> None:
+    """Расход на обращения к модели (§9.6.3).
+
+    Три разреза, и каждый отвечает на свой вопрос: сегодня — «сколько уходит сейчас»,
+    неделя — «на что это похоже вообще», текущий прогон — «во что обходится ЭТОТ прайс».
+    Разбивка по нагрузкам показывает главное: прайсовый шаг дороже менеджерского на
+    порядки, и складывать их в одно число бессмысленно.
+    """
+    if not is_admin:
+        await message.answer("Команда доступна только администратору.")
+        return
+
+    today = date.today().isoformat()
+    week = (date.today() - timedelta(days=6)).isoformat()
+
+    blocks = [usage.render_block("За сегодня", await pricing_store.usage_totals(since=today)),
+              usage.render_block("За 7 дней", await pricing_store.usage_totals(since=week))]
+
+    for kind, title in (("pricing", "прайсы"), ("manager", "запросы менеджеров")):
+        rows = await pricing_store.usage_totals(since=week, kind=kind)
+        if usage.summarize(rows)["calls"]:
+            blocks.append(usage.render_block(f"  из них {title}", rows))
+
+    run = await pricing_store.get_run(message.from_user.id)
+    if run and run.get("started_at"):
+        doc = run.get("price_doc") or run.get("supplier") or "текущий прайс"
+        blocks.append(usage.render_block(
+            f"Прогон «{doc}»",
+            await pricing_store.usage_totals(since=run["started_at"],
+                                             user_id=message.from_user.id,
+                                             kind="pricing")))
+
+    top = await _top_tools(pricing_store, week)
+    if top:
+        blocks.append("Дороже всего за неделю:\n" + top)
+
+    blocks.append("Тарифы — снимок на сентябрь 2026; кеш-запись считается по часовому "
+                  "тарифу (×2), чтение — ×0.1.")
+    await message.answer("\n\n".join(blocks))
+
+
+async def _top_tools(store: PricingStore, since: str, limit: int = 5) -> str:
+    """Во что обошлись инструменты. Сворачиваем по имени: одна строка журнала может
+    содержать несколько инструментов, но в подавляющем большинстве ответов он один."""
+    by_name: dict[str, float] = {}
+    calls: dict[str, int] = {}
+    for row in await store.usage_by_tool(since=since):
+        amount = usage.cost(row["model"], row["input_tokens"], row["output_tokens"],
+                            row["cache_read"], row["cache_write"])
+        if amount is None:
+            continue
+        name = row["tools"]
+        by_name[name] = by_name.get(name, 0.0) + amount
+        calls[name] = calls.get(name, 0) + row["calls"]
+    top = sorted(by_name.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+    return "\n".join(f"  {name} — {usage.money(amount)} ({calls[name]})"
+                     for name, amount in top)
 
 
 @router.message(Command("categories"))

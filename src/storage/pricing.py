@@ -198,6 +198,27 @@ CREATE TABLE IF NOT EXISTS price_writes (
 );
 CREATE INDEX IF NOT EXISTS ix_price_writes_item ON price_writes (item_ref, written_on);
 CREATE INDEX IF NOT EXISTS ix_price_writes_day ON price_writes (written_on);
+-- Расход токенов (§9.6.3). Строка на КАЖДЫЙ вызов API, не на ход диалога: ход — это
+-- десятки вызовов, и на его уровне вопрос «какой шаг дороже» просто не задаётся.
+-- Храним ТОЛЬКО счётчики. Доллары считает src/agent/usage.py при показе: тариф меняется,
+-- и записанная цена задним числом исказила бы историю.
+CREATE TABLE IF NOT EXISTS token_usage (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at    TEXT NOT NULL,
+    user_id       INTEGER,
+    kind          TEXT NOT NULL,     -- manager | pricing: две нагрузки с разной ценой шага
+    model         TEXT NOT NULL,
+    effort        TEXT,              -- NULL, пока не задаём: значит умолчание API
+    iteration     INTEGER,           -- шаг ручного цикла: виден разогнавшийся прогон
+    tools         TEXT,              -- инструменты из ответа: за что заплачено
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read    INTEGER NOT NULL DEFAULT 0,
+    cache_write   INTEGER NOT NULL DEFAULT 0,
+    supplier      TEXT,
+    price_doc     TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_token_usage_day ON token_usage (created_at);
 -- Заявки поставщиков об эксклюзиве (§9.5). Пишутся при КАЖДОМ разборе прайса, в т.ч.
 -- отклонённого: «эксклюзив» — факт из прайса, а не следствие решения о записи цен.
 -- Никогда не перезаписываются: действующая пометка выводится из них (price_tool/exclusive).
@@ -638,8 +659,8 @@ class PricingStore:
         """{supplier, price_doc, planned, done, remaining} либо None."""
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT supplier, price_doc, planned, done, notes, stage, price_date "
-                "FROM price_run WHERE user_id = ?", (user_id,))
+                "SELECT supplier, price_doc, planned, done, notes, stage, price_date, "
+                "started_at FROM price_run WHERE user_id = ?", (user_id,))
             row = await cur.fetchone()
         if not row:
             return None
@@ -649,9 +670,11 @@ class PricingStore:
             stage_done = set(stage.get("done") or [])
             stage["remaining"] = [c for c in stage.get("planned") or []
                                   if c.get("ref") not in stage_done]
+        # started_at — граница суммирования расхода по прогону (§9.6.3): «сколько стоил
+        # ЭТОТ прайс» считается по строкам журнала не раньше этой даты.
         return {"supplier": row[0], "price_doc": row[1], "price_date": row[6],
                 "planned": planned, "done": done, "notes": json.loads(row[4] or "[]"),
-                "stage": stage,
+                "stage": stage, "started_at": row[7],
                 "remaining": [t for t in planned if t.get("code") not in done]}
 
     # --------------------------------------- очередь коллекций внутри марки (§9.6.2)
@@ -903,6 +926,80 @@ class PricingStore:
             cur = await db.execute("SELECT key FROM items_checked WHERE user_id = ?",
                                    (user_id,))
             return {row[0] for row in await cur.fetchall()}
+
+    # ------------------------------------------ расход токенов (§9.6.3)
+
+    async def record_usage(self, row: dict) -> None:
+        """Записать расход одного вызова API.
+
+        Вызывается из горячего пути прайсового прогона, поэтому ничего не проверяет и
+        ничего не возвращает: разбираться с числами — дело показа, а не записи.
+        """
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO token_usage (created_at, user_id, kind, model, effort, "
+                "iteration, tools, input_tokens, output_tokens, cache_read, cache_write, "
+                "supplier, price_doc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (_now(), row.get("user_id"), row.get("kind") or "manager",
+                 row.get("model") or "", row.get("effort"), row.get("iteration"),
+                 row.get("tools"), int(row.get("input_tokens") or 0),
+                 int(row.get("output_tokens") or 0), int(row.get("cache_read") or 0),
+                 int(row.get("cache_write") or 0), row.get("supplier"),
+                 row.get("price_doc")))
+            await db.commit()
+
+    async def usage_totals(self, since: str | None = None, user_id: int | None = None,
+                           kind: str | None = None) -> list[dict]:
+        """Суммы расхода, СГРУППИРОВАННЫЕ ПО МОДЕЛИ.
+
+        Группировка обязательна: за период моделей может быть несколько, а тариф у них
+        разный — один общий множитель дал бы неверный итог.
+        """
+        where, params = [], []
+        if since:
+            where.append("created_at >= ?")
+            params.append(since)
+        if user_id is not None:
+            where.append("user_id = ?")
+            params.append(user_id)
+        if kind:
+            where.append("kind = ?")
+            params.append(kind)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT model, COUNT(*), SUM(input_tokens), SUM(output_tokens), "
+                "SUM(cache_read), SUM(cache_write) FROM token_usage"
+                + clause + " GROUP BY model", params)
+            rows = await cur.fetchall()
+        return [{"model": r[0], "calls": r[1], "input_tokens": r[2] or 0,
+                 "output_tokens": r[3] or 0, "cache_read": r[4] or 0,
+                 "cache_write": r[5] or 0} for r in rows]
+
+    async def usage_by_tool(self, since: str | None = None,
+                            user_id: int | None = None) -> list[dict]:
+        """Расход в разрезе инструментов — чтобы увидеть, какой шаг тянет деньги.
+
+        Группируем по паре (модель, инструменты): без модели стоимость не посчитать, а
+        строка инструментов берётся как есть — в подавляющем большинстве ответов там один
+        инструмент, и разбирать её на части значило бы приписывать каждому долю наугад.
+        """
+        where, params = ["tools IS NOT NULL", "tools <> ''"], []
+        if since:
+            where.append("created_at >= ?")
+            params.append(since)
+        if user_id is not None:
+            where.append("user_id = ?")
+            params.append(user_id)
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT tools, model, COUNT(*), SUM(input_tokens), SUM(output_tokens), "
+                "SUM(cache_read), SUM(cache_write) FROM token_usage WHERE "
+                + " AND ".join(where) + " GROUP BY tools, model", params)
+            rows = await cur.fetchall()
+        return [{"tools": r[0], "model": r[1], "calls": r[2], "input_tokens": r[3] or 0,
+                 "output_tokens": r[4] or 0, "cache_read": r[5] or 0,
+                 "cache_write": r[6] or 0} for r in rows]
 
     # -------------------------------------------------- настройки (§5.2)
 
