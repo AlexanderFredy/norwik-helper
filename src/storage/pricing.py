@@ -63,6 +63,8 @@ CREATE TABLE IF NOT EXISTS active_price (
     user_id    INTEGER PRIMARY KEY,
     filename   TEXT NOT NULL,
     path       TEXT NOT NULL,       -- файл рядом с базой, как у отложенных задач
+    key        TEXT,                -- тот же ключ, что в очереди: «это тот же прайс»
+    price_date TEXT,
     saved_at   TEXT NOT NULL
 );
 
@@ -83,9 +85,11 @@ CREATE TABLE IF NOT EXISTS price_queue (
     user_id  INTEGER NOT NULL,
     filename TEXT NOT NULL,
     path     TEXT NOT NULL,
-    key      TEXT NOT NULL,
-    source   TEXT NOT NULL DEFAULT 'telegram',   -- telegram | mail
-    added_at TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    source      TEXT NOT NULL DEFAULT 'telegram',   -- telegram | mail
+    price_date  TEXT,        -- дата САМОГО прайса: из имени файла, позже — из шапки
+    received_at TEXT,        -- когда файл пришёл: дата письма либо момент получения
+    added_at    TEXT NOT NULL,
     UNIQUE (user_id, key)
 );
 
@@ -262,6 +266,15 @@ class PricingStore:
             columns = {row[1] for row in await cur.fetchall()}
             if "digest" not in columns:
                 await db.execute("ALTER TABLE pending_proposal ADD COLUMN digest TEXT")
+            for table, extra in (("active_price", ("key", "price_date")),
+                                 ("price_queue", ("price_date", "received_at"))):
+                cur = await db.execute(f"PRAGMA table_info({table})")
+                have = {row[1] for row in await cur.fetchall()}
+                for column in extra:
+                    if have and column not in have:
+                        await db.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+
             if "kind" not in columns:
                 # ПРЕДМЕТ ЗАПИСИ, а не её вид: 'prices' уходит в set-prices, 'items' — в
                 # set-items. Одно поле вместо второй таблицы потому, что предложения
@@ -723,22 +736,27 @@ class PricingStore:
 
     # ------------------------------------------------- активный прайс (§9.7)
 
-    async def set_active_price(self, user_id: int, filename: str, path: str) -> None:
+    async def set_active_price(self, user_id: int, filename: str, path: str,
+                               key: str | None = None,
+                               price_date: str | None = None) -> None:
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "INSERT INTO active_price (user_id, filename, path, saved_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+                "INSERT INTO active_price (user_id, filename, path, key, price_date, "
+                "saved_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
                 "filename = excluded.filename, path = excluded.path, "
+                "key = excluded.key, price_date = excluded.price_date, "
                 "saved_at = excluded.saved_at",
-                (user_id, filename, str(path), _now()))
+                (user_id, filename, str(path), key, price_date, _now()))
             await db.commit()
 
     async def get_active_price(self, user_id: int) -> dict | None:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT filename, path FROM active_price WHERE user_id = ?", (user_id,))
+                "SELECT filename, path, key, price_date FROM active_price "
+                "WHERE user_id = ?", (user_id,))
             row = await cur.fetchone()
-        return {"filename": row[0], "path": row[1]} if row else None
+        return {"filename": row[0], "path": row[1], "key": row[2],
+                "price_date": row[3]} if row else None
 
     async def list_active_prices(self) -> list[dict]:
         """Все активные прайсы — читается один раз при старте бота."""
@@ -746,6 +764,15 @@ class PricingStore:
             cur = await db.execute("SELECT user_id, filename, path FROM active_price")
             rows = await cur.fetchall()
         return [{"user_id": r[0], "filename": r[1], "path": r[2]} for r in rows]
+
+    async def known_price_paths(self) -> set[str]:
+        """Все пути, на которые кто-то ссылается, — для уборки сирот при старте (§9.8)."""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT file_path FROM deferred_tasks WHERE file_path IS NOT NULL "
+                "UNION SELECT path FROM active_price "
+                "UNION SELECT path FROM price_queue")
+            return {row[0] for row in await cur.fetchall() if row[0]}
 
     async def price_file_in_use(self, path: str) -> bool:
         """Ссылается ли на файл ещё кто-нибудь — отложенная задача или другой админ.
@@ -779,32 +806,44 @@ class PricingStore:
     # ------------------------------------------------- очередь прайсов (§9.8)
 
     async def enqueue_price(self, user_id: int, filename: str, path: str, key: str,
-                            source: str = "telegram") -> dict:
+                            source: str = "telegram", price_date: str | None = None,
+                            received_at: str | None = None) -> dict:
         """Поставить прайс в очередь. Тот же `key` — замена, а не второй экземпляр.
 
-        Возвращает `{"status": "queued"|"replaced", "old_path": …}`: путь прежней версии
-        отдаётся наружу, потому что удалять файл здесь нельзя — на него может ссылаться
-        отложенная задача (§9.7).
+        Заменяем, ТОЛЬКО ЕСЛИ пришедший свежее (§9.8): повторно присланный старый файл не
+        должен вытеснять из очереди более новую версию. Сравнение — `freshness.is_newer`.
+
+        Возвращает `{"status": "queued"|"replaced"|"kept", "old_path": …}`: путь прежней
+        версии отдаётся наружу, потому что удалять файл здесь нельзя — на него может
+        ссылаться отложенная задача (§9.7).
         """
+        from src.price_tool.freshness import is_newer
+
+        seen = received_at or _now()
+
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT id, path FROM price_queue WHERE user_id = ? AND key = ?",
-                (user_id, key))
+                "SELECT id, path, price_date, received_at FROM price_queue "
+                "WHERE user_id = ? AND key = ?", (user_id, key))
             row = await cur.fetchone()
 
             if row:
+                existing = {"price_date": row[2], "received_at": row[3]}
+                if not is_newer({"price_date": price_date, "received_at": seen}, existing):
+                    return {"status": "kept", "old_path": str(path)}
+
                 await db.execute(
                     "UPDATE price_queue SET filename = ?, path = ?, source = ?, "
-                    "added_at = ? WHERE id = ?",
-                    (filename, str(path), source, _now(), row[0]))
+                    "price_date = ?, received_at = ?, added_at = ? WHERE id = ?",
+                    (filename, str(path), source, price_date, seen, _now(), row[0]))
                 await db.commit()
                 return {"status": "replaced",
                         "old_path": row[1] if row[1] != str(path) else None}
 
             await db.execute(
-                "INSERT INTO price_queue (user_id, filename, path, key, source, added_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, filename, str(path), key, source, _now()))
+                "INSERT INTO price_queue (user_id, filename, path, key, source, "
+                "price_date, received_at, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, filename, str(path), key, source, price_date, seen, _now()))
             await db.commit()
             return {"status": "queued", "old_path": None}
 
@@ -812,11 +851,12 @@ class PricingStore:
         """Очередь в порядке поступления."""
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT id, filename, path, source, added_at FROM price_queue "
-                "WHERE user_id = ? ORDER BY id", (user_id,))
+                "SELECT id, filename, path, source, added_at, key, price_date, "
+                "received_at FROM price_queue WHERE user_id = ? ORDER BY id", (user_id,))
             rows = await cur.fetchall()
         return [{"id": r[0], "filename": r[1], "path": r[2], "source": r[3],
-                 "added_at": r[4]} for r in rows]
+                 "added_at": r[4], "key": r[5], "price_date": r[6],
+                 "received_at": r[7]} for r in rows]
 
     async def take_next_price(self, user_id: int) -> dict | None:
         """Взять из очереди самый ранний прайс и убрать его оттуда."""

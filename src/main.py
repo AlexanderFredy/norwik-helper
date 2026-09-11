@@ -7,6 +7,7 @@ from aiogram import Bot, Dispatcher
 from src.agent.orchestrator import Orchestrator
 from src.agent.tools import ToolExecutor
 from src.bot import pricing_handlers
+from src.storage import price_files
 from src.bot.auth import AuthMiddleware
 from src.bot.commands import setup_bot_commands
 from src.bot.handlers import router
@@ -40,6 +41,11 @@ async def main() -> None:
     restored = await pricing_handlers.restore_active_prices(pricing_store)
     if restored:
         logger.info("Возобновлены прайсы в работе: %d", restored)
+
+    # Файл пишется на диск раньше строки в базе, и падение между этими шагами оставляет
+    # сироту. Чистим ТОЛЬКО здесь: пока бот работает, файл может быть создан секунду назад
+    # и ещё не попасть в базу — гонка, в которой мы стёрли бы нужное (§9.8).
+    price_files.sweep(config.db_path, await pricing_store.known_price_paths())
 
     onec = None
     if config.onec_base_url and config.onec_token:

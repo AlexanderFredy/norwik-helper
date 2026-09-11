@@ -26,7 +26,9 @@ from src.price_tool.item_broadcast import build_item_broadcast
 from src.price_tool import modes
 from src.price_tool.exclusive import resolve
 from src.price_tool.history import LABELS
+from src.price_tool.freshness import date_from_name, human_date
 from src.price_tool.parser import parse_price_table
+from src.price_tool.scope import normalize
 from src.price_tool.signature import price_signature
 from src.storage import price_files
 from src.storage.pricing import PricingStore
@@ -109,6 +111,42 @@ async def _in_stage(store: PricingStore, user_id: int) -> bool:
 
 _DIGITS = re.compile(r"\d+")
 
+async def _fresher_notice(store: PricingStore, user_id: int) -> str:
+    """«ПОЯВИЛСЯ НОВЫЙ ПРАЙС от дд.мм.гг» — если в очередь встал прайс того же поставщика.
+
+    Админ может разбирать прайс не один час, и всё это время он может быть уже неактуален.
+    Знать об этом лучше СРАЗУ: одно дело — доспорить про фаску в устаревшем файле, другое —
+    закрыть его и взять свежий.
+
+    «Тот же поставщик» опознаётся двумя способами. Надёжный — совпадение ключа с активным
+    прайсом: это буквально новая версия того, что сейчас в работе. Дополнительный — имя
+    поставщика из плана прогона встречается в имени нового файла: так ловится другой прайс
+    того же поставщика, у которого скелет иной.
+    """
+    active = await store.get_active_price(user_id)
+    if not active:
+        return ""
+
+    waiting = await store.list_queue(user_id)
+    if not waiting:
+        return ""
+
+    run = await store.get_run(user_id)
+    supplier = normalize(str((run or {}).get("supplier") or ""))
+
+    for row in waiting:
+        same = bool(active.get("key")) and row.get("key") == active.get("key")
+        if not same and supplier and len(supplier) > 3:
+            same = supplier in normalize(row.get("filename") or "")
+        if same:
+            when = human_date(row)
+            return ("ПОЯВИЛСЯ НОВЫЙ ПРАЙС" + (f" от {when}" if when else "")
+                    + f" — «{row['filename']}». Он уже в очереди; текущий разбор можно "
+                      "закончить или прекратить командой /cancel_price.")
+
+    return ""
+
+
 def price_key(filename: str, content: bytes) -> str:
     """Ключ «это тот же прайс, только свежее» (§9.8).
 
@@ -132,7 +170,8 @@ def price_key(filename: str, content: bytes) -> str:
 
 
 async def _enqueue(store: PricingStore, user_id: int, filename: str,
-                   content: bytes, source: str = "telegram") -> str:
+                   content: bytes, source: str = "telegram",
+                   received_at: str | None = None) -> str:
     """Поставить прайс в очередь за тем, что уже в работе. Текст ответа админу."""
     path = price_files.save(store.db_path, filename, content)
     if not path:
@@ -140,7 +179,9 @@ async def _enqueue(store: PricingStore, user_id: int, filename: str,
                 "пришлите этот файл заново, когда текущий будет обработан.")
 
     result = await store.enqueue_price(user_id, filename, str(path),
-                                       price_key(filename, content), source)
+                                       price_key(filename, content), source,
+                                       price_date=date_from_name(filename),
+                                       received_at=received_at)
     old = result.get("old_path")
     if old and not await store.price_file_in_use(old):
         price_files.forget([old])
@@ -149,6 +190,9 @@ async def _enqueue(store: PricingStore, user_id: int, filename: str,
     active = await store.get_active_price(user_id)
     now = f"Сейчас в работе «{active['filename']}»." if active else ""
 
+    if result["status"] == "kept":
+        return (f"Прайс «{filename}» старее того, что уже стоит в очереди, — оставил "
+                f"более свежий. {now} В очереди: {waiting}.").strip()
     if result["status"] == "replaced":
         return (f"Прайс «{filename}» заменил в очереди прежнюю версию — разбирать будем "
                 f"свежую. {now} В очереди: {waiting}.").strip()
@@ -186,7 +230,9 @@ async def _remember_file(store: PricingStore, user_id: int, filename: str,
     _files[user_id] = (filename, content)
     path = price_files.save(store.db_path, filename, content)
     if path:
-        await store.set_active_price(user_id, filename, str(path))
+        await store.set_active_price(user_id, filename, str(path),
+                                     key=price_key(filename, content),
+                                     price_date=date_from_name(filename))
     else:
         # Записать не вышло — работаем как раньше, из памяти. Разбор из-за этого срывать
         # незачем: рестарт всего лишь вернёт прежнее поведение.
@@ -240,29 +286,40 @@ def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-def _with_hint(text: str, hint: str) -> tuple[str, list | None]:
-    """Текст с курсивной подсказкой в конце. Пустая подсказка ничего не меняет."""
-    if not hint:
-        return text, None
-    body = text.rstrip()
-    full = f"{body}\n\n{hint}"
-    return full, [MessageEntity(type="italic",
-                                offset=_utf16_len(full) - _utf16_len(hint),
-                                length=_utf16_len(hint))]
+def _with_hint(text: str, hint: str = "", notice: str = "") -> tuple[str, list | None]:
+    """Текст с хвостами: жирное уведомление и курсивная подсказка.
+
+    Порядок именно такой: уведомление — новость («появился новый прайс»), подсказка —
+    инструкция. Новость важнее, поэтому стоит выше и набрана жирным.
+    """
+    full = text.rstrip()
+    entities: list[MessageEntity] = []
+
+    for piece, style in ((notice, "bold"), (hint, "italic")):
+        if not piece:
+            continue
+        full = f"{full}\n\n{piece}" if full else piece
+        entities.append(MessageEntity(type=style,
+                                      offset=_utf16_len(full) - _utf16_len(piece),
+                                      length=_utf16_len(piece)))
+
+    return full, entities or None
 
 
-async def _send(message: Message, text: str, markup=None, hint: str = "") -> None:
+async def _send(message: Message, text: str, markup=None, hint: str = "",
+                notice: str = "") -> None:
     parts = _chunks(text)
+    tail_len = len(hint) + len(notice) + 4
     for i, chunk in enumerate(parts):
         last = i == len(parts) - 1
         entities = None
-        if last and hint:
-            if len(chunk) + len(hint) + 2 <= 4096:
-                chunk, entities = _with_hint(chunk, hint)
+        if last and (hint or notice):
+            if len(chunk) + tail_len <= 4096:
+                chunk, entities = _with_hint(chunk, hint, notice)
             else:
-                # Подсказка не влезла — уходит отдельным сообщением, но не теряется.
+                # Хвост не влез — уходит отдельным сообщением, но не теряется.
                 await message.answer(chunk, reply_markup=markup)
-                tail, tail_entities = _with_hint("", hint)
+                tail, tail_entities = _with_hint("", hint, notice)
                 await message.answer(tail.strip(), entities=tail_entities)
                 return
         # `entities` передаём ТОЛЬКО когда они есть: без подсказки вызов должен остаться
@@ -498,6 +555,10 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
         # кодом, и переписывание его моделью стоило ~2 000 выходных токенов на шаг, а
         # заодно теряло строки. Ответ модели добавляем, только если она сказала что-то
         # своё — вопрос или замечание сверх предложения.
+        # Плашку считаем ОДИН раз на ход и вешаем на любой ответ по прайсу — и на
+        # предложение с кнопкой, и на обычную реплику: пропустить новость об устаревшем
+        # прайсе хуже, чем показать её лишний раз.
+        notice = await _fresher_notice(store, user_id)
         hint = ""
         if pending and tools.last_summary:
             extra = (answer or "").strip()
@@ -512,7 +573,7 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
                         "пересоберётся с учётом ответа, и кнопка появится новая.")
         else:
             text = answer
-        await _send(message, text, markup, hint=hint)
+        await _send(message, text, markup, hint=hint, notice=notice)
         if pending is not None:
             return                       # ждём кнопку админа
 

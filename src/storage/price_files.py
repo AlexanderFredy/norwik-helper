@@ -73,3 +73,32 @@ def forget(paths) -> int:
         except OSError:
             logger.warning("Не удалось удалить сохранённый прайс %s", path, exc_info=True)
     return removed
+
+
+def sweep(db_path, known) -> int:
+    """Удалить прайсы, на которые больше никто не ссылается (§9.8).
+
+    Файл пишется на диск раньше, чем строка в базе, — между этими шагами процесс может
+    упасть, и останется сирота. По одному такому файлу беда невелика, но за месяцы работы
+    каталог вырастет на десятки мегабайт, и понять, что там лишнее, будет уже нельзя.
+
+    Чистим ТОЛЬКО при старте и ТОЛЬКО свой каталог: пока бот работает, файл может быть
+    создан секунду назад и ещё не попасть в базу — гонка, в которой мы стёрли бы нужное.
+    """
+    folder = _dir(Path(db_path))
+    if not folder.is_dir():
+        return 0
+
+    keep = {str(Path(p).resolve()) for p in known or () if p}
+    removed = 0
+    for file in folder.iterdir():
+        try:
+            if file.is_file() and str(file.resolve()) not in keep:
+                file.unlink()
+                removed += 1
+        except OSError:
+            logger.warning("Не удалось убрать осиротевший прайс %s", file, exc_info=True)
+
+    if removed:
+        logger.info("Убрано осиротевших прайсов: %d", removed)
+    return removed
