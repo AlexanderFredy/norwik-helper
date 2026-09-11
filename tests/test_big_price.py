@@ -100,11 +100,11 @@ class FakeChat:
     def __init__(self):
         self.sent: list[str] = []
 
-    async def answer(self, text, reply_markup=None):
+    async def answer(self, text, reply_markup=None, entities=None, parse_mode=None):
         self.sent.append(text)
         return self
 
-    async def edit_text(self, text, reply_markup=None):
+    async def edit_text(self, text, reply_markup=None, entities=None):
         self.sent.append(text)
 
     async def delete(self):
@@ -163,6 +163,9 @@ class AutoAdvanceTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Перехожу к Ceracasa", text)
         self.assertIn("Перехожу к Imola", text)
         self.assertIn("Прайс «Price.xls» обработан полностью", text)
+        # Очередь прошла сама, но закрытие теперь за админом (§9.9)
+        self.assertIn("Закончить работу с этим прайсом?", text)
+        await ph._finish_run(chat, self.store, 42, force=True, confirmed=True)
         self.assertIsNone(await self.store.get_run(42))     # прогон закрыт
         self.assertNotIn(42, ph._files)
 

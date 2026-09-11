@@ -63,6 +63,16 @@ _STATUS = {
 _files: dict[int, tuple[str, bytes]] = {}
 
 
+def _close_keyboard() -> InlineKeyboardMarkup:
+    """Одна кнопка под вопросом «Закончить работу с этим прайсом?» (§9.9).
+
+    Кнопки «Нет» намеренно нет: «нет» — это не решение, а продолжение работы, и выражается
+    оно текстом следующей задачи. Лишняя кнопка требовала бы от админа отвечать дважды.
+    """
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да", callback_data="price:close:0")]])
+
+
 def _keyboard(proposal_id: int, in_stage: bool = False) -> InlineKeyboardMarkup:
     """Кнопки под предложением (§9.7).
 
@@ -386,7 +396,8 @@ async def _run_cost(store: PricingStore, user_id: int, run: dict | None) -> str:
 
 
 async def _finish_run(message: Message, store: PricingStore, user_id: int,
-                      force: bool = False, orchestrator=None, onec=None) -> bool:
+                      force: bool = False, orchestrator=None, onec=None,
+                      confirmed: bool = False, quiet: bool = False) -> bool:
     """Завершить прогон: отложенные замечания, итог, выход из режима прайса.
 
     Один выход на оба пути — и когда последняя марка записана кнопкой, и когда по ней
@@ -395,6 +406,11 @@ async def _finish_run(message: Message, store: PricingStore, user_id: int,
 
     `force` — для пути кнопки: там прогон мог не начинаться вовсе (однобрендовый прайс),
     но выйти из режима всё равно надо.
+
+    `confirmed` — админ нажал «Да» (§9.9). БЕЗ НЕГО ПРОГОН НЕ ЗАКРЫВАЕТСЯ: разобрать план
+    до конца и закончить работу с прайсом — разные события. У админа могут остаться задачи
+    по тому же файлу (завести марку, дозаполнить коллекцию), а закрытие стирает и файл, и
+    историю диалога — вернуться к ним будет уже неоткуда.
     """
     run = await store.get_run(user_id)
     if run is not None and run["remaining"]:
@@ -402,30 +418,53 @@ async def _finish_run(message: Message, store: PricingStore, user_id: int,
     if run is None and not force:
         return False
 
-    lines: list[str] = []
-    if run and run.get("notes"):
-        lines.append("Осталось за рамками разбора:")
-        lines += [f"— {n}" for n in run["notes"]]
-        lines.append("")
-    deferred = await store.list_deferred(user_id)
-    if deferred:
-        lines.append("Отложено, вернуться позже:")
-        lines += [f"— {_deferred_title(t)}" for t in deferred]
-        lines.append("Список: /deferred — там же как продолжить.")
-        lines.append("")
     doc = (run or {}).get("price_doc") or (run or {}).get("supplier")
-    lines.append(f"Прайс «{doc}» обработан полностью." if doc
-                 else "Работа с прайсом завершена.")
-    # Стоимость прогона — ДО очистки: сумма считается от `started_at`, а `clear_run` ниже
-    # прогон удаляет вместе с этой датой.
-    spent = await _run_cost(store, user_id, run)
-    if spent:
-        lines.append(spent)
-    lines.append("Пришлите следующий файл, когда понадобится.")
+
+    # РАЗБОР ЗАКОНЧЕН, НО РАБОТА — НЕТ. Сводка и вопрос показываются ЗДЕСЬ И ОДИН РАЗ;
+    # на подтверждении её печатать заново нельзя — она уже висит в чате выше (§9.9).
+    if not confirmed:
+        lines: list[str] = []
+        if run and run.get("notes"):
+            lines.append("Осталось за рамками разбора:")
+            lines += [f"— {n}" for n in run["notes"]]
+            lines.append("")
+        deferred = await store.list_deferred(user_id)
+        if deferred:
+            lines.append("Отложено, вернуться позже:")
+            lines += [f"— {_deferred_title(t)}" for t in deferred]
+            lines.append("Список: /deferred — там же как продолжить.")
+            lines.append("")
+        lines.append(f"Прайс «{doc}» обработан полностью." if doc
+                     else "Работа с прайсом завершена.")
+        # Стоимость — пока прогон жив: сумма считается от `started_at`, а `clear_run`
+        # (ниже, уже на подтверждении) удаляет прогон вместе с этой датой.
+        spent = await _run_cost(store, user_id, run)
+        if spent:
+            lines.append(spent)
+        lines.append("")
+        lines.append("Закончить работу с этим прайсом? "
+                     "Если есть ещё задачи по этому прайсу — напишите.")
+
+        await store.set_awaiting_close(user_id, True)
+        await _send(message, "\n".join(lines), _close_keyboard(),
+                    hint="Нажмите «Да», когда всё. Пока не нажали — файл и история "
+                         "остаются, можно просто написать следующую задачу.")
+        return False
+
+    lines = [f"Работа с прайсом «{doc}» закончена." if doc
+             else "Работа с прайсом закончена.",
+             "Пришлите следующий файл, когда понадобится."]
 
     await _forget_file(store, user_id)
     await store.reset(user_id)
     await store.clear_run(user_id)
+
+    # Закрытие ради нового файла: очередь не трогаем и «пришлите следующий» не говорим —
+    # его только что прислали, а очередь разберётся, когда дойдёт до неё (§9.9).
+    if quiet:
+        await _send(message, f"Прежний прайс «{doc}» закрываю — взялся за новый."
+                    if doc else "Прежний прайс закрываю — взялся за новый.")
+        return True
 
     # ОЧЕРЕДЬ ДВИГАЕТСЯ САМА (§9.8). Пока админ разбирал этот прайс, могли прийти другие;
     # просить «пришлите следующий файл», когда файл уже лежит на сервере, — лишний шаг.
@@ -537,6 +576,10 @@ async def _run(message: Message, user_text: str, orchestrator, onec, store: Pric
     # кнопки (§9.6): там `message` это сообщение БОТА, и from_user в нём — бот, а не админ
     if user_id is None:
         user_id = message.from_user.id
+
+    # Пошла новая работа по прайсу — значит прежний вопрос «закончить?» снят и в конце его
+    # надо задать заново (§9.9). Иначе после доп. задачи прогон закрылся бы молча.
+    await store.set_awaiting_close(user_id, False)
 
     for _ in range(MAX_AUTO_STEPS):
         tools = PricingTools(onec, store, user_id)
@@ -662,9 +705,19 @@ async def handle_price_document(message: Message, orchestrator, onec, pricing_st
     await message.bot.download_file(file_info.file_path, destination=buf)
     user_id = message.from_user.id
 
+    # Прежний прайс разобран и ждал только «Да» — новый файл и есть ответ (§9.9). Закрываем
+    # старый сами: держать его дальше незачем, а в очередь он отправил бы новый файл ждать
+    # кнопки, которую админ уже не нажмёт. Прайс В РАБОТЕ так не вытесняется — он уходит в
+    # очередь, как и прежде (§9.8).
+    active = await pricing_store.get_active_price(user_id)
+    if active and active.get("awaiting_close"):
+        await _finish_run(message, pricing_store, user_id, force=True, confirmed=True,
+                          quiet=True)
+        active = None
+
     # ЗАНЯТО — В ОЧЕРЕДЬ, А НЕ ВМЕСТО. Прежде новый файл затирал текущий вместе с диалогом
     # и планом: недоразобранный прайс исчезал молча (§9.8).
-    if user_id in _files or await pricing_store.get_active_price(user_id):
+    if user_id in _files or active:
         await status_msg.edit_text(
             await _enqueue(pricing_store, user_id, doc.file_name, buf.getvalue()))
         return
@@ -1247,6 +1300,15 @@ async def handle_price_decision(callback: CallbackQuery, onec, pricing_store: Pr
     user_id = callback.from_user.id
     if not is_admin:
         await callback.answer("Только администратор", show_alert=True)
+        return
+
+    if action == "close":
+        # «Да» под вопросом о завершении (§9.9). Здесь прогон закрывается по-настоящему:
+        # чистится файл, история, кеши — и очередь двигается дальше.
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("Закрываю прайс")
+        await _finish_run(callback.message, pricing_store, user_id, force=True,
+                          orchestrator=orchestrator, onec=onec, confirmed=True)
         return
 
     if action in ("skip", "defer", "defer_tm"):

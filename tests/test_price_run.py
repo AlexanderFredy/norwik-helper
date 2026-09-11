@@ -209,12 +209,14 @@ class FinalNotesTest(unittest.IsolatedAsyncioTestCase):
                          "Лист «HDF Паркет» не разбирал — там нет брендов из выгрузки")
         for code in ("T1", "T2", "T3"):
             await self.store.mark_tm_done(42, code)
-        self.assertTrue(await ph._finish_run(self.chat, self.store, 42))
+        # Разбор дошёл до конца, но прогон НЕ закрывается сам — сначала вопрос (§9.9)
+        self.assertFalse(await ph._finish_run(self.chat, self.store, 42))
         text = "\n".join(self.chat.sent)
         self.assertIn("Осталось за рамками разбора:", text)
         self.assertIn("— Бренды не в выгрузке: Betta, Aura", text)
         self.assertIn("— Лист «HDF Паркет»", text)
         self.assertIn("Прайс «Монарх-логистик» обработан полностью.", text)
+        self.assertIn("Закончить работу с этим прайсом?", text)
 
     async def test_not_shown_while_marks_remain(self):
         await self._note("что-то про прайс")
@@ -226,7 +228,10 @@ class FinalNotesTest(unittest.IsolatedAsyncioTestCase):
         ph._files[42] = ("monarh.xlsx", b"x")
         for code in ("T1", "T2", "T3"):
             await self.store.mark_tm_done(42, code)
+        # Без подтверждения прайс остаётся в работе, с подтверждением — закрывается
         await ph._finish_run(self.chat, self.store, 42)
+        self.assertIn(42, ph._files)
+        await ph._finish_run(self.chat, self.store, 42, confirmed=True)
         self.assertNotIn(42, ph._files)
         self.assertIsNone(await self.store.get_run(42))
 
@@ -239,7 +244,11 @@ class FinalNotesTest(unittest.IsolatedAsyncioTestCase):
         await self.store.clear_run(42)
         ph._files[42] = ("p.xlsx", b"x")
         self.assertFalse(await ph._finish_run(self.chat, self.store, 42))
-        self.assertTrue(await ph._finish_run(self.chat, self.store, 42, force=True))
+        # force доводит до вопроса, но закрывает только подтверждение
+        self.assertFalse(await ph._finish_run(self.chat, self.store, 42, force=True))
+        self.assertIn(42, ph._files)
+        self.assertTrue(await ph._finish_run(self.chat, self.store, 42, force=True,
+                                             confirmed=True))
         self.assertNotIn(42, ph._files)
 
 
@@ -259,11 +268,11 @@ class FakeChat:
         self.sent: list[str] = []
         self.bot = None
 
-    async def answer(self, text, reply_markup=None):
+    async def answer(self, text, reply_markup=None, entities=None, parse_mode=None):
         self.sent.append(text)
         return self
 
-    async def edit_text(self, text, reply_markup=None):
+    async def edit_text(self, text, reply_markup=None, entities=None):
         self.sent.append(text)
 
     async def edit_reply_markup(self, reply_markup=None):
@@ -337,9 +346,14 @@ class ContinueAfterApplyTest(unittest.IsolatedAsyncioTestCase):
         await self._press()
         text = "\n".join(self.chat.sent)
         self.assertIn("Прайс «Монарх-логистик» обработан полностью", text)
+        self.assertEqual(self.orc.prompts, [])          # продолжать нечего
+        # Кнопка на последней марке доводит до вопроса, а не до закрытия (§9.9):
+        # у админа могут остаться задачи по этому же файлу.
+        self.assertIn("Закончить работу с этим прайсом?", text)
+        self.assertIn(42, ph._files)
+        await ph._finish_run(self.chat, self.store, 42, force=True, confirmed=True)
         self.assertNotIn(42, ph._files)
         self.assertIsNone(await self.store.get_run(42))
-        self.assertEqual(self.orc.prompts, [])          # продолжать нечего
 
 
 if __name__ == "__main__":

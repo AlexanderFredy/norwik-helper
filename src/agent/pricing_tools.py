@@ -310,8 +310,10 @@ PRICING_TOOLS = [
     {
         "name": "get_selling_tm",
         "description": (
-            "Торговые марки, выгружаемые на сайт: [{name, code}]. Бренд прайса, которого "
-            "здесь нет, не обрабатываем — только сообщаем админу. Без параметров."
+            "Торговые марки 1С: [{name, code, selling}]. `selling: false` — марка заведена, "
+            "но ещё НЕ помечена к выгрузке на сайт; её код годится для create_item, а в "
+            "план прогона сама она не идёт — спроси админа, обрабатывать ли. Бренда нет в "
+            "списке совсем — не обрабатываем, сообщаем админу. Без параметров."
         ),
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
@@ -395,6 +397,30 @@ PRICING_TOOLS = [
                 "note": {"type": "string", "description": "причина словами админа, если назвал"},
             },
             "required": ["tm_code", "supplier"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "find_1c_items",
+        "description": (
+            "Поиск позиции ПО ВСЕЙ номенклатуре 1С — по артикулу и/или части имени, "
+            "включая СНЯТЫЕ С ПРОИЗВОДСТВА и товары ЧУЖИХ марок. "
+            "ВЫЗЫВАЙ ПЕРЕД СОЗДАНИЕМ КАЖДОЙ НОВОЙ ПОЗИЦИИ: выгрузка по ТМ показывает только "
+            "свою марку, а товар мог быть заведён раньше под другой — тогда создавать "
+            "нельзя, надо возвращать существующий (сменой папки). "
+            "Параметры: article, name (хотя бы один; article от 2 символов, name от 3), "
+            "необязательные tm и limit (по умолчанию 50). "
+            "Поиск по ВХОЖДЕНИЮ, лишние кандидаты — норма: отбрасывай их по имени и марке. "
+            "`not_exported: true` — позиция в невыгружаемой ветке, почти наверняка снятая."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "article": {"type": "string", "description": "артикул или его часть"},
+                "name": {"type": "string", "description": "часть наименования"},
+                "tm": {"type": "string", "description": "код ТМ, если надо сузить"},
+                "limit": {"type": "integer"},
+            },
             "additionalProperties": False,
         },
     },
@@ -715,6 +741,8 @@ class PricingTools:
                 return await self._record_exclusives(inp)
             if name == "set_exclusive":
                 return await self._set_exclusive(inp)
+            if name == "find_1c_items":
+                return await asyncio.to_thread(self._find_items, inp)
             if name == "get_1c_folders":
                 return await asyncio.to_thread(self._folders, inp)
             if name == "get_1c_properties":
@@ -1173,9 +1201,20 @@ class PricingTools:
         return blocks
 
     def _selling_tm(self) -> str:
-        tms = self._onec.selling_tm()
+        """Все марки с признаком выгрузки на сайт (§19.10).
+
+        Раньше отдавались только помеченные, и марка, заведённая админом час назад, была
+        агенту не видна вовсе: он честно писал «такой ТМ нет, заведите» про уже заведённую.
+        Марку заводят РАНЬШЕ, чем помечают к выгрузке, — она сначала прорабатывается, и
+        товары под неё нужно заводить уже в этом промежутке.
+
+        В ПЛАН по умолчанию по-прежнему идут только помеченные: непроработанную марку
+        разбирать рано. Но теперь это решение, а не слепота, и админ может его отменить.
+        """
+        tms = self._onec.selling_tm(all_marks=True)
         _TM_NAMES.update({t.code: t.name for t in tms})   # чтобы звать марки по имени
-        return json.dumps([{"name": t.name, "code": t.code} for t in tms], ensure_ascii=False)
+        return json.dumps([{"name": t.name, "code": t.code, "selling": t.selling}
+                           for t in tms], ensure_ascii=False)
 
     def _hidden(self) -> bool:
         """Тянуть ли снятые с производства. Решает РЕЖИМ, а не место вызова.
@@ -1259,6 +1298,38 @@ class PricingTools:
         }
 
     # ------------------------------------------------------ справочник: чтение и правка
+
+    def _find_items(self, inp: dict) -> str:
+        """Поиск по всей номенклатуре перед созданием позиции (§19.11).
+
+        Ответ намеренно короткий: это проверка «есть или нет», а не выгрузка. Полные данные
+        найденного товара агент возьмёт через `get_1c_nomenclature` по его марке.
+        """
+        article = (inp.get("article") or "").strip()
+        name = (inp.get("name") or "").strip()
+        if not article and not name:
+            return json.dumps({"error": "Нужен article или name"}, ensure_ascii=False)
+
+        found = self._onec.find_items(
+            article=article, name=name,
+            tm=(inp.get("tm") or "").strip() or None,
+            limit=int(inp.get("limit") or 50))
+
+        return json.dumps({
+            "query": {"article": article, "name": name},
+            "total": found.total,
+            # «Не нашлось» и «не поместилось» — разные ответы, и решать по ним надо по-разному
+            "truncated": found.truncated,
+            "errors": found.errors[:10],
+            "items": [{
+                "ref": i.ref, "name": i.name, "article": i.article,
+                "tm": i.tm, "tm_code": i.tm_code,
+                "product_type": i.product_type, "product_type_ref": i.product_type_ref,
+                "folder_ref": i.parent_ref, "folder": i.parent_name,
+                # Главный признак: невыгружаемая ветка — это и есть снятые с производства
+                "not_exported": i.not_exported,
+            } for i in found.items],
+        }, ensure_ascii=False)
 
     def _folders(self, inp: dict) -> str:
         tree = self._onec.folders(product_type=(inp.get("product_type") or "").strip() or None,

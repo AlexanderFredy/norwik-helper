@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS active_price (
     path       TEXT NOT NULL,       -- файл рядом с базой, как у отложенных задач
     key        TEXT,                -- тот же ключ, что в очереди: «это тот же прайс»
     price_date TEXT,
+    -- Разбор дошёл до конца и ЖДЁТ подтверждения админа (§9.9). Прогон не закрывается сам:
+    -- у админа могут остаться задачи по этому же прайсу, а закрытие стирает файл и историю.
+    awaiting_close INTEGER NOT NULL DEFAULT 0,
     saved_at   TEXT NOT NULL
 );
 
@@ -295,6 +298,13 @@ class PricingStore:
                     if have and column not in have:
                         await db.execute(
                             f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+
+            # Флаг ожидания подтверждения — число, а не текст, поэтому отдельно от цикла.
+            cur = await db.execute("PRAGMA table_info(active_price)")
+            have = {row[1] for row in await cur.fetchall()}
+            if have and "awaiting_close" not in have:
+                await db.execute("ALTER TABLE active_price ADD COLUMN awaiting_close "
+                                 "INTEGER NOT NULL DEFAULT 0")
 
             if "kind" not in columns:
                 # ПРЕДМЕТ ЗАПИСИ, а не её вид: 'prices' уходит в set-prices, 'items' — в
@@ -775,11 +785,22 @@ class PricingStore:
     async def get_active_price(self, user_id: int) -> dict | None:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT filename, path, key, price_date FROM active_price "
+                "SELECT filename, path, key, price_date, awaiting_close FROM active_price "
                 "WHERE user_id = ?", (user_id,))
             row = await cur.fetchone()
         return {"filename": row[0], "path": row[1], "key": row[2],
-                "price_date": row[3]} if row else None
+                "price_date": row[3], "awaiting_close": bool(row[4])} if row else None
+
+    async def set_awaiting_close(self, user_id: int, waiting: bool) -> None:
+        """Пометить прайс как «разобран, ждём подтверждения» либо снять пометку (§9.9).
+
+        Снимается при любой новой работе по этому прайсу: если админ дал ещё задачу, в
+        конце надо спросить заново, а не считать, что уже спрашивали.
+        """
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("UPDATE active_price SET awaiting_close = ? WHERE user_id = ?",
+                             (1 if waiting else 0, user_id))
+            await db.commit()
 
     async def list_active_prices(self) -> list[dict]:
         """Все активные прайсы — читается один раз при старте бота."""

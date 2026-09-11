@@ -64,10 +64,38 @@ class FakeOnec:
         self.reads = 0
         self.errors: list[dict] = []      # позиции, которые 1С не отдала
         self.tms: list[tuple[str, str]] = []   # (имя, код) для selling_tm
+        self.catalogue: list = []              # FoundItem для find_items
+        self.searches: list[dict] = []         # чем именно искали
 
-    def selling_tm(self):
+    def selling_tm(self, all_marks: bool = False):
+        """`all_marks` отдаёт и непомеченные к выгрузке (§19.10).
+
+        Элемент `tms` — (имя, код) либо (имя, код, selling): марка, заведённая, но ещё не
+        помеченная, — рабочее состояние, а не исключение.
+        """
         from src.onec.client import TradeMark
-        return [TradeMark(name=n, code=c) for n, c in self.tms]
+        marks = [TradeMark(name=t[0], code=t[1],
+                           selling=t[2] if len(t) > 2 else True) for t in self.tms]
+        return marks if all_marks else [m for m in marks if m.selling]
+
+    def find_items(self, article="", name="", tm=None, limit=50):
+        """Поиск по всей номенклатуре (§19.11) — вхождением, как в 1С.
+
+        Ищет по ВСЕМУ `catalogue`, а не по `_items`: смысл инструмента как раз в том, что
+        он видит за пределами текущей марки.
+        """
+        from src.onec.client import FoundItems
+        self.searches.append({"article": article, "name": name, "tm": tm})
+        hits = []
+        for it in self.catalogue:
+            if tm and it.tm_code != tm:
+                continue
+            if article and article.lower() in (it.article or "").lower():
+                hits.append(it)
+            elif name and name.lower() in (it.name or "").lower():
+                hits.append(it)
+        return FoundItems(items=hits[:limit], total=len(hits[:limit]),
+                          truncated=len(hits) > limit)
 
     def by_tm_all(self, tm_code, **kw):
         self.reads += 1

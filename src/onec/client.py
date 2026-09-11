@@ -100,6 +100,35 @@ class Folder:
 
 
 @dataclass(frozen=True)
+class FoundItem:
+    """Позиция, найденная поиском по всей номенклатуре (§19.11).
+
+    Отдельно от `NomItem`: там цены и коэффициенты ЕИ, здесь их нет и быть не должно —
+    поиск отвечает на вопрос «существует ли уже такой товар и где он лежит», а не «почём».
+    """
+    ref: str
+    name: str
+    full_name: str = ""
+    article: str = ""
+    unit: str = ""
+    product_type: str = ""
+    product_type_ref: str = ""
+    tm: str = ""
+    tm_code: str = ""
+    parent_ref: str = ""
+    parent_name: str = ""
+    not_exported: bool = False
+
+
+@dataclass(frozen=True)
+class FoundItems:
+    items: list[FoundItem]
+    total: int
+    truncated: bool = False
+    errors: list[dict] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class FolderTree:
     items: list[Folder]
     total: int
@@ -333,6 +362,51 @@ class OnecClient:
             page=int(data.get("offset", page)),
             size=int(data.get("limit", size)),
             items=items,
+            errors=[e for e in (data.get("errors") or []) if isinstance(e, dict)],
+        )
+
+    def find_items(self, article: str = "", name: str = "", tm: str | None = None,
+                   limit: int = 50) -> FoundItems:
+        """Поиск позиций ПО ВСЕЙ номенклатуре — по артикулу и/или имени (§19.11).
+
+        Нужен ровно для одного: перед созданием позиции убедиться, что её нет среди снятых
+        с производства. Проверка по `by_tm` этого не даёт — она видит одну марку, а товар
+        мог быть заведён под другой, и именно такой дубль проверка и должна ловить.
+
+        Невыгружаемые (а снятые лежат именно там) приходят ПО УМОЛЧАНИЮ — в отличие от
+        `by_tm`, где их надо просить отдельно.
+        """
+        params: dict = {"limit": limit}
+        if article:
+            params["article"] = article
+        if name:
+            params["name"] = name
+        if tm:
+            params["tm"] = tm
+        r = self._get("/get-products/find-items", params=params)
+        r.raise_for_status()
+        data = _loads_bom(r.content)
+        items = [
+            FoundItem(
+                ref=str(x.get("ref", "")),
+                name=(x.get("name") or "").strip(),
+                full_name=(x.get("full_name") or "").strip(),
+                article=(x.get("article") or "").strip(),
+                unit=(x.get("unit") or "").strip(),
+                product_type=(x.get("product_type") or "").strip(),
+                product_type_ref=str(x.get("product_type_ref", "")),
+                tm=(x.get("tm") or "").strip(),
+                tm_code=str(x.get("tm_code", "")),
+                parent_ref=str((x.get("parent") or {}).get("code", "")),
+                parent_name=((x.get("parent") or {}).get("name") or "").strip(),
+                not_exported=bool(x.get("not_exported", False)),
+            )
+            for x in (data.get("items") or [])
+        ]
+        return FoundItems(
+            items=items,
+            total=int(data.get("total", len(items)) or 0),
+            truncated=bool(data.get("truncated", False)),
             errors=[e for e in (data.get("errors") or []) if isinstance(e, dict)],
         )
 
