@@ -70,9 +70,44 @@ _NOM_CACHE: dict[tuple[str, bool], tuple[float, list]] = {}
 _TM_NAMES: dict[str, str] = {}
 
 
+# Что из справочных чтений уже отдавалось В ЭТОМ ПРОГОНЕ: ключ → короткая сводка.
+# Папки марки и свойства вида товара за прогон не меняются, но выгрузки тяжёлые (свойства
+# одного вида — до ~8 тыс. токенов) и, в отличие от листов прайса и номенклатуры,
+# `_prune_file_dumps` их НЕ чистит: повторная выгрузка осядет в истории до конца прогона и
+# поедет в каждый следующий запрос. Поэтому второй раз отдаём не данные, а указание, где
+# они лежат (§9.6.5).
+_SEEN_READS: dict[tuple, str] = {}
+
+
 def clear_nomenclature_cache() -> None:
+    """Сбросить кеши чтений из 1С.
+
+    Зовётся при новом прайсе И ПОСЛЕ КАЖДОЙ ЗАПИСИ в 1С — и второе здесь важнее первого:
+    `set_items` заводит папки и добавляет значения свойств, то есть ровно те данные, что
+    мы запретили перечитывать. После записи право переспросить обязано вернуться.
+    """
     _NOM_CACHE.clear()
     _TM_NAMES.clear()
+    _SEEN_READS.clear()
+
+def _repeat_answer(key: tuple) -> str | None:
+    """Ответ на повторный запрос уже отданных справочных данных, либо None (§9.6.5).
+
+    Круг цикла этим не вернуть — он уже оплачен, — но выгрузку в историю не пускаем: она
+    осела бы там до конца прогона и ехала в каждый следующий запрос. Указываем ИМЕННО на
+    переписку: `_prune_file_dumps` эти выгрузки не трогает, так что они гарантированно на
+    месте, в отличие от листов прайса и номенклатуры.
+    """
+    was = _SEEN_READS.get(key)
+    if not was:
+        return None
+    return json.dumps({
+        "repeat": True,
+        "was": was,
+        "hint": ("Уже приходило в этом прогоне — возьми выше в переписке. "
+                 "После записи в 1С спросить можно снова."),
+    }, ensure_ascii=False)
+
 
 def next_step(run: dict | None) -> str | None:
     """Что обрабатывать следующим: коллекция текущей марки либо следующая марка."""
@@ -438,7 +473,10 @@ PRICING_TOOLS = [
             "collection | group | discontinued. По имени вид папки не определяй: ветки "
             "видов товара называются «Водостойкий ламинат» и «Двери».\n"
             "С фильтром `tm` возвращаются и папки в ЧУЖИХ ветках, где лежат товары этой "
-            "марки, — это и есть кандидаты на разнос по правильным папкам."),
+            "марки, — это и есть кандидаты на разнос по правильным папкам.\n"
+            "ОДИН РАЗ НА МАРКУ. За прогон дерево не меняется; на повторный запрос с теми же "
+            "фильтрами придёт не дерево, а напоминание посмотреть выше по переписке. После "
+            "записи в 1С данные обновятся сами — тогда запросить можно снова."),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -457,7 +495,11 @@ PRICING_TOOLS = [
             "Свойство «Коллекция» (`0000003`) запрашивай ТОЛЬКО вместе с `tm` и "
             "`property`: без отбора в нём три тысячи значений. Пустой список при запросе "
             "с маркой значит «у этой марки в этой ветке коллекций нет» — это ответ, а не "
-            "сбой отбора."),
+            "сбой отбора.\n"
+            "ОДИН РАЗ НА ВИД ТОВАРА, а не на коллекцию. За прогон свойства не меняются; на "
+            "повторный запрос с теми же параметрами придёт не список, а напоминание "
+            "посмотреть выше по переписке. После записи в 1С (она добавляет значения "
+            "свойств) данные обновятся сами — тогда запросить можно снова."),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1345,8 +1387,16 @@ class PricingTools:
         }, ensure_ascii=False)
 
     def _folders(self, inp: dict) -> str:
-        tree = self._onec.folders(product_type=(inp.get("product_type") or "").strip() or None,
-                                  tm=(inp.get("tm") or "").strip() or None)
+        product_type = (inp.get("product_type") or "").strip() or None
+        tm = (inp.get("tm") or "").strip() or None
+
+        key = ("folders", product_type, tm)
+        repeat = _repeat_answer(key)
+        if repeat:
+            return repeat
+
+        tree = self._onec.folders(product_type=product_type, tm=tm)
+        _SEEN_READS[key] = f"дерево папок, {len(tree.items)} шт."
         return json.dumps({
             "total": tree.total,
             "not_returned_by_1c": tree.errors[:20],
@@ -1361,10 +1411,18 @@ class PricingTools:
         }, ensure_ascii=False)
 
     def _properties(self, inp: dict) -> str:
-        cat = self._onec.properties_by_type(
-            inp["product_type"],
-            tm=(inp.get("tm") or "").strip() or None,
-            property_code=(inp.get("property") or "").strip() or None)
+        product_type = inp["product_type"]
+        tm = (inp.get("tm") or "").strip() or None
+        prop = (inp.get("property") or "").strip() or None
+
+        key = ("properties", product_type, tm, prop)
+        repeat = _repeat_answer(key)
+        if repeat:
+            return repeat
+
+        cat = self._onec.properties_by_type(product_type, tm=tm, property_code=prop)
+        _SEEN_READS[key] = (f"свойства вида товара «{cat.product_type or product_type}», "
+                            f"{len(cat.properties)} шт.")
         return json.dumps({
             "product_type": cat.product_type,
             "product_type_ref": cat.product_type_ref,
