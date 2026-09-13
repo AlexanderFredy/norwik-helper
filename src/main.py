@@ -17,6 +17,7 @@ from src.config import load_config
 from src.email_tool.client import MailClient
 from src.onec.client import OnecClient
 from src.storage.pricing import PricingStore
+from src.storage.model_store import ModelStore
 from src.storage.suppliers import SupplierStore
 from src.storage.users import UserStore
 from src.website_tool.norwik import NorwikClient
@@ -40,6 +41,13 @@ async def main() -> None:
     # сквозная сущность, и второй файл развёл бы её по двум местам.
     supplier_store = SupplierStore(config.db_path)
     await supplier_store.init()
+    # Состояние модели работы с прайсами (§10). Пока только хранилище: список прайсов и
+    # задач поднимается в память, но команд, которые его меняют, ещё нет.
+    model_store = ModelStore(config.db_path)
+    await model_store.init()
+    known_prices = await model_store.load_all()
+    if known_prices:
+        logger.info("В модели прайсов: %d", len(known_prices))
 
     # Прайсы, которые админы разбирали до перезапуска, поднимаем обратно в память: история
     # диалога лежит в базе и рестарт переживает, а файл до 10.09.2026 не переживал — и
@@ -51,7 +59,14 @@ async def main() -> None:
     # Файл пишется на диск раньше строки в базе, и падение между этими шагами оставляет
     # сироту. Чистим ТОЛЬКО здесь: пока бот работает, файл может быть создан секунду назад
     # и ещё не попасть в базу — гонка, в которой мы стёрли бы нужное (§9.8).
-    price_files.sweep(config.db_path, await pricing_store.known_price_paths())
+    #
+    # Ссылки собираем ИЗ ВСЕХ ТРЁХ хранилищ. Забыть здесь одно — значит стереть файл,
+    # на который оно ссылается: для модели это прайс без файла, а такого объекта
+    # существовать не может (§3.1 agent-workflow-model.md).
+    known = (await pricing_store.known_price_paths()
+             | await supplier_store.known_paths()
+             | await model_store.known_paths())
+    price_files.sweep(config.db_path, known)
 
     onec = None
     if config.onec_base_url and config.onec_token:
