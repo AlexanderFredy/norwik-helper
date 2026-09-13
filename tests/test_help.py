@@ -1,7 +1,7 @@
 """Команда /help, меню команд Telegram и проход команд сквозь диалог по прайсу."""
 import unittest
 
-from src.bot import handlers, pricing_handlers as ph
+from src.bot import catalog_handlers as ch, handlers, pricing_handlers as ph
 from src.bot.commands import ADMIN_COMMANDS, COMMON_COMMANDS, build_help
 
 
@@ -52,7 +52,9 @@ class HelpTextTest(unittest.TestCase):
 
     def test_every_menu_command_has_handler(self):
         registered = set()
-        for router in (handlers.router, ph.router):
+        # Роутеров три: общий, прайсовый и справочники. Забыть здесь новый — значит
+        # перестать замечать команду в меню без обработчика, ради чего тест и написан.
+        for router in (handlers.router, ph.router, ch.router):
             for h in router.message.handlers:
                 for f in h.filters:
                     registered |= set(getattr(f.callback, "commands", None) or [])

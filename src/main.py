@@ -11,11 +11,13 @@ from src.storage import price_files
 from src.bot.auth import AuthMiddleware
 from src.bot.commands import setup_bot_commands
 from src.bot.handlers import router
+from src.bot.catalog_handlers import router as catalog_router
 from src.bot.pricing_handlers import router as pricing_router
 from src.config import load_config
 from src.email_tool.client import MailClient
 from src.onec.client import OnecClient
 from src.storage.pricing import PricingStore
+from src.storage.suppliers import SupplierStore
 from src.storage.users import UserStore
 from src.website_tool.norwik import NorwikClient
 
@@ -34,6 +36,10 @@ async def main() -> None:
     await store.init()
     pricing_store = PricingStore(config.db_path)
     await pricing_store.init()
+    # Справочники поставщиков (§2 spec/agent-workflow-model.md). Та же база: поставщик —
+    # сквозная сущность, и второй файл развёл бы её по двум местам.
+    supplier_store = SupplierStore(config.db_path)
+    await supplier_store.init()
 
     # Прайсы, которые админы разбирали до перезапуска, поднимаем обратно в память: история
     # диалога лежит в базе и рестарт переживает, а файл до 10.09.2026 не переживал — и
@@ -68,9 +74,11 @@ async def main() -> None:
 
     bot = Bot(token=config.telegram_bot_token)
     dp = Dispatcher(store=store, orchestrator=orchestrator, openai_api_key=config.openai_api_key,
-                    onec=onec, pricing_store=pricing_store)
+                    onec=onec, pricing_store=pricing_store,
+                    supplier_store=supplier_store)
     dp.message.middleware(AuthMiddleware(store, config.admin_telegram_id))
     dp.callback_query.middleware(AuthMiddleware(store, config.admin_telegram_id))
+    dp.include_router(catalog_router)   # справочники: только команды, конфликтов нет
     dp.include_router(pricing_router)   # прайсы — до общего роутера: он ловит любой текст
     dp.include_router(router)
 
