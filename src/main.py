@@ -17,6 +17,7 @@ from src.config import load_config
 from src.email_tool.client import MailClient
 from src.onec.client import OnecClient
 from src.storage.pricing import PricingStore
+from src.storage.command_queue import CommandQueue
 from src.storage.model_store import ModelStore
 from src.storage.suppliers import SupplierStore
 from src.storage.users import UserStore
@@ -48,6 +49,15 @@ async def main() -> None:
     known_prices = await model_store.load_all()
     if known_prices:
         logger.info("В модели прайсов: %d", len(known_prices))
+
+    # Очередь команд визуалов (§7). Взятая, но не завершённая команда означает одно:
+    # процесс умер, не доработав. Живых взятых в момент старта быть не может — агент
+    # один, — поэтому возвращаем их в очередь, а не гадаем, кто их держит.
+    commands = CommandQueue(config.db_path)
+    await commands.init()
+    stale = await commands.requeue_stale()
+    if stale:
+        logger.info("Возвращено в очередь команд после перезапуска: %d", stale)
 
     # Прайсы, которые админы разбирали до перезапуска, поднимаем обратно в память: история
     # диалога лежит в базе и рестарт переживает, а файл до 10.09.2026 не переживал — и
