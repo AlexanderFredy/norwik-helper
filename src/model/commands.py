@@ -31,16 +31,6 @@ class CommandKind(str, Enum):
     RELEASE_LOCK = "снять захват"
 
 
-#: Команды, которые ЗАНИМАЮТ прайс: они меняют его состав или запускают работу по нему.
-#: Только среди них действует «кто первый, тот и работает» (§7) — остальным отвечать
-#: «прайс занят» было бы нелепо: смена статуса мгновенна, и две подряд это обычное дело.
-EXCLUSIVE = frozenset({
-    CommandKind.EXECUTE_TASK,
-    CommandKind.REBUILD_TASKS,
-    CommandKind.DESTROY_PRICE,
-    CommandKind.DELETE_TASK,
-})
-
 #: Команды-присваивания: повторная по тому же объекту ПЕРЕЗАПИСЫВАЕТ лежащую в очереди.
 #: В модель должно приехать последнее решение админа, а не цепочка промежуточных.
 COALESCING = frozenset({
@@ -65,10 +55,6 @@ class Command:
     payload: dict = field(default_factory=dict)
     created_at: str = field(default_factory=now)
     id: int | None = None
-
-    @property
-    def exclusive(self) -> bool:
-        return self.kind in EXCLUSIVE
 
     @property
     def coalescing(self) -> bool:
@@ -111,15 +97,19 @@ def plan_batch(commands: list[Command],
                busy_prices: set[int] | None = None) -> tuple[list[Command], list[Rejected]]:
     """Разобрать пачку: что выполняем, что отклоняем.
 
-    Правило «кто первый, тот и работает» (§7): если за цикл пришло несколько ЗАНИМАЮЩИХ
+    **Правило «кто первый» действует на ВСЕ команды** (§7): если за цикл пришло несколько
     команд по одному прайсу, выполняется самая ранняя, остальным отвечаем «прайс занят».
-    Это тот же жёсткий запрет, что и захват прайса (§4.1), просто на входе.
+    Тот же жёсткий запрет, что и захват прайса (§5.1), просто на входе.
 
-    `busy_prices` — прайсы, уже захваченные кем-то к началу цикла. Команды по ним
-    отклоняются сразу, не дожидаясь своей очереди.
+    Две подряд смены статуса ОДНОГО объекта до этого правила не доходят — они схлопываются
+    ещё в очереди (`COALESCING`), и в пачке остаётся одна.
 
-    Команды-присваивания (статус, описание) под правило НЕ попадают: они мгновенны, и
-    отвечать «занято» на вторую подряд смену статуса значило бы ломать обычную работу.
+    `busy_prices` — прайсы, закрытые для инициатора к началу цикла. Считать их должен
+    вызывающий: захват свой же админ не блокирует, поэтому набор зависит от того, ЧЕЙ это
+    цикл (`locks.busy_for`).
+
+    Команда без прайса (приём нового файла) под правило не попадает: она ещё не относится
+    ни к какому прайсу.
     """
     busy = set(busy_prices or ())
     taken: set[int] = set()
@@ -127,10 +117,6 @@ def plan_batch(commands: list[Command],
     rejected: list[Rejected] = []
 
     for command in order_batch(commands):
-        if not command.exclusive:
-            run.append(command)
-            continue
-
         price_id = command.price_id
         if price_id is None:
             run.append(command)

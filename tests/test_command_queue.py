@@ -47,18 +47,25 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(len(run), 2)
         self.assertEqual(rejected, [])
 
-    def test_assignments_are_not_subject_to_first_wins(self):
-        """Смена статуса мгновенна: отвечать «занято» на вторую подряд — ломать работу."""
+    def test_rule_applies_to_assignments_too(self):
+        """Решение админа от 14.09.2026: «кто первый» — для ВСЕХ команд без исключений.
+
+        Две смены статуса ОДНОГО объекта сюда не доходят — они схлопываются ещё в очереди,
+        и в пачке остаётся одна. Под правило попадают команды к РАЗНЫМ объектам одного
+        прайса.
+        """
         a = cmd(kind=CommandKind.SET_TASK_STATUS, task=1, at="2026-09-13T10:00:01")
         b = cmd(kind=CommandKind.SET_TASK_STATUS, task=2, at="2026-09-13T10:00:02")
         run, rejected = plan_batch([a, b])
-        self.assertEqual(len(run), 2)
-        self.assertEqual(rejected, [])
+        self.assertEqual(run, [a])
+        self.assertEqual(len(rejected), 1)
 
-    def test_assignment_passes_even_when_price_is_busy(self):
+    def test_assignment_is_blocked_by_a_busy_price(self):
+        """§5.1: пока с прайсом работает один админ, все его задачи закрыты для других."""
         a = cmd(kind=CommandKind.EDIT_TASK_DESCRIPTION, task=1)
         run, rejected = plan_batch([a], busy_prices={1})
-        self.assertEqual(run, [a])
+        self.assertEqual(run, [])
+        self.assertIn("другим администратором", rejected[0].reason)
 
     def test_already_locked_price_rejects_work_commands(self):
         a = cmd(price=1)

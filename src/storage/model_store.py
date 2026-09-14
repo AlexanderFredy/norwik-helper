@@ -22,6 +22,7 @@ import aiosqlite
 
 from src.model.enums import PriceStatus, TaskKind, TaskStatus, TaskSubject
 from src.model.price import Price, SupplierPrice
+from src.model.locks import Lock
 from src.model.refs import Ref, TaskAddress, TradeMark
 from src.model.task import PriceTask
 
@@ -37,7 +38,14 @@ CREATE TABLE IF NOT EXISTS price (
     price_date  TEXT,                   -- дата ВНУТРИ файла, если её удалось прочитать
     status      TEXT NOT NULL,
     created_at  TEXT NOT NULL,
-    newer_id    INTEGER                 -- ссылка на САМЫЙ новый прайс группы, не на следующий
+    newer_id    INTEGER,                -- ссылка на САМЫЙ новый прайс группы, не на следующий
+    -- Захват (§5.1). Полями на строке прайса, а не отдельной таблицей: захват — состояние
+    -- самого прайса, и жизнь у него ровно та же.
+    lock_actor      TEXT,               -- NULL = свободен
+    lock_generation INTEGER NOT NULL DEFAULT 0,   -- маркер поколения, строго возрастающий
+    lock_acquired_at TEXT,
+    lock_expires_at  TEXT,
+    lock_working    INTEGER NOT NULL DEFAULT 1    -- 0 = идёт минута ожидания после задачи
 );
 CREATE INDEX IF NOT EXISTS ix_price_group ON price (supplier_id, signature);
 -- ТМ, найденные в прайсе. `in_1c = 0` — марки в 1С нет либо LLM не смогла сопоставить;
@@ -91,6 +99,18 @@ class ModelStore:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self._db_path) as db:
             await db.executescript(_SCHEMA)
+            # База могла быть создана до появления захвата — дописываем колонки.
+            cur = await db.execute("PRAGMA table_info(price)")
+            have = {row[1] for row in await cur.fetchall()}
+            for column, ddl in (
+                ("lock_actor", "TEXT"),
+                ("lock_generation", "INTEGER NOT NULL DEFAULT 0"),
+                ("lock_acquired_at", "TEXT"),
+                ("lock_expires_at", "TEXT"),
+                ("lock_working", "INTEGER NOT NULL DEFAULT 1"),
+            ):
+                if have and column not in have:
+                    await db.execute(f"ALTER TABLE price ADD COLUMN {column} {ddl}")
             await db.commit()
 
     # ----------------------------------------------------------------- чтение
@@ -252,6 +272,53 @@ class ModelStore:
             await db.commit()
 
     # ---------------------------------------------------------------- утилиты
+
+    # ---------------------------------------------------------------- захваты
+
+    async def load_locks(self) -> dict[int, Lock]:
+        """Захваты, поднятые из базы. Истёкшие НЕ отсеиваются здесь.
+
+        Решает про истечение `locks.expired_locks`: снятие захвата должно сопровождаться
+        уведомлением визуалов (§5.1), а хранилище уведомлять не умеет и не должно.
+        """
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT id, lock_actor, lock_generation, lock_acquired_at, "
+                "lock_expires_at, lock_working FROM price WHERE lock_actor IS NOT NULL")
+            return {row[0]: Lock(price_id=row[0], actor=row[1], generation=row[2],
+                                 acquired_at=row[3], expires_at=row[4],
+                                 working=bool(row[5])) for row in await cur.fetchall()}
+
+    async def save_lock(self, lock: Lock) -> None:
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "UPDATE price SET lock_actor = ?, lock_generation = ?, "
+                "lock_acquired_at = ?, lock_expires_at = ?, lock_working = ? WHERE id = ?",
+                (lock.actor, lock.generation, lock.acquired_at, lock.expires_at,
+                 1 if lock.working else 0, lock.price_id))
+            await db.commit()
+
+    async def clear_lock(self, price_id: int) -> bool:
+        """Снять захват. Номер поколения НЕ обнуляем.
+
+        Иначе следующий захват начался бы с единицы и совпал с номером отменённого
+        прогона — а маркер поколения ровно для того и нужен, чтобы этого не случилось.
+        """
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE price SET lock_actor = NULL, lock_acquired_at = NULL, "
+                "lock_expires_at = NULL, lock_working = 1 WHERE id = ? "
+                "AND lock_actor IS NOT NULL", (price_id,))
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def last_generation(self, price_id: int) -> int:
+        """Номер последнего захвата — от него считается следующий."""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute("SELECT lock_generation FROM price WHERE id = ?",
+                                   (price_id,))
+            row = await cur.fetchone()
+        return row[0] if row else 0
 
     async def known_paths(self) -> set[str]:
         """Файлы, на которые ссылается модель, — для уборки сирот при старте."""
