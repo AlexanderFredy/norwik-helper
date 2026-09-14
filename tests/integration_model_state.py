@@ -175,6 +175,61 @@ class Probe:
         self.check("повторная уборка ничего не меняет", r9.get("changed") == 0,
                    str(r9)[:200])
 
+    def run_provider(self, cfg):
+        """Тот же обмен, но через рабочий код: OnecClient и OnecProvider.
+
+        Шаги выше бьют по HTTP напрямую и проверяют BSL. Здесь проверяется НАША сторона:
+        пути внутри клиента, разбор ответа и то, что провайдер не шлёт снимок впустую.
+        Опечатка в пути юнит-тестами не ловится — там клиент поддельный.
+        """
+        from src.onec.client import OnecClient
+        from src.onec.model_provider import OnecProvider
+
+        print("\n11. Через OnecClient и OnecProvider — наша сторона обмена")
+        onec = OnecClient(cfg.onec_base_url, cfg.onec_token, timeout=60)
+        try:
+            answer = onec.agent_commands()
+            self.check("клиент забрал команды", "server_time" in answer, str(answer)[:200])
+            self.check("объектов в 1С хватает", "missing" not in answer,
+                       str(answer.get("missing")))
+
+            written = onec.set_model_state([])
+            self.check("клиент положил снимок", "version" in written, str(written)[:200])
+
+            # Провайдер с пустой моделью: первый оборот обязан выровнять зеркало, второй —
+            # промолчать, иначе в простое каждые пять секунд уходил бы лишний POST.
+            class Empty:
+                prices = []
+
+                def lock_of(self, price_id):
+                    return None
+
+            provider = OnecProvider(onec, Empty())
+            before = written.get("version")
+
+            import asyncio
+
+            class NoQueue:
+                async def pending(self):
+                    return []
+
+                async def taken(self):
+                    return []
+
+                async def put(self, command, offset=0.0, agent_now=None):
+                    raise AssertionError("команд быть не должно")
+
+            asyncio.run(provider.collect(NoQueue()))
+            self.check("провайдер отправил снимок", not provider._dirty, "признак остался")
+
+            after = onec.set_model_state([])
+            self.check("зеркало пустое и стабильное", after.get("changed") == 0,
+                       str(after)[:200])
+            self.check("версия не скачет на пустом снимке",
+                       after.get("version") == before, "%s → %s" % (before, after.get("version")))
+        finally:
+            onec.close()
+
 
 def main() -> int:
     cfg = load_config()
@@ -187,6 +242,7 @@ def main() -> int:
     try:
         probe = Probe(client)
         probe.run()
+        probe.run_provider(cfg)
     finally:
         client.close()
 

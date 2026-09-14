@@ -19,6 +19,7 @@ from src.bot.pricing_handlers import router as pricing_router
 from src.config import load_config
 from src.email_tool.client import MailClient
 from src.onec.client import OnecClient
+from src.onec.model_provider import OnecProvider
 from src.storage.pricing import PricingStore
 from src.model.service import PriceListService
 from src.storage.command_queue import CommandQueue
@@ -115,7 +116,20 @@ async def main() -> None:
     logger.info("Модель поднята: прайсов %d", len(model.prices))
 
     bot = Bot(token=config.telegram_bot_token)
-    loop = AgentLoop(commands, model, providers=[TelegramProvider()])
+    # ВТОРОЙ ВИЗУАЛ — форма 1С (specs/1c-model-form.md). Подключается, только если 1С
+    # настроена: без неё провайдер на каждом обороте ходил бы в никуда.
+    #
+    # Провайдер он же слушатель: снимок состояния уезжает в 1С, лишь когда состояние
+    # менялось, а узнать об этом можно только от модели. Подписка ОБЯЗАТЕЛЬНА — без неё
+    # зеркало выровняется один раз при подъёме и застынет.
+    providers = [TelegramProvider()]
+    if onec is not None:
+        onec_provider = OnecProvider(onec, model, supplier_store)
+        providers.append(onec_provider)
+        model.events.subscribe(onec_provider)
+        logger.info("Форма 1С подключена как второй визуал")
+
+    loop = AgentLoop(commands, model, providers=providers)
     model.events.subscribe(TelegramListener(bot, [config.admin_telegram_id]))
 
     dp = Dispatcher(store=store, orchestrator=orchestrator, openai_api_key=config.openai_api_key,

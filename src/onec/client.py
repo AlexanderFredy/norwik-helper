@@ -519,6 +519,69 @@ class OnecClient:
         r.raise_for_status()
         return json.loads(text)
 
+    # ------------------------------------------------- обмен с формой модели (§3)
+    #
+    # Три метода ниже обслуживают ВТОРОЙ ВИЗУАЛ — форму 1С (specs/1c-model-form.md).
+    # Обе стрелки идут ОТ агента: обработчик HTTP-сервиса работает в своём сеансе и до
+    # открытой формы не дотягивается, толкнуть данные в неё платформа не даёт.
+    #
+    # `_post_json` общий: у трёх маршрутов одна обвязка — тело в UTF-8, проверка на
+    # HTML-страницу веб-сервера вместо JSON и разбор ответа.
+
+    def _post_json(self, path: str, payload: dict, timeout: float = 60) -> dict:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        r = self._client.post(path, content=body, headers=JSON_UTF8, timeout=timeout)
+        text = r.content.decode("utf-8-sig", errors="replace")
+        # Необработанное исключение BSL веб-сервер подменяет своей страницей: текста 1С в
+        # ней нет вовсе, и без этой проверки мы бы разбирали HTML как JSON.
+        if "<!DOCTYPE" in text or "<html" in text.lower():
+            raise RuntimeError(f"1С вернул HTML вместо JSON (HTTP {r.status_code})")
+        r.raise_for_status()
+        return json.loads(text)
+
+    def agent_commands(self) -> dict:
+        """Забрать ждущие команды формы вместе с часами 1С (§3.1).
+
+        `server_time` в ответе обязателен: по нему считается смещение часов. Порядок «кто
+        первый» решается временем создания на стороне визуала, и сбитые часы давали бы 1С
+        либо вечный выигрыш, либо вечный проигрыш.
+
+        Эндпоинт лёгкий — читает только таблицу команд. Замер: 231 мс против 1 263 мс у
+        запроса с обращением к Номенклатуре, то есть 4,6 % против 25,3 % занятости 1С при
+        опросе раз в пять секунд.
+        """
+        r = self._get("/get-products/agent-commands")
+        text = r.content.decode("utf-8-sig", errors="replace")
+        if "<!DOCTYPE" in text or "<html" in text.lower():
+            raise RuntimeError(f"1С вернул HTML вместо JSON (HTTP {r.status_code})")
+        r.raise_for_status()
+        return json.loads(text)
+
+    def agent_commands_state(self, items: list[dict]) -> dict:
+        """Сообщить судьбу команд: `принята`, затем `выполнена` либо `отклонена` (§3.2).
+
+        Зовётся ДВАЖДЫ на команду намеренно. Между «забрал» и «применил» агент может
+        умереть, и тогда команда обязана остаться в работе; а форме нужны оба момента —
+        колесико ожидания гаснет по РЕЗУЛЬТАТУ, а не по факту, что команду забрали.
+        """
+        return self._post_json("/get-products/agent-commands-state", {"commands": items})
+
+    def set_model_state(self, prices: list[dict]) -> dict:
+        """Положить в 1С ПОЛНЫЙ снимок состояния модели (§3.3).
+
+        Целиком, а не приращениями: снимок мал (десятки строк) и самоисцеляющийся —
+        потерянное обновление чинится следующим, тогда как с приращениями расхождение
+        копилось бы молча.
+
+        РАЗНИЦУ СЧИТАЕТ 1С: она трогает только изменившиеся строки и поднимает счётчик
+        версии, лишь если разница непустая. Иначе форма перерисовывалась бы каждые пять
+        секунд под руками у админа.
+
+        Отсутствующий ключ `prices` и пустой список — РАЗНОЕ: пустой честно вычищает
+        зеркало, отсутствующий 1С отвергает, чтобы обрезанный запрос не стёр список.
+        """
+        return self._post_json("/get-products/set-model-state", {"prices": prices})
+
     def by_tm_all(self, tm_code: str, size: int = 200, max_pages: int = 20,
                   include_not_exported: bool = False,
                   product_type: str | None = None) -> Nomenclature:
