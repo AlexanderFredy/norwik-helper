@@ -4,9 +4,15 @@
 команда, присланная перед остановкой процесса, должна дождаться его подъёма — ровно этим
 опрос визуалов и лучше слушателя, у которого такая команда пропала бы.
 
-**Схлопывание.** Повторная смена статуса того же объекта перезаписывает лежащую в очереди
-команду, а не добавляет вторую: в модель приезжает последнее решение админа, а не цепочка
-промежуточных. Схлопываются только присваивания (`COALESCING` в `src/model/commands.py`).
+**Замещение.** Новая команда ТОГО ЖЕ ВИДА по тому же объекту перезаписывает лежащую в
+очереди, а не добавляет вторую: в модель приезжает последнее решение админа, а не цепочка
+промежуточных. Вид входит в ключ обязательно — иначе «изменить описание» и следом «выполнить»
+по одной задаче слились бы в одно, а это штатный рабочий порядок (§3.3).
+
+**Часы источника.** Порядок решает время создания на стороне визуала, но у 1С свой сервер и
+свои часы. `put` принимает измеренное смещение и кладёт рядом с сырой меткой приведённую к
+нашим часам (`sort_at`) — сортировка идёт по ней. У Telegram смещение нулевое по построению:
+метку ставит тот же процесс.
 
 **Взятие помечает, а не удаляет.** Между «забрал» и «выполнил» процесс может умереть, и
 тогда по базе видно, на чём он встал. Удаляет команду тот, кто её обработал.
@@ -18,7 +24,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from src.model.commands import Command, CommandKind
+from src.model.commands import Command, CommandKind, sort_time
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS command_queue (
@@ -32,10 +38,14 @@ CREATE TABLE IF NOT EXISTS command_queue (
     -- Время создания НА СТОРОНЕ ВИЗУАЛА, не попадания в очередь: по нему решается,
     -- кто первый (§7). Порядок обхода провайдеров сделал бы один визуал главнее другого.
     created_at TEXT NOT NULL,
+    -- То же время, ПРИВЕДЁННОЕ К НАШИМ ЧАСАМ (`commands.sort_time`). Сортируем по нему:
+    -- часы 1С могут быть сбиты, и тогда сырая метка дала бы ей вечное преимущество.
+    sort_at    TEXT NOT NULL,
+    skew_note  TEXT NOT NULL DEFAULT '',   -- почему метке не поверили, если не поверили
     queued_at  TEXT NOT NULL,
     taken_at   TEXT                        -- NULL = ждёт; иначе агент её уже забрал
 );
-CREATE INDEX IF NOT EXISTS ix_queue_pending ON command_queue (taken_at, created_at);
+CREATE INDEX IF NOT EXISTS ix_queue_pending ON command_queue (taken_at, sort_at);
 """
 
 
@@ -52,12 +62,29 @@ class CommandQueue:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self._db_path) as db:
             await db.executescript(_SCHEMA)
+            # База могла быть создана до появления поправки на часы — дописываем колонки.
+            cur = await db.execute("PRAGMA table_info(command_queue)")
+            have = {row[1] for row in await cur.fetchall()}
+            if have and "sort_at" not in have:
+                await db.execute("ALTER TABLE command_queue ADD COLUMN sort_at TEXT "
+                                 "NOT NULL DEFAULT ''")
+                await db.execute("UPDATE command_queue SET sort_at = created_at "
+                                 "WHERE sort_at = ''")
+            if have and "skew_note" not in have:
+                await db.execute("ALTER TABLE command_queue ADD COLUMN skew_note TEXT "
+                                 "NOT NULL DEFAULT ''")
             await db.commit()
 
-    async def put(self, command: Command) -> Command:
-        """Положить команду в очередь. Присваивания схлопываются с уже лежащими."""
+    async def put(self, command: Command, offset_seconds: float = 0.0,
+                  agent_now=None) -> Command:
+        """Положить команду в очередь, заместив лежащую того же вида по тому же объекту.
+
+        `offset_seconds` — насколько часы источника уходят вперёд относительно наших.
+        Для Telegram всегда ноль: метку ставит тот же процесс.
+        """
         key = command.coalesce_key()
         payload = json.dumps(command.payload or {}, ensure_ascii=False)
+        command.sort_at, note = sort_time(command.created_at, offset_seconds, agent_now)
 
         async with aiosqlite.connect(self._db_path) as db:
             if key is not None:
@@ -72,18 +99,21 @@ class CommandQueue:
                     # последнее решение, и «первым» оно теперь считается по нему же.
                     await db.execute(
                         "UPDATE command_queue SET payload = ?, created_at = ?, "
-                        "source = ?, actor = ?, queued_at = ? WHERE id = ?",
-                        (payload, command.created_at, command.source, command.actor,
-                         _now(), twin[0]))
+                        "sort_at = ?, skew_note = ?, source = ?, actor = ?, "
+                        "queued_at = ? WHERE id = ?",
+                        (payload, command.created_at, command.sort_at, note,
+                         command.source, command.actor, _now(), twin[0]))
                     await db.commit()
                     command.id = twin[0]
                     return command
 
             cur = await db.execute(
                 "INSERT INTO command_queue (kind, source, actor, price_id, task_id, "
-                "payload, created_at, queued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "payload, created_at, sort_at, skew_note, queued_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (command.kind.value, command.source, command.actor, command.price_id,
-                 command.task_id, payload, command.created_at, _now()))
+                 command.task_id, payload, command.created_at, command.sort_at,
+                 note, _now()))
             await db.commit()
             command.id = cur.lastrowid
             return command
@@ -92,8 +122,8 @@ class CommandQueue:
         """Что ждёт разбора, в порядке создания на стороне визуала."""
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT id, kind, source, actor, price_id, task_id, payload, created_at "
-                "FROM command_queue WHERE taken_at IS NULL ORDER BY created_at, id")
+                "SELECT id, kind, source, actor, price_id, task_id, payload, created_at, "
+                "sort_at FROM command_queue WHERE taken_at IS NULL ORDER BY sort_at, id")
             return [_from_row(row) for row in await cur.fetchall()]
 
     async def take(self, limit: int = 100) -> list[Command]:
@@ -131,8 +161,8 @@ class CommandQueue:
         """Взятые, но не завершённые — диагностика зависшего разбора."""
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT id, kind, source, actor, price_id, task_id, payload, created_at "
-                "FROM command_queue WHERE taken_at IS NOT NULL ORDER BY created_at, id")
+                "SELECT id, kind, source, actor, price_id, task_id, payload, created_at, "
+                "sort_at FROM command_queue WHERE taken_at IS NOT NULL ORDER BY sort_at, id")
             return [_from_row(row) for row in await cur.fetchall()]
 
     async def requeue_stale(self) -> int:
@@ -156,11 +186,11 @@ class CommandQueue:
 
 
 def _from_row(row) -> Command:
-    cid, kind, source, actor, price_id, task_id, payload, created_at = row
+    cid, kind, source, actor, price_id, task_id, payload, created_at, sort_at = row
     try:
         data = json.loads(payload or "{}")
     except (ValueError, TypeError):
         data = {}
     return Command(kind=CommandKind(kind), source=source, actor=actor,
                    price_id=price_id, task_id=task_id, payload=data,
-                   created_at=created_at, id=cid)
+                   created_at=created_at, sort_at=sort_at or created_at, id=cid)

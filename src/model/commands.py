@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 
@@ -31,13 +31,56 @@ class CommandKind(str, Enum):
     RELEASE_LOCK = "снять захват"
 
 
-#: Команды-присваивания: повторная по тому же объекту ПЕРЕЗАПИСЫВАЕТ лежащую в очереди.
-#: В модель должно приехать последнее решение админа, а не цепочка промежуточных.
-COALESCING = frozenset({
-    CommandKind.SET_TASK_STATUS,
-    CommandKind.SET_PRICE_STATUS,
-    CommandKind.EDIT_TASK_DESCRIPTION,
-})
+#: Потолок доверия к метке — СТРАХОВКА, а не основной механизм. Основную работу делает
+#: измеренное смещение часов источника; потолок ловит случай, когда измерить не вышло или
+#: измерение само оказалось мусором. Час, а не пять минут: команда могла честно пролежать в
+#: очереди 1С, пока агент был выключен, и такую метку портить нельзя — она верна.
+MAX_SKEW_SECONDS = 3600
+
+
+def sort_time(reported: str | None, offset_seconds: float = 0.0,
+              agent_now: datetime | None = None, trust: bool = True) -> tuple[str, str]:
+    """Время, по которому команда участвует в «кто первый». Возвращает (время, причина).
+
+    **Зачем вообще поправка.** Порядок решает время создания НА СТОРОНЕ ВИЗУАЛА (§7), но
+    часы визуала могут быть сбиты — тогда он либо всегда выигрывает, либо всегда проигрывает,
+    и вся затея с честным порядком рушится.
+
+    Расхождение возможно ровно у ОДНОГО визуала — 1С: она отдельный сервер. Команды
+    Telegram создаёт сам процесс бота, и их метка — это и есть часы агента, смещение нулевое
+    по построению.
+
+    Поэтому `offset_seconds` — измеренное смещение часов источника относительно наших
+    (`время_визуала − наше_время` в момент опроса). Вычитая его, приводим метку к нашим
+    часам.
+
+    **Потолок доверия — страховка.** Основную работу делает поправка; потолок ловит случай,
+    когда смещение измерить не вышло (`trust=False`) или оно само оказалось мусором. Порог
+    намеренно велик: команда могла честно пролежать в очереди 1С, пока агент был выключен,
+    и такая метка ВЕРНА — портить её нельзя.
+
+    Причина возвращается наружу, чтобы подмена времени была видна в логе, а не молча меняла
+    порядок.
+    """
+    agent_now = agent_now or datetime.now(timezone.utc)
+    if not trust:
+        return agent_now.isoformat(), "часы источника неизвестны"
+    if not reported:
+        return agent_now.isoformat(), "метки нет"
+
+    try:
+        stamp = datetime.fromisoformat(reported)
+    except ValueError:
+        return agent_now.isoformat(), "метка не разобрана"
+
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+
+    corrected = stamp - timedelta(seconds=offset_seconds)
+    drift = abs((corrected - agent_now).total_seconds())
+    if drift > MAX_SKEW_SECONDS:
+        return agent_now.isoformat(), f"часы источника разошлись на {int(drift)} с"
+    return corrected.isoformat(), ""
 
 
 @dataclass
@@ -53,21 +96,35 @@ class Command:
     price_id: int | None = None
     task_id: int | None = None
     payload: dict = field(default_factory=dict)
-    created_at: str = field(default_factory=now)
+    created_at: str = field(default_factory=now)     # как сообщил визуал — для диагностики
+    sort_at: str = ""                                # приведённое к нашим часам (`sort_time`)
     id: int | None = None
 
-    @property
-    def coalescing(self) -> bool:
-        return self.kind in COALESCING
+    def __post_init__(self) -> None:
+        # Без поправки порядок считается по сырой метке: для Telegram это одно и то же,
+        # потому что её ставит тот же процесс.
+        if not self.sort_at:
+            self.sort_at = self.created_at
 
     def coalesce_key(self) -> tuple | None:
-        """Ключ схлопывания: вид плюс объект, к которому команда относится.
+        """Ключ замещения: **вид плюс объект**, к которому команда относится.
 
-        None — команда не схлопывается и всегда добавляется отдельной строкой.
+        Новая команда замещает лежащую в очереди того же вида по тому же объекту: в модель
+        должно приехать последнее решение админа, а не цепочка промежуточных. Это касается
+        ВСЕХ видов, а не только присваиваний: два «выполни задачу 5» подряд — одно
+        намерение, и запускать её дважды не нужно (§4.2).
+
+        **Вид входит в ключ обязательно.** Иначе «изменить описание» и следом «выполнить»
+        по одной задаче схлопнулись бы в одно, а это ровно тот рабочий порядок, ради
+        которого правка описания и существует: админ правит задание и тут же отправляет
+        его на исполнение (§3.3). Потеряв первую команду, мы отправили бы старый текст.
+
+        None — замещать не по чему: у команды нет объекта (приём нового файла), и две
+        такие команды это два разных файла.
         """
-        if not self.coalescing:
-            return None
         target = self.task_id if self.task_id is not None else self.price_id
+        if target is None:
+            return None
         return (self.kind.value, target)
 
     def label(self) -> str:
@@ -86,11 +143,14 @@ class Rejected:
 def order_batch(commands: list[Command]) -> list[Command]:
     """Упорядочить пачку по времени создания на стороне визуала.
 
+    Сортируем по `sort_at` — метке, приведённой к нашим часам (`sort_time`), а не по сырой:
+    сбитые часы визуала иначе давали бы ему вечное преимущество.
+
     Ничья разрешается порядком в очереди (`id`): две команды с одинаковой отметкой времени
     должны разбираться одинаково при каждом прогоне, иначе поведение зависело бы от того,
     как база вернула строки.
     """
-    return sorted(commands, key=lambda c: (c.created_at, c.id or 0))
+    return sorted(commands, key=lambda c: (c.sort_at or c.created_at, c.id or 0))
 
 
 def plan_batch(commands: list[Command],
@@ -101,8 +161,8 @@ def plan_batch(commands: list[Command],
     команд по одному прайсу, выполняется самая ранняя, остальным отвечаем «прайс занят».
     Тот же жёсткий запрет, что и захват прайса (§5.1), просто на входе.
 
-    Две подряд смены статуса ОДНОГО объекта до этого правила не доходят — они схлопываются
-    ещё в очереди (`COALESCING`), и в пачке остаётся одна.
+    Две команды одного вида по ОДНОМУ объекту до этого правила не доходят — они замещают
+    друг друга ещё в очереди (`coalesce_key`), и в пачке остаётся одна.
 
     `busy_prices` — прайсы, закрытые для инициатора к началу цикла. Считать их должен
     вызывающий: захват свой же админ не блокирует, поэтому набор зависит от того, ЧЕЙ это

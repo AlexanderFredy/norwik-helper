@@ -6,15 +6,26 @@
 """
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from src.model.commands import Command, CommandKind, order_batch, plan_batch
+from src.model.commands import (Command, CommandKind, order_batch, plan_batch,
+                                sort_time)
 from src.storage.command_queue import CommandQueue
 
 
-def cmd(kind=CommandKind.EXECUTE_TASK, price=1, task=None, at="2026-09-13T10:00:00",
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def at_s(seconds: int = 0) -> str:
+    """Метка рядом с «сейчас»: дальше часа срабатывает потолок доверия (`sort_time`)."""
+    return (NOW + timedelta(seconds=seconds)).isoformat()
+
+
+def cmd(kind=CommandKind.EXECUTE_TASK, price=1, task=None, at=None,
         source="telegram", actor="admin-1", **payload):
-    return Command(kind=kind, price_id=price, task_id=task, created_at=at,
+    return Command(kind=kind, price_id=price, task_id=task,
+                   created_at=at or NOW.isoformat(),
                    source=source, actor=actor, payload=payload)
 
 
@@ -22,27 +33,27 @@ class PlanTest(unittest.TestCase):
     """Чистое правило разбора пачки — без базы."""
 
     def test_order_is_by_visual_time_not_arrival(self):
-        late = cmd(at="2026-09-13T10:00:05")
-        early = cmd(at="2026-09-13T10:00:01")
+        late = cmd(at=at_s(5))
+        early = cmd(at=at_s(1))
         late.id, early.id = 1, 2          # в очередь легла раньше поздняя
         self.assertEqual([c.id for c in order_batch([late, early])], [2, 1])
 
     def test_ties_are_broken_deterministically(self):
-        a, b = cmd(at="2026-09-13T10:00:00"), cmd(at="2026-09-13T10:00:00")
+        a, b = cmd(at=at_s(0)), cmd(at=at_s(0))
         a.id, b.id = 7, 3
         self.assertEqual([c.id for c in order_batch([a, b])], [3, 7])
 
     def test_first_wins_among_exclusive_commands(self):
-        first = cmd(task=1, at="2026-09-13T10:00:01")
-        second = cmd(task=2, at="2026-09-13T10:00:02")
+        first = cmd(task=1, at=at_s(1))
+        second = cmd(task=2, at=at_s(2))
         run, rejected = plan_batch([second, first])
         self.assertEqual(run, [first])
         self.assertEqual(len(rejected), 1)
         self.assertIn("занят", rejected[0].reason)
 
     def test_different_prices_do_not_block_each_other(self):
-        a = cmd(price=1, at="2026-09-13T10:00:01")
-        b = cmd(price=2, at="2026-09-13T10:00:02")
+        a = cmd(price=1, at=at_s(1))
+        b = cmd(price=2, at=at_s(2))
         run, rejected = plan_batch([a, b])
         self.assertEqual(len(run), 2)
         self.assertEqual(rejected, [])
@@ -54,8 +65,8 @@ class PlanTest(unittest.TestCase):
         и в пачке остаётся одна. Под правило попадают команды к РАЗНЫМ объектам одного
         прайса.
         """
-        a = cmd(kind=CommandKind.SET_TASK_STATUS, task=1, at="2026-09-13T10:00:01")
-        b = cmd(kind=CommandKind.SET_TASK_STATUS, task=2, at="2026-09-13T10:00:02")
+        a = cmd(kind=CommandKind.SET_TASK_STATUS, task=1, at=at_s(1))
+        b = cmd(kind=CommandKind.SET_TASK_STATUS, task=2, at=at_s(2))
         run, rejected = plan_batch([a, b])
         self.assertEqual(run, [a])
         self.assertEqual(len(rejected), 1)
@@ -75,16 +86,75 @@ class PlanTest(unittest.TestCase):
 
     def test_command_without_price_is_not_blocked(self):
         """«Принять прайс» ещё не относится ни к какому прайсу."""
-        a = Command(kind=CommandKind.SUBMIT_PRICE, created_at="2026-09-13T10:00:00")
+        a = Command(kind=CommandKind.SUBMIT_PRICE, created_at=at_s(0))
         run, _ = plan_batch([a], busy_prices={1, 2})
         self.assertEqual(run, [a])
 
     def test_rebuild_and_execute_compete_for_the_same_price(self):
-        run_first = cmd(kind=CommandKind.EXECUTE_TASK, task=1, at="2026-09-13T10:00:01")
-        rebuild = cmd(kind=CommandKind.REBUILD_TASKS, at="2026-09-13T10:00:02")
+        run_first = cmd(kind=CommandKind.EXECUTE_TASK, task=1, at=at_s(1))
+        rebuild = cmd(kind=CommandKind.REBUILD_TASKS, at=at_s(2))
         run, rejected = plan_batch([rebuild, run_first])
         self.assertEqual(run, [run_first])
         self.assertEqual(rejected[0].command.kind, CommandKind.REBUILD_TASKS)
+
+
+class ClockTest(unittest.TestCase):
+    """Сбитые часы визуала (§7).
+
+    Порядок решает время создания на стороне визуала, но у 1С свой сервер. Если её часы
+    уходят, она либо всегда выигрывает, либо всегда проигрывает — и честный порядок
+    превращается в фикцию. Telegram этой болезни не подвержен: метку ставит тот же процесс.
+    """
+
+    def test_no_offset_keeps_the_stamp(self):
+        got, note = sort_time(at_s(10), 0.0, NOW)
+        self.assertEqual(got, at_s(10))
+        self.assertEqual(note, "")
+
+    def test_offset_is_subtracted(self):
+        """Часы 1С спешат на 120 с — метка приводится к нашим."""
+        got, note = sort_time(at_s(130), offset_seconds=120, agent_now=NOW)
+        self.assertEqual(got, at_s(10))
+        self.assertEqual(note, "")
+
+    def test_lagging_clock_is_corrected_too(self):
+        got, _ = sort_time(at_s(-130), offset_seconds=-120, agent_now=NOW)
+        self.assertEqual(got, at_s(-10))
+
+    def test_corrected_stamps_restore_the_true_order(self):
+        """Главное: после поправки выигрывает тот, кто ДЕЙСТВИТЕЛЬНО нажал раньше."""
+        # 1С спешит на час: её «10:00:05» это на самом деле 09:00:05.
+        onec, _ = sort_time(at_s(3605), offset_seconds=3600, agent_now=NOW)
+        telegram, _ = sort_time(at_s(10), offset_seconds=0, agent_now=NOW)
+        self.assertLess(onec, telegram)
+
+    def test_wild_stamp_falls_back_to_our_clock(self):
+        got, note = sort_time(at_s(99999), 0.0, NOW)
+        self.assertEqual(got, NOW.isoformat())
+        self.assertIn("разошлись", note)
+
+    def test_unknown_clock_falls_back_without_pretending(self):
+        got, note = sort_time(at_s(10), 0.0, NOW, trust=False)
+        self.assertEqual(got, NOW.isoformat())
+        self.assertIn("неизвестны", note)
+
+    def test_old_but_honest_stamp_is_kept(self):
+        """Команда могла честно пролежать в очереди 1С, пока агент был выключен.
+
+        Такая метка ВЕРНА, и портить её нельзя — иначе порядок команд, накопившихся за
+        простой, схлопнется в момент подъёма.
+        """
+        got, note = sort_time(at_s(-1800), 0.0, NOW)
+        self.assertEqual(got, at_s(-1800))
+        self.assertEqual(note, "")
+
+    def test_broken_and_missing_stamps(self):
+        self.assertIn("не разобрана", sort_time("вчера", 0.0, NOW)[1])
+        self.assertIn("метки нет", sort_time("", 0.0, NOW)[1])
+
+    def test_naive_stamp_is_treated_as_utc(self):
+        got, note = sort_time(NOW.replace(tzinfo=None).isoformat(), 0.0, NOW)
+        self.assertEqual(note, "")
 
 
 class QueueTest(unittest.IsolatedAsyncioTestCase):
@@ -109,20 +179,20 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.q.pending())[0].payload["status"], "выполнена")
 
     async def test_pending_is_ordered_by_visual_time(self):
-        await self.q.put(cmd(task=1, at="2026-09-13T10:00:09"))
-        await self.q.put(cmd(task=2, at="2026-09-13T10:00:01"))
+        await self.q.put(cmd(task=1, at=at_s(9)))
+        await self.q.put(cmd(task=2, at=at_s(1)))
         self.assertEqual([c.task_id for c in await self.q.pending()], [2, 1])
 
     async def test_status_change_overwrites_instead_of_queueing_twice(self):
         """В модель приезжает последнее решение, а не цепочка промежуточных."""
         await self.q.put(cmd(kind=CommandKind.SET_TASK_STATUS, task=5, status="выполнена"))
         await self.q.put(cmd(kind=CommandKind.SET_TASK_STATUS, task=5,
-                             at="2026-09-13T10:00:30", status="к обработке"))
+                             at=at_s(30), status="к обработке"))
 
         pending = await self.q.pending()
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0].payload["status"], "к обработке")
-        self.assertEqual(pending[0].created_at, "2026-09-13T10:00:30")
+        self.assertEqual(pending[0].created_at, at_s(30))
 
     async def test_status_of_another_task_is_a_separate_command(self):
         await self.q.put(cmd(kind=CommandKind.SET_TASK_STATUS, task=5, status="выполнена"))
@@ -144,10 +214,27 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0].payload["text"], "два")
 
-    async def test_execute_commands_do_not_coalesce(self):
-        """Каждая — отдельное намерение, и ответить надо на каждую."""
+    async def test_execute_commands_also_coalesce(self):
+        """Решение админа 14.09.2026: новая команда замещает лежащую того же вида.
+
+        Два «выполни задачу 5» подряд — одно намерение, запускать её дважды не нужно.
+        """
         await self.q.put(cmd(task=5))
-        await self.q.put(cmd(task=5, at="2026-09-13T10:00:30"))
+        await self.q.put(cmd(task=5, at=at_s(30)))
+        self.assertEqual(len(await self.q.pending()), 1)
+
+    async def test_kind_is_part_of_the_key(self):
+        """«Изменить описание» и следом «выполнить» — штатный порядок, слить их нельзя:
+        иначе агенту уехал бы старый текст задания."""
+        await self.q.put(cmd(kind=CommandKind.EDIT_TASK_DESCRIPTION, task=5, text="новое"))
+        await self.q.put(cmd(kind=CommandKind.EXECUTE_TASK, task=5, at=at_s(1)))
+        kinds = [c.kind for c in await self.q.pending()]
+        self.assertEqual(kinds, [CommandKind.EDIT_TASK_DESCRIPTION, CommandKind.EXECUTE_TASK])
+
+    async def test_submit_price_never_coalesces(self):
+        """У неё нет объекта: две такие команды — два разных файла."""
+        await self.q.put(Command(kind=CommandKind.SUBMIT_PRICE, created_at=at_s(0)))
+        await self.q.put(Command(kind=CommandKind.SUBMIT_PRICE, created_at=at_s(1)))
         self.assertEqual(len(await self.q.pending()), 2)
 
     async def test_take_marks_and_hides(self):
@@ -180,7 +267,7 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
     async def test_requeue_stale_at_startup(self):
         """Взятая без завершения означает одно: процесс умер, не доработав."""
         await self.q.put(cmd(task=1))
-        await self.q.put(cmd(task=2, at="2026-09-13T10:00:30"))
+        await self.q.put(cmd(task=2, at=at_s(30)))
         await self.q.take()
 
         returned = await self.q.requeue_stale()
@@ -200,7 +287,7 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_take_limit(self):
         for i in range(5):
-            await self.q.put(cmd(task=i, at=f"2026-09-13T10:00:0{i}"))
+            await self.q.put(cmd(task=i, at=at_s(i)))
         self.assertEqual(len(await self.q.take(limit=2)), 2)
         self.assertEqual(len(await self.q.pending()), 3)
 
@@ -217,9 +304,9 @@ class EndToEndTest(unittest.IsolatedAsyncioTestCase):
         self._dir.cleanup()
 
     async def test_two_admins_on_one_price_first_wins(self):
-        await self.q.put(cmd(task=1, actor="admin-1", at="2026-09-13T10:00:02",
+        await self.q.put(cmd(task=1, actor="admin-1", at=at_s(2),
                              source="telegram"))
-        await self.q.put(cmd(task=2, actor="admin-2", at="2026-09-13T10:00:01",
+        await self.q.put(cmd(task=2, actor="admin-2", at=at_s(1),
                              source="1c"))
 
         run, rejected = plan_batch(await self.q.take())
