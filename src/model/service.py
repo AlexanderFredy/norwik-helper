@@ -23,10 +23,14 @@ logger = logging.getLogger(__name__)
 
 
 class PriceListService:
-    def __init__(self, model_store, supplier_store, save_file, broadcaster=None) -> None:
+    def __init__(self, model_store, supplier_store, save_file, broadcaster=None,
+                 build_tasks=None) -> None:
         self._store = model_store
         self._suppliers = supplier_store
         self._save_file = save_file
+        # Формирование задач агентом (§6.1). None — падаем на заглушку: так тесты идут
+        # без сети и без ключа, а бот без настроенного 1С всё равно показывает список.
+        self._build_tasks = build_tasks
         self.events = broadcaster or Broadcaster()
         self._prices: list[Price] = []
         self._locks: dict[int, lk.Lock] = {}
@@ -72,6 +76,9 @@ class PriceListService:
                                  model_store=self._store, prices=self._prices,
                                  supplier_hint=supplier_hint, force=force,
                                  received_at=received_at, save_file=self._save_file)
+
+        if result.price is not None:
+            await self._fill_tasks(result.price, content, filename)
 
         if result.price is None:
             await self.events.publish(Event(
@@ -230,14 +237,13 @@ class PriceListService:
         if lock is not None and lock.working and not lock.expired():
             return await self._reject(command, "по прайсу идёт задача, дождитесь её конца")
 
-        from src.model.intake import read_signature, stub_tasks
         from src.storage import price_files
 
         content = price_files.load(price.supplier_price.file_path)
-        _, sheets = read_signature(content or b"", price.supplier_price.filename)
-        supplier = await self._suppliers.get_supplier(price.supplier_price.supplier_id)
+        if content is None:
+            return await self._reject(command, "файл прайса не найден на сервере")
 
-        fresh = stub_tasks(sheets, supplier.name if supplier else "поставщик")
+        fresh = await self._make_tasks(price, content, price.supplier_price.filename)
         price.rebuild(fresh)
         await self._store.replace_tasks(price.id, price.tasks)
 
@@ -245,6 +251,40 @@ class PriceListService:
             EventKind.TASKS_REBUILT, price_id=price.id,
             text=f"Задачи прайса №{price.id} собраны заново: {len(price.tasks)}. "
                  "Статусы и правки описаний не переносятся."))
+
+    async def _make_tasks(self, price: Price, content: bytes,
+                          filename: str) -> list[PriceTask]:
+        """Список задач: агентом, если он есть, иначе заглушкой.
+
+        Пустой ответ агента — не повод оставить прайс без задач: падаем на заглушку и
+        говорим об этом. Молчаливо пустой список админ прочтёт как «разбирать нечего».
+        """
+        from src.model.intake import read_signature, stub_tasks
+
+        supplier = await self._suppliers.get_supplier(price.supplier_price.supplier_id)
+        name = supplier.name if supplier else "поставщик"
+
+        if self._build_tasks is not None:
+            try:
+                tasks = await self._build_tasks(content, filename, price)
+            except Exception:                           # noqa: BLE001
+                logger.exception("Агент не составил задачи по %s", filename)
+                tasks = []
+            if tasks:
+                return tasks
+            await self.events.publish(Event(
+                EventKind.TASKS_REBUILT, price_id=price.id,
+                text="Агент не смог составить задачи — подставил заглушку. "
+                     "Повторить: /rebuild " + str(price.id)))
+
+        _, sheets = read_signature(content, filename)
+        return stub_tasks(sheets, name)
+
+    async def _fill_tasks(self, price: Price, content: bytes, filename: str) -> None:
+        """Задачи при приёме. Прайс уже записан — дописываем список отдельно."""
+        tasks = await self._make_tasks(price, content, filename)
+        price.rebuild(tasks)
+        await self._store.replace_tasks(price.id, price.tasks)
 
     async def _destroy(self, command: Command) -> None:
         price = self.price(command.price_id)

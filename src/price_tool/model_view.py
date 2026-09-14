@@ -33,7 +33,11 @@ def render_prices(prices, locks=None, suppliers=None) -> str:
             head += f"  ⚠ устарел (свежее — №{price.newer_id})"
         lines.append(head)
 
-        state = f"   {price.status.value} · задач {done}/{len(price.tasks)}"
+        # «задач 0/5» админ прочитал как «ноль задач» — и был прав, формат двусмыслен.
+        # Числу должно предшествовать слово, которое оно считает.
+        total = len(price.tasks)
+        state = (f"   {price.status.value} · задач {total}"
+                 + (f", выполнено {done}" if total else ""))
         if price.ready:
             state += " · готов к закрытию"
         lines.append(state)

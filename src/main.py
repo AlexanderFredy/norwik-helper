@@ -60,11 +60,6 @@ async def main() -> None:
     if stale:
         logger.info("Возвращено в очередь команд после перезапуска: %d", stale)
 
-    model = PriceListService(
-        model_store, supplier_store,
-        save_file=lambda content, name: price_files.save(config.db_path, name, content))
-    await model.load()
-    logger.info("Модель поднята: прайсов %d", len(model.prices))
 
     # Прайсы, которые админы разбирали до перезапуска, поднимаем обратно в память: история
     # диалога лежит в базе и рестарт переживает, а файл до 10.09.2026 не переживал — и
@@ -103,6 +98,21 @@ async def main() -> None:
         # добавляют обработчики — только они знают, чей это вызов и по какому прайсу.
         on_usage=pricing_store.record_usage,
     )
+
+    async def build_tasks(content, filename, price):
+        """Список задач составляет агент (§6.1). Метки расхода — как у прайсового
+        прогона: по ним видно, во что обходится формирование (§9.6.3)."""
+        from src.model.task_builder import build
+        tasks, _ = await build(orchestrator, content, filename, onec=onec,
+                               usage_labels={"kind": "pricing", "price_doc": filename})
+        return tasks
+
+    model = PriceListService(
+        model_store, supplier_store,
+        save_file=lambda content, name: price_files.save(config.db_path, name, content),
+        build_tasks=build_tasks)
+    await model.load()
+    logger.info("Модель поднята: прайсов %d", len(model.prices))
 
     bot = Bot(token=config.telegram_bot_token)
     loop = AgentLoop(commands, model, providers=[TelegramProvider()])

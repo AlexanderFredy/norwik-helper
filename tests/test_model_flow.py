@@ -291,7 +291,10 @@ class ViewTest(Base):
                                                           "Монарх"})
         self.assertIn(f"№{price.id}", text)
         self.assertIn("Монарх", text)
-        self.assertIn(f"1/{len(price.tasks)}", text)
+        # Числу предшествует слово, которое оно считает: «задач 0/5» админ прочитал как
+        # «ноль задач», и формат был в этом виноват, а не он.
+        self.assertIn(f"задач {len(price.tasks)}", text)
+        self.assertIn("выполнено 1", text)
 
     async def test_tasks_are_grouped_by_kind_in_spec_order(self):
         await self.submit()

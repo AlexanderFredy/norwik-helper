@@ -23,6 +23,17 @@ def _clean(value: str | None) -> str:
     return (value or "").strip()
 
 
+def norm_article(value: str | None) -> str:
+    """Артикул без разделителей вовсе: «LE-263», «LE 263» и «le263» — один артикул.
+
+    Общая `scope.normalize` для этого не годится: она заменяет пунктуацию ПРОБЕЛОМ, и
+    «LE-263» превращается в «le 263», которое не совпадёт с «le263». Поставщики пишут
+    артикул как придётся, и различать эти написания значило бы заводить дубли на пустом
+    месте.
+    """
+    return "".join(ch for ch in (value or "").lower() if ch.isalnum())
+
+
 @dataclass(frozen=True)
 class Ref:
     """Идентификаторы одного предмета: марки, коллекции или товара.
@@ -45,7 +56,7 @@ class Ref:
             norm = normalize(_clean(raw))
             if norm and norm not in seen:
                 seen.append(norm)
-        return cls(code=_clean(code), article=normalize(_clean(article)),
+        return cls(code=_clean(code), article=norm_article(article),
                    names=tuple(seen))
 
     @property
