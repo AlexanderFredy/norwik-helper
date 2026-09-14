@@ -176,14 +176,22 @@
 Оба — в том же HTTP-сервисе `ai-tools`, рядом с `by-tm` и `set-prices`, с тем же заголовком
 `X-API-Token` и той же функцией `ОтветJSON`.
 
-**Пути одним сегментом.** Шаблон URL сервиса — `{query-type}`, и вторая косая черта
-потребовала бы отдельного шаблона ради косметики:
+**Все три маршрута — на шаблоне `get-products/{query-type}`**, и GET, и POST:
 
 ```
 GET  .../get-products/agent-commands
-POST .../product-management/agent-commands-state
-POST .../product-management/set-model-state
+POST .../get-products/agent-commands-state
+POST .../get-products/set-model-state
 ```
+
+`ProductManagementPOST` — это ИМЯ обработчика метода POST у того же шаблона, а не отдельный
+путь: `POST .../product-management/...` отдаёт 404 (проверено живым запросом 14.09.2026).
+Сегмент в шаблоне один — отсюда `agent-commands-state`, а не `agent-commands/state`.
+
+**Каждая ветка оборачивается в `Попытка`** и отдаёт `{"error": "<текст 1С>"}` с кодом 500.
+Без этого исключение уходит наружу, веб-сервер подменяет ответ своей HTML-страницей «500 -
+Internal server error», и текста ошибки 1С в ней нет вовсе — отличить «нет регистра в
+конфигурации» от «не тот реквизит в запросе» по такому ответу нельзя.
 
 ### 3.1. `GET .../get-products/agent-commands` — агент забирает команды
 
@@ -206,7 +214,7 @@ POST .../product-management/set-model-state
 обращением к Номенклатуре — 1 263 мс. При лёгком эндпоинте пятисекундный опрос стоит 4,6 %
 занятости 1С, при тяжёлом — 25,3 %.
 
-### 3.2. `POST .../product-management/agent-commands-state` — судьба команды
+### 3.2. `POST .../get-products/agent-commands-state` — судьба команды
 
 ```json
 { "commands": [ { "id": "8f2a1b3c-4d5e-4f60-9a7b-1c2d3e4f5a6b", "state": "принята" },
@@ -226,7 +234,7 @@ POST .../product-management/set-model-state
 и тогда команда обязана остаться в работе, а не считаться выполненной. А форме нужны оба
 момента: колесико должно гаснуть по РЕЗУЛЬТАТУ, а не по факту, что команду забрали.
 
-### 3.3. `POST .../product-management/set-model-state` — агент кладёт состояние
+### 3.3. `POST .../get-products/set-model-state` — агент кладёт состояние
 
 **Полный снимок**, а не приращения:
 
