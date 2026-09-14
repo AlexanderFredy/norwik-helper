@@ -196,6 +196,34 @@ async def handle_voice(message: Message, orchestrator, openai_api_key: str | Non
     await _process_query(message, text, orchestrator, status_msg, pricing_store)
 
 
+#: Команды отключённого прайсового потока (см. main.py). Названы поимённо, чтобы ответ был
+#: осмысленным: «не знаю такой команды» про /queue, которая вчера работала, сбивает с толку.
+_DISABLED = {
+    "queue", "next_price", "queue_clear", "cancel_price", "mode", "mappings",
+    "mapping_forget", "categories", "category_add", "category_remove", "deferred",
+    "deferred_forget", "deferred_clear", "deferred_clear_stale", "deferred_resume",
+    "exclusives", "exclusive_forget", "tokens",
+}
+
+
+@router.message(F.text.startswith("/"))
+async def handle_unknown_command(message: Message) -> None:
+    """Команда, которую никто не разобрал.
+
+    Стоит ПЕРЕД общим обработчиком намеренно. Иначе такая команда уходит менеджерскому
+    агенту — это вызов модели за деньги и ответ про поиск товара на «/queue».
+    """
+    name = (message.text or "").split()[0].lstrip("/").split("@")[0].lower()
+
+    if name in _DISABLED:
+        await message.answer(
+            f"Команда /{name} относится к прежнему разбору прайсов — он отключён на время "
+            "обкатки модели.\n\nСейчас работают /prices и /tasks, полный список — /help.")
+        return
+
+    await message.answer(f"Не знаю команду /{name}. Список — /help.")
+
+
 @router.message()
 async def handle_query(message: Message, orchestrator, pricing_store=None) -> None:
     if not message.text:
