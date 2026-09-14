@@ -223,13 +223,41 @@ class QueueTest(unittest.IsolatedAsyncioTestCase):
         await self.q.put(cmd(task=5, at=at_s(30)))
         self.assertEqual(len(await self.q.pending()), 1)
 
-    async def test_kind_is_part_of_the_key(self):
-        """«Изменить описание» и следом «выполнить» — штатный порядок, слить их нельзя:
-        иначе агенту уехал бы старый текст задания."""
+    async def test_edit_then_execute_becomes_one_command_carrying_the_text(self):
+        """Сценарий админа: правит описание и тут же жмёт «Выполнить», между опросами.
+
+        Ключ замещения — ОБЪЕКТ, не вид, поэтому команды сливаются в одну. Иначе обе попали
+        бы в одну пачку, и правило «кто первый» отклонило бы «Выполнить» с «прайс занят» —
+        штатный порядок работы ломался бы на ровном месте.
+
+        Полезная нагрузка при этом объединяется: агент получает «выполнить задачу 5» СО
+        СВЕЖИМ текстом задания, а не со старым.
+        """
         await self.q.put(cmd(kind=CommandKind.EDIT_TASK_DESCRIPTION, task=5, text="новое"))
         await self.q.put(cmd(kind=CommandKind.EXECUTE_TASK, task=5, at=at_s(1)))
-        kinds = [c.kind for c in await self.q.pending()]
-        self.assertEqual(kinds, [CommandKind.EDIT_TASK_DESCRIPTION, CommandKind.EXECUTE_TASK])
+
+        pending = await self.q.pending()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].kind, CommandKind.EXECUTE_TASK)
+        self.assertEqual(pending[0].payload["text"], "новое")
+
+    async def test_newer_payload_wins_on_the_same_key(self):
+        await self.q.put(cmd(kind=CommandKind.EDIT_TASK_DESCRIPTION, task=5, text="раз"))
+        await self.q.put(cmd(kind=CommandKind.EDIT_TASK_DESCRIPTION, task=5,
+                             at=at_s(1), text="два"))
+        self.assertEqual((await self.q.pending())[0].payload["text"], "два")
+
+    async def test_commands_on_different_tasks_do_not_merge(self):
+        """Замещение работает ТОЛЬКО по конкретной задаче."""
+        await self.q.put(cmd(kind=CommandKind.EDIT_TASK_DESCRIPTION, task=5, text="новое"))
+        await self.q.put(cmd(kind=CommandKind.EXECUTE_TASK, task=6, at=at_s(1)))
+        self.assertEqual(len(await self.q.pending()), 2)
+
+    async def test_task_command_does_not_merge_with_a_price_command(self):
+        """Задача и прайс — разные объекты: «пересобрать задачи» не съедает правку."""
+        await self.q.put(cmd(kind=CommandKind.EDIT_TASK_DESCRIPTION, task=5, text="новое"))
+        await self.q.put(cmd(kind=CommandKind.REBUILD_TASKS, price=1, at=at_s(1)))
+        self.assertEqual(len(await self.q.pending()), 2)
 
     async def test_submit_price_never_coalesces(self):
         """У неё нет объекта: две такие команды — два разных файла."""

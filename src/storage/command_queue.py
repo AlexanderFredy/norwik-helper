@@ -4,10 +4,13 @@
 команда, присланная перед остановкой процесса, должна дождаться его подъёма — ровно этим
 опрос визуалов и лучше слушателя, у которого такая команда пропала бы.
 
-**Замещение.** Новая команда ТОГО ЖЕ ВИДА по тому же объекту перезаписывает лежащую в
-очереди, а не добавляет вторую: в модель приезжает последнее решение админа, а не цепочка
-промежуточных. Вид входит в ключ обязательно — иначе «изменить описание» и следом «выполнить»
-по одной задаче слились бы в одно, а это штатный рабочий порядок (§3.3).
+**Замещение — по ОБЪЕКТУ, вид в ключ не входит.** Более новая команда по той же задаче
+(или тому же прайсу) перезаписывает лежащую в очереди, какого бы вида та ни была: в модель
+приезжает последнее решение админа, а не цепочка промежуточных.
+
+**Полезная нагрузка при этом ОБЪЕДИНЯЕТСЯ.** Админ правит описание задачи и тут же жмёт
+«Выполнить»: замещающая команда — «выполнить», но текст правки обязан доехать вместе с ней,
+иначе агент получит старое задание.
 
 **Часы источника.** Порядок решает время создания на стороне визуала, но у 1С свой сервер и
 свои часы. `put` принимает измеренное смещение и кладёт рядом с сырой меткой приведённую к
@@ -88,21 +91,36 @@ class CommandQueue:
 
         async with aiosqlite.connect(self._db_path) as db:
             if key is not None:
-                target_col = "task_id" if command.task_id is not None else "price_id"
-                target = command.task_id if command.task_id is not None else command.price_id
+                # Объект сравнивается СВОЕГО РОДА. Иначе команда по прайсу нашла бы строки
+                # его задач: у них тоже проставлен `price_id`, — и «пересобрать задачи»
+                # молча съело бы правку описания.
+                if command.task_id is not None:
+                    where, target = "task_id IS ?", command.task_id
+                else:
+                    where, target = "price_id IS ? AND task_id IS NULL", command.price_id
                 cur = await db.execute(
-                    f"SELECT id FROM command_queue WHERE kind = ? AND {target_col} IS ? "
-                    "AND taken_at IS NULL", (command.kind.value, target))
+                    f"SELECT id, payload FROM command_queue WHERE {where} "
+                    "AND taken_at IS NULL", (target,))
                 twin = await cur.fetchone()
                 if twin:
-                    # Перезаписываем вместе с временем создания: в модель должно приехать
-                    # последнее решение, и «первым» оно теперь считается по нему же.
+                    # ПОЛЕЗНАЯ НАГРУЗКА ОБЪЕДИНЯЕТСЯ, а не затирается: админ правит описание
+                    # и тут же жмёт «Выполнить». Замещающая команда — «выполнить», но текст
+                    # правки обязан доехать вместе с ней, иначе агент получит старое задание.
+                    # Свои значения важнее: они новее.
+                    try:
+                        merged = json.loads(twin[1] or "{}")
+                    except (ValueError, TypeError):
+                        merged = {}
+                    merged.update(command.payload or {})
+                    command.payload = merged
+
                     await db.execute(
-                        "UPDATE command_queue SET payload = ?, created_at = ?, "
+                        "UPDATE command_queue SET kind = ?, payload = ?, created_at = ?, "
                         "sort_at = ?, skew_note = ?, source = ?, actor = ?, "
-                        "queued_at = ? WHERE id = ?",
-                        (payload, command.created_at, command.sort_at, note,
-                         command.source, command.actor, _now(), twin[0]))
+                        "price_id = ?, queued_at = ? WHERE id = ?",
+                        (command.kind.value, json.dumps(merged, ensure_ascii=False),
+                         command.created_at, command.sort_at, note, command.source,
+                         command.actor, command.price_id, _now(), twin[0]))
                     await db.commit()
                     command.id = twin[0]
                     return command
