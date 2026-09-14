@@ -12,11 +12,15 @@ from src.bot.auth import AuthMiddleware
 from src.bot.commands import setup_bot_commands
 from src.bot.handlers import router
 from src.bot.catalog_handlers import router as catalog_router
+from src.bot.model_handlers import (TelegramListener, TelegramProvider,
+                                    router as model_router)
+from src.bot.model_loop import AgentLoop
 from src.bot.pricing_handlers import router as pricing_router
 from src.config import load_config
 from src.email_tool.client import MailClient
 from src.onec.client import OnecClient
 from src.storage.pricing import PricingStore
+from src.model.service import PriceListService
 from src.storage.command_queue import CommandQueue
 from src.storage.model_store import ModelStore
 from src.storage.suppliers import SupplierStore
@@ -46,9 +50,6 @@ async def main() -> None:
     # задач поднимается в память, но команд, которые его меняют, ещё нет.
     model_store = ModelStore(config.db_path)
     await model_store.init()
-    known_prices = await model_store.load_all()
-    if known_prices:
-        logger.info("В модели прайсов: %d", len(known_prices))
 
     # Очередь команд визуалов (§7). Взятая, но не завершённая команда означает одно:
     # процесс умер, не доработав. Живых взятых в момент старта быть не может — агент
@@ -58,6 +59,12 @@ async def main() -> None:
     stale = await commands.requeue_stale()
     if stale:
         logger.info("Возвращено в очередь команд после перезапуска: %d", stale)
+
+    model = PriceListService(
+        model_store, supplier_store,
+        save_file=lambda content, name: price_files.save(config.db_path, name, content))
+    await model.load()
+    logger.info("Модель поднята: прайсов %d", len(model.prices))
 
     # Прайсы, которые админы разбирали до перезапуска, поднимаем обратно в память: история
     # диалога лежит в базе и рестарт переживает, а файл до 10.09.2026 не переживал — и
@@ -98,19 +105,25 @@ async def main() -> None:
     )
 
     bot = Bot(token=config.telegram_bot_token)
+    loop = AgentLoop(commands, model, providers=[TelegramProvider()])
+    model.events.subscribe(TelegramListener(bot, [config.admin_telegram_id]))
+
     dp = Dispatcher(store=store, orchestrator=orchestrator, openai_api_key=config.openai_api_key,
                     onec=onec, pricing_store=pricing_store,
-                    supplier_store=supplier_store)
+                    supplier_store=supplier_store, model=model, queue=commands, loop=loop)
     dp.message.middleware(AuthMiddleware(store, config.admin_telegram_id))
     dp.callback_query.middleware(AuthMiddleware(store, config.admin_telegram_id))
     dp.include_router(catalog_router)   # справочники: только команды, конфликтов нет
-    dp.include_router(pricing_router)   # прайсы — до общего роутера: он ловит любой текст
+    # СТАРЫЙ ПРАЙСОВЫЙ ПОТОК ОТКЛЮЧЁН на время обкатки модели: оба реагировали бы на один
+    # присланный файл. Вернуть — раскомментировать строку ниже.
+    # dp.include_router(pricing_router)
+    dp.include_router(model_router)     # модель: команды и приём файла
     dp.include_router(router)
 
     await setup_bot_commands(bot, config.admin_telegram_id)
 
     logger.info("Запуск бота (polling)")
-    await dp.start_polling(bot)
+    await asyncio.gather(dp.start_polling(bot), loop.run())
 
 
 if __name__ == "__main__":
