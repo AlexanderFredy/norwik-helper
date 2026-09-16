@@ -108,10 +108,30 @@ async def main() -> None:
                                usage_labels={"kind": "pricing", "price_doc": filename})
         return tasks
 
+    async def run_task(price, task, content, guard):
+        """Выполнение задачи агентом (§6.2) — С НАСТОЯЩЕЙ ЗАПИСЬЮ в 1С.
+
+        `guard` приходит из модели и бросает, если прогон потерял право писать;
+        исполнитель зовёт его вплотную перед каждой записью.
+
+        Категории (`/categories`) передаются сюда по той же причине, что и в прайсовый
+        поток: они ограничивают, что вообще разрешено трогать, и проверяются кодом, а не
+        моделью.
+        """
+        from src.model.executor import run
+        scope = [c["category"] for c in await pricing_store.list_scope()]
+        return await run(orchestrator, onec, price, task, content, guard, scope=scope,
+                         usage_labels={"kind": "model_task",
+                                       "price_doc": price.supplier_price.filename})
+
     model = PriceListService(
         model_store, supplier_store,
         save_file=lambda content, name: price_files.save(config.db_path, name, content),
-        build_tasks=build_tasks)
+        build_tasks=build_tasks,
+        # БЕЗ 1С ВЫПОЛНЕНИЕ ОСТАЁТСЯ ЗАГЛУШКОЙ. Дать агенту инструменты записи, которым
+        # некуда писать, значит получить прогон, честно доложивший об успехе на ошибках
+        # соединения.
+        run_task=run_task if onec is not None else None)
     await model.load()
     logger.info("Модель поднята: прайсов %d", len(model.prices))
 

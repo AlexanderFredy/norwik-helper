@@ -3,9 +3,14 @@
 Список прайсов живёт в памяти процесса и пишется в базу при каждом изменении. Агент один,
 визуалы к базе напрямую не обращаются — поэтому синглтон в памяти остаётся настоящим.
 
-**Выполнение задачи здесь ЗАГЛУШКА:** в 1С ничего не пишется. Пока проверяется обвязка —
-список прайсов, задачи, статусы, захват. Настоящее выполнение придёт вместе с инструментами
-LLM (§6.1–6.2), и подменить надо будет ровно один метод `_execute`.
+**Выполнение задачи ПИШЕТ В 1С** (§6.2), и делает это `src/model/executor.py`. Если
+исполнитель не передан (`run_task=None`), метод остаётся заглушкой: так тесты идут без
+сети и без ключа, а бот без настроенного 1С всё равно показывает список.
+
+**ПРАВО НА ЗАПИСЬ ПРОВЕРЯЕТСЯ ВНУТРИ ПРОГОНА, а не только на старте.** Прогон длится
+минуты, и за это время захват может истечь, админ — снять его, а прайс — исчезнуть.
+Проверка сидит в `guard`, который исполнитель зовёт вплотную перед каждой записью:
+статус поправим, запись в 1С нет.
 """
 from __future__ import annotations
 
@@ -40,13 +45,16 @@ def _description(command: Command) -> str:
 
 class PriceListService:
     def __init__(self, model_store, supplier_store, save_file, broadcaster=None,
-                 build_tasks=None) -> None:
+                 build_tasks=None, run_task=None) -> None:
         self._store = model_store
         self._suppliers = supplier_store
         self._save_file = save_file
         # Формирование задач агентом (§6.1). None — падаем на заглушку: так тесты идут
         # без сети и без ключа, а бот без настроенного 1С всё равно показывает список.
         self._build_tasks = build_tasks
+        # Выполнение задачи агентом (§6.2): `run_task(price, task, content, guard)` →
+        # (статус, результат). None — заглушка, в 1С не пишется ничего.
+        self._run_task = run_task
         self.events = broadcaster or Broadcaster()
         self._prices: list[Price] = []
         self._locks: dict[int, lk.Lock] = {}
@@ -152,11 +160,10 @@ class PriceListService:
     # ------------------------------------------------------------------ задачи
 
     async def _execute(self, command: Command) -> None:
-        """ЗАГЛУШКА выполнения: в 1С ничего не пишется.
+        """Выполнить задачу: агент читает 1С и пишет в неё (§6.2).
 
-        Здесь встанет вызов LLM с идентификатором, актуальным описанием, прошлым результатом
-        и текущим статусом (§6.2). Пока отмечаем задачу выполненной с явной пометкой, чтобы
-        результат нельзя было принять за настоящую запись.
+        Без `run_task` остаётся заглушкой с явной пометкой — результат нельзя принять за
+        настоящую запись.
         """
         price, task = self.task(command.task_id)
         if task is None:
@@ -173,19 +180,73 @@ class PriceListService:
             await self._reject(command, "задача уже выполнена, перечитайте состояние")
             return
 
-        await self._take_lock(price, command.actor)
+        lock = await self._take_lock(price, command.actor)
         await self.events.publish(Event(
             EventKind.TASK_RUNNING, price_id=price.id, task_id=task.id,
             text=f"Задача {task.id} взята в работу: {task.label()}"))
 
-        task.complete(TaskStatus.DONE,
-                      "ЗАГЛУШКА: выполнение не производилось, в 1С ничего не записано")
+        try:
+            status, result = await self._run(price, task, lock, command.actor)
+        except Exception:                               # noqa: BLE001
+            logger.exception("Прогон задачи %s сорвался", task.id)
+            # Задача ОСТАЁТСЯ в очереди: сорвавшийся прогон мог успеть записать часть, и
+            # выдавать это за успех нельзя. Что именно записано — видно в 1С.
+            status = TaskStatus.TODO
+            result = ("Прогон сорвался, подробности в журнале. Часть правок могла "
+                      "записаться — проверьте в 1С перед повтором.")
+
+        task.complete(status, result)
         await self._store.update_task(task)
         await self._after_task(price)
 
         await self.events.publish(Event(
             EventKind.TASK_STATUS, price_id=price.id, task_id=task.id,
             text=f"Задача {task.id} — {task.status.value}. {task.result}"))
+
+    async def _run(self, price: Price, task: PriceTask, lock: lk.Lock,
+                   actor: str) -> tuple[TaskStatus, str]:
+        """Сам прогон. Возвращает исход, ничего не сохраняя — это дело вызывающего."""
+        if self._run_task is None:
+            return (TaskStatus.DONE,
+                    "ЗАГЛУШКА: выполнение не производилось, в 1С ничего не записано")
+
+        from src.storage import price_files
+
+        content = price_files.load(price.supplier_price.file_path)
+        if content is None:
+            return (TaskStatus.TODO, "Файл прайса не найден на сервере — работать нечем.")
+
+        generation = lock.generation
+
+        def guard() -> None:
+            """Право на запись. Зовётся ВПЛОТНУЮ ПЕРЕД каждой записью в 1С.
+
+            Между стартом прогона и записью проходят минуты: аренда могла истечь, админ
+            мог снять захват, прайс — уничтожить. Проверять только на старте значит
+            допустить запись от имени прогона, который уже никто не ждёт.
+
+            `generation` защищает от самого коварного случая: захват СНЯЛИ и тут же взяли
+            заново другим прогоном. Актор и живость совпадут, а поколение — нет.
+            """
+            current = self._locks.get(price.id)
+            if not lk.valid_for(current, generation, actor):
+                from src.model.executor import WriteRefused
+                raise WriteRefused(
+                    "захват прайса потерян — прогон отменён либо аренда истекла")
+            # Признак жизни: работающий прогон продлевает аренду, зависший теряет её.
+            # Продлеваем ЗДЕСЬ, а не по таймеру, ровно потому, что это единственное
+            # место, где точно известно: прогон дошёл до записи и жив.
+            self._locks[price.id] = lk.renew(current)
+
+        status, result = await self._run_task(price, task, content, guard)
+
+        # Аренду, продлённую внутри прогона, надо сохранить: иначе после перезапуска
+        # процесса захват выглядел бы истёкшим раньше, чем он есть.
+        alive = self._locks.get(price.id)
+        if alive is not None and alive.generation == generation:
+            await self._store.save_lock(alive)
+
+        return status, result
 
     async def _set_task_status(self, command: Command) -> None:
         price, task = self.task(command.task_id)

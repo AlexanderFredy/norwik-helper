@@ -37,11 +37,18 @@ class HelpTextTest(unittest.TestCase):
                     "/adduser", "/removeuser", "/listusers"):
             self.assertIn(cmd, text)
 
-    def test_admin_is_warned_that_execution_is_a_stub(self):
-        """Заглушка должна быть названа прямо: иначе «выполнено» прочтут как запись в 1С."""
+    def test_admin_is_warned_that_execution_writes_to_1c(self):
+        """Запись должна быть названа прямо, и заранее.
+
+        Раньше здесь висело предупреждение о заглушке — оно было ровно так же
+        обязательно, но с обратным смыслом: «выполнено» нельзя было прочесть как запись.
+        Теперь наоборот: `/run` пишет в боевой справочник без второго подтверждения, и
+        узнать об этом из справки надо ДО нажатия, а не по изменившимся ценам.
+        """
         text = build_help(is_admin=True)
-        self.assertIn("ЗАГЛУШКА", text)
-        self.assertIn("в 1С ничего не пишется", text)
+        self.assertIn("ПИШЕТ В 1С", text)
+        self.assertIn("без второго подтверждения", text)
+        self.assertNotIn("ЗАГЛУШКА", text)
 
     def test_disabled_flow_is_not_advertised(self):
         text = build_help(is_admin=True)

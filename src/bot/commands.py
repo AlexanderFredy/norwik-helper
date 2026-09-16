@@ -21,7 +21,7 @@ ADMIN_COMMANDS = COMMON_COMMANDS + [
     # убраны из меню: показывать то, что не отвечает, хуже, чем не показывать вовсе.
     BotCommand(command="prices", description="Список прайсов в работе"),
     BotCommand(command="tasks", description="Задачи по прайсу"),
-    BotCommand(command="run", description="Выполнить задачу (заглушка)"),
+    BotCommand(command="run", description="Выполнить задачу"),
     BotCommand(command="rebuild", description="Собрать задачи прайса заново"),
     BotCommand(command="suppliers", description="Справочник поставщиков"),
     BotCommand(command="signatures", description="Форматы прайсов поставщиков"),
@@ -52,11 +52,11 @@ _ADMIN_HELP = """
 Устаревший прайс не принимается; чтобы взять его силой, пришлите файл с подписью
 /model_force.
 
-<b>ВАЖНО: выполнение задач сейчас ЗАГЛУШКА — в 1С ничего не пишется.</b>
+<b>ВНИМАНИЕ: выполнение задачи ПИШЕТ В 1С сразу, без второго подтверждения.</b>
 
 /prices — список прайсов: статус, задачи, захват
 /tasks &lt;номер&gt; — задачи по прайсу
-/run &lt;номер задачи&gt; — выполнить (заглушка)
+/run &lt;номер задачи&gt; — выполнить (пишет в 1С)
 /edit &lt;номер&gt; &lt;текст&gt; — поправить описание задачи
 /status &lt;номер&gt; &lt;статус&gt; — сменить статус задачи
 /task_delete &lt;номер&gt; — удалить задачу
@@ -99,7 +99,7 @@ _ADMIN_HELP = """
 _NO_ONEC = """
 
 ⚠️ Интеграция с 1С не настроена (нет ONEC_BASE_URL/ONEC_TOKEN). Для обкатки модели
-это не мешает: выполнение задач сейчас заглушка и в 1С ничего не пишет."""
+это не мешает: задачи модели работают отдельно."""
 
 
 def build_help(is_admin: bool, onec_enabled: bool = True) -> str:
