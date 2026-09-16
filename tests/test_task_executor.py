@@ -35,21 +35,23 @@ def nom(ref="T1", article="A1", name="Дуб Верона", collection="Vintage"
 
 
 class FakeNomenclature:
-    def __init__(self, items):
+    def __init__(self, items, tm=""):
         self.items = list(items)
+        self.tm = tm
         self.errors = []
 
 
 class FakeOnec:
     """Считает записи и отдаёт заданную номенклатуру."""
 
-    def __init__(self, items=None):
+    def __init__(self, items=None, tm_name="Most Flooring"):
         self._items = list(items or [nom()])
+        self.tm_name = tm_name
         self.price_writes = []
         self.item_writes = []
 
     def by_tm_all(self, tm_code, **kw):
-        return FakeNomenclature(self._items)
+        return FakeNomenclature(self._items, tm=self.tm_name)
 
     def set_prices(self, payload):
         self.price_writes.append(payload)
@@ -144,6 +146,56 @@ class WriteGuardTest(unittest.IsolatedAsyncioTestCase):
             "tm_code": "TM1", "collection": "Такой нет", "purchase": 1500})
         self.assertEqual(onec.price_writes, [])
         self.assertIn("нет коллекции", out)
+
+
+class BrandNameTest(unittest.IsolatedAsyncioTestCase):
+    """Имя марки в наименованиях берётся из 1С, а не из того, что прислала модель.
+
+    ЧТО ЭТО ЛОВИТ. `build_name` собирает имя из частей, и марка была среди них. Модель,
+    увидев в прайсе «MOST FLOOR», честно передавала это написание — и нормализация
+    переименовывала сотни позиций. Запретом в промпте не лечится: модель копирует не по
+    злому умыслу, а потому что так написано в источнике.
+    """
+
+    async def _written_name(self, onec, tm_name):
+        tools = TaskTools(onec, b"", "p.xlsx", allow, kind=TaskKind.NORMALIZE_NAMES)
+        await tools.execute("write_items", {
+            "tm_code": "TM1", "tm_name": tm_name,
+            "product_type": "PT1", "product_type_name": "Ламинат",
+            "collection": "Vintage",
+            "items": [{"op": "update", "ref": "T1", "title": "Дуб Медовый"}]})
+        if not onec.item_writes:
+            return ""
+        ops = onec.item_writes[0]
+        return next((o.get("name", "") for o in ops if o.get("name")), "")
+
+    async def test_the_1c_spelling_wins(self):
+        onec = FakeOnec(tm_name="Most Flooring")
+        name = await self._written_name(onec, "MOST FLOOR")
+        self.assertIn("Most Flooring", name)
+        self.assertNotIn("MOST FLOOR", name)
+
+    async def test_divergence_is_reported_not_swallowed(self):
+        """Переименование марки — решение админа, и он узнает о расхождении только так."""
+        onec = FakeOnec(tm_name="Most Flooring")
+        tools = TaskTools(onec, b"", "p.xlsx", allow, kind=TaskKind.NORMALIZE_NAMES)
+        out = await tools.execute("write_items", {
+            "tm_code": "TM1", "tm_name": "MOST FLOOR",
+            "product_type": "PT1", "product_type_name": "Ламинат",
+            "collection": "Vintage",
+            "items": [{"op": "update", "ref": "T1", "title": "Дуб Медовый"}]})
+        self.assertIn("Most Flooring", out)
+        self.assertIn("MOST FLOOR", out)
+
+    async def test_matching_spelling_says_nothing(self):
+        onec = FakeOnec(tm_name="Most Flooring")
+        tools = TaskTools(onec, b"", "p.xlsx", allow, kind=TaskKind.NORMALIZE_NAMES)
+        out = await tools.execute("write_items", {
+            "tm_code": "TM1", "tm_name": "most flooring",
+            "product_type": "PT1", "product_type_name": "Ламинат",
+            "collection": "Vintage",
+            "items": [{"op": "update", "ref": "T1", "title": "Дуб Медовый"}]})
+        self.assertNotIn("⚠️ Марка", out)
 
 
 class OutcomeTest(unittest.IsolatedAsyncioTestCase):

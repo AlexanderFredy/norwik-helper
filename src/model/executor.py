@@ -26,7 +26,7 @@ import logging
 from datetime import date
 from decimal import Decimal
 
-from src.model.enums import TaskKind, TaskStatus
+from src.model.enums import TaskKind, TaskStatus, TaskSubject
 from src.price_tool import items as item_rules
 # `plan_collection` есть И в `changes` (цены), И в `items` (справочник) — разные функции
 # с одним именем. Ценовую берём под своим именем, справочную зовём через модуль:
@@ -124,6 +124,9 @@ TOOLS = [
             "НАИМЕНОВАНИЯ СОБИРАЕТ КОД. Передавай ЧАСТИ: `title` — только название "
             "расцветки («Дуб Медовый»), `tail` — размер, которым поставщик различает "
             "позиции. Имя, полное наименование и наименование для сайта соберутся сами.\n"
+            "ИМЯ МАРКИ БЕРЁТСЯ ИЗ 1С и переданное тобой не используется: как пишется "
+            "марка — решает справочник, а не прайс. Написания разошлись — скажи об этом "
+            "в finish, менять его вправе только админ.\n"
             "Передавай только то, что МЕНЯЕТСЯ: отсутствие поля значит «не трогать».\n"
             "Цены сюда НЕ передаются — для них отдельный инструмент."),
         "input_schema": {
@@ -244,6 +247,7 @@ class TaskTools:
         self._scope = list(scope or [])
         self._sheets = None
         self._items_cache: dict[str, list] = {}
+        self._tm_names: dict[str, str] = {}     # код марки → её имя В 1С, не в прайсе
 
         self.written_items = 0
         self.written_prices = 0
@@ -312,7 +316,24 @@ class TaskTools:
             nom = await asyncio.to_thread(self._onec.by_tm_all, tm_code,
                                           include_not_exported=True)
             self._items_cache[tm_code] = list(nom.items)
+            # Каноническое имя марки — из 1С, и только оттуда (см. `_canonical_tm`).
+            self._tm_names[tm_code] = (nom.tm or "").strip()
         return self._items_cache[tm_code]
+
+    async def _canonical_tm(self, tm_code: str) -> str:
+        """Имя марки ТАК, КАК ОНО ЗАПИСАНО В 1С.
+
+        **Агент на это имя влиять не должен.** `build_name` собирает наименование из
+        частей `[вид] [марка] [коллекция] [название] [размер]`, и марку он брал из того,
+        что прислала модель, — без отката к справочнику. Достаточно было скопировать
+        написание из прайса («MOST FLOOR» вместо «Most Flooring»), чтобы переименовать
+        сотни позиций разом, и это выглядело бы как обычная нормализация.
+
+        Запретом в промпте такое не лечится: модель копирует написание не по злому
+        умыслу, а потому что видит его в прайсе. Поэтому имя не спрашивают — его берут.
+        """
+        await self._nomenclature(tm_code)
+        return self._tm_names.get(tm_code, "")
 
     async def _items(self, inp: dict) -> str:
         tm_code = str(inp.get("tm_code") or "").strip()
@@ -431,11 +452,26 @@ class TaskTools:
             return "Не передан tm_code — без кода марки правку собрать нельзя."
 
         current = await self._nomenclature(tm_code)
+
+        # ИМЯ МАРКИ ПОДМЕНЯЕТСЯ НА КАНОН ИЗ 1С, что бы ни прислала модель. Расхождение
+        # при этом НЕ замалчивается: оно уезжает в ответ инструмента и оттуда в отчёт
+        # админу — переименование марки решает человек, а не прогон нормализации.
+        canonical = await self._canonical_tm(tm_code)
+        asked = str(inp.get("tm_name") or "").strip()
+        inp = dict(inp)
+        note = ""
+        if canonical:
+            inp["tm_name"] = canonical
+            if asked and asked.casefold() != canonical.casefold():
+                note = (f"\n⚠️ Марка в 1С называется «{canonical}», ты передал «{asked}». "
+                        f"В наименования пошёл вариант 1С. Если написание надо менять — "
+                        f"это отдельное решение админа, скажи о нём в finish.")
+
         # Правила сборки — общие с прайсовым потоком: имена, категории, что считать
         # значимой правкой. Свой второй набор разошёлся бы с первым молча.
         plan = item_rules.plan_collection(inp, current, self._scope)
         ops = plan.ops()
-        summary = item_rules.render(plan)
+        summary = item_rules.render(plan) + note
 
         if not ops:
             return summary + "\n\n[Записывать нечего — расхождений не нашлось.]"
@@ -585,6 +621,66 @@ PROMPT = """Ты — контент-менеджер интернет-магаз
 Не приписывай себе того, чего не делал: админ видит только твой текст."""
 
 
+async def run_normalization(onec, task, guard, scope=None):
+    """Нормализация наименований кодом (§6.2, вариант «без LLM»).
+
+    Модель не участвует: вход для `plan_collection` собирается из полей 1С, сборка имени —
+    существующие правила §19.5. Отсюда и свойства: ноль токенов, секунды вместо минут и
+    один и тот же результат при повторе.
+    """
+    from src.model import normalize as nz
+
+    tm_code = (task.address.tm.code or "").strip()
+    if not tm_code:
+        return (TaskStatus.TODO,
+                "У задачи нет кода марки 1С — нормализовать нечего. Пересоберите задачи "
+                "или укажите марку.")
+
+    nom = await asyncio.to_thread(onec.by_tm_all, tm_code, include_not_exported=True)
+    tm_name = (nom.tm or "").strip()
+    # Коллекция берётся из адреса задачи: она чаще всего адресована одной, и сужать
+    # первую настоящую запись до проверяемой глазами — правильно по умолчанию.
+    only = task.address.subject.label() if task.subject == TaskSubject.COLLECTION else ""
+
+    inputs, skipped, discontinued = nz.plan(nom.items, tm_code, tm_name,
+                                            only_collection=only)
+
+    if not inputs and not skipped:
+        return (TaskStatus.DONE,
+                f"В 1С не нашлось позиций для нормализации"
+                + (f" в коллекции «{only}»." if only else " по этой марке.")
+                + (f" Снятых с производства: {discontinued}." if discontinued else ""))
+
+    written = 0
+    failed: list[str] = []
+
+    for inp in inputs:
+        plan = item_rules.plan_collection(inp, list(nom.items), list(scope or []))
+        ops = plan.ops()
+        if not ops:
+            continue
+
+        # Право на запись — вплотную перед КАЖДЫМ вызовом 1С, ровно как в LLM-пути:
+        # коллекций может быть много, прогон длится, а захват за это время теряется.
+        guard()
+
+        result = await asyncio.to_thread(onec.set_items, ops)
+        written += int(result.get("updated") or 0)
+        for err in (result.get("errors") or [])[:20]:
+            failed.append(f"{err.get('ref') or err.get('index')}: "
+                          f"{err.get('code')} {err.get('message')}")
+
+    text = nz.report(written, skipped, discontinued, len(inputs))
+    if failed:
+        text += ("\n\nНЕ ЗАПИСАНО " + str(len(failed)) + ":\n"
+                 + "\n".join(f"— {f}" for f in failed))
+
+    # ЧАСТИЧНО — когда часть работы осталась человеку либо не записалась. Это штатный
+    # исход, и статус обязан его называть: «выполнена» скрыла бы список на разбор.
+    status = TaskStatus.PARTIAL if (skipped or failed) else TaskStatus.DONE
+    return status, text
+
+
 def task_brief(price, task) -> str:
     """Что именно предстоит сделать — одним куском для модели."""
     lines = [
@@ -617,6 +713,12 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
     Молчаливый агент не имеет права выдать себя за успех: не вызвал `finish` — задача
     остаётся «к обработке» с пояснением, а не помечается выполненной.
     """
+    # НОРМАЛИЗАЦИЯ ИДЁТ МИМО МОДЕЛИ. У неё нет ни одного входа снаружи 1С — прайс для
+    # неё не нужен вовсе, — а значит и решать нечего: имя собирается по шаблону из полей
+    # самой карточки. Платить за круги цикла и терпеть непредсказуемость незачем.
+    if task.kind == TaskKind.NORMALIZE_NAMES:
+        return await run_normalization(onec, task, guard, scope=scope)
+
     tools = TaskTools(onec, content, price.supplier_price.filename, guard,
                       scope=scope, kind=task.kind)
 
