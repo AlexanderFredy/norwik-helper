@@ -154,6 +154,25 @@ class CommandFlowTest(Base):
         self.assertIn("ЗАГЛУШКА", self.task.result)
         self.assertIn("в 1С ничего не записано", self.task.result)
 
+    async def test_edit_rides_along_with_the_run(self):
+        """Ключ `description` — тот, что шлёт форма 1С (§4.3 спеки формы).
+
+        У двух визуалов ключи разошлись: форма слала `description`, модель читала `text`,
+        — и правка из 1С пропадала МОЛЧА: задача выполнялась со старым описанием, ошибки
+        при этом не возникало. Ловится только проверкой обоих имён.
+        """
+        await self.send(CommandKind.EXECUTE_TASK, price_id=self.price.id,
+                        task_id=self.task.id,
+                        payload={"description": "сверить размеры плитки"})
+        self.assertEqual(self.task.description, "сверить размеры плитки")
+
+    async def test_edit_accepts_the_old_telegram_key(self):
+        """Команда, лежавшая в очереди со старым ключом, не должна пропасть при выкладке:
+        очередь переживает перезапуск (`requeue_stale`)."""
+        await self.send(CommandKind.EDIT_TASK_DESCRIPTION, price_id=self.price.id,
+                        task_id=self.task.id, payload={"text": "старый ключ"})
+        self.assertEqual(self.task.description, "старый ключ")
+
     async def test_run_survives_reload(self):
         await self.send(CommandKind.EXECUTE_TASK, price_id=self.price.id,
                         task_id=self.task.id)

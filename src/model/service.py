@@ -22,6 +22,22 @@ from src.model.task import PriceTask
 logger = logging.getLogger(__name__)
 
 
+def _description(command: Command) -> str:
+    """Текст правки описания из полезной нагрузки команды.
+
+    **Ключ `description`**, как называется само поле задачи и как его шлёт форма 1С.
+    `text` принимается как СТАРОЕ имя из Telegram: у двух визуалов оказались разные
+    ключи, и правки из 1С молча терялись — задача выполнялась со старым описанием, и
+    никакой ошибки при этом не возникало.
+
+    Алиас оставлен ради команд, которые лежат в очереди в момент выкладки: она переживает
+    перезапуск (`requeue_stale`), и правка, набранная минуту назад, не должна пропасть.
+    Когда такие команды заведомо доиграны, алиас можно убрать.
+    """
+    payload = command.payload or {}
+    return payload.get("description") or payload.get("text") or ""
+
+
 class PriceListService:
     def __init__(self, model_store, supplier_store, save_file, broadcaster=None,
                  build_tasks=None) -> None:
@@ -149,7 +165,7 @@ class PriceListService:
 
         # Правка описания могла приехать вместе с командой: при замещении в очереди
         # полезная нагрузка объединяется (§7), и свежий текст лежит здесь же.
-        text = (command.payload or {}).get("text")
+        text = _description(command)
         if text:
             task.set_description(text)
 
@@ -191,7 +207,7 @@ class PriceListService:
         price, task = self.task(command.task_id)
         if task is None:
             return await self._reject(command, "задача не найдена")
-        task.set_description((command.payload or {}).get("text", ""))
+        task.set_description(_description(command))
         await self._store.update_task(task)
         await self.events.publish(Event(
             EventKind.TASK_STATUS, price_id=price.id, task_id=task.id,

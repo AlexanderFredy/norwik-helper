@@ -176,7 +176,7 @@ async def cmd_edit(message: Message, command: CommandObject, model, queue,
         return
     await _send(message, Command(kind=CommandKind.EDIT_TASK_DESCRIPTION, source="telegram",
                                  actor=_actor(message), price_id=price.id,
-                                 task_id=task.id, payload={"text": parts[1]}), loop, queue)
+                                 task_id=task.id, payload={"description": parts[1]}), loop, queue)
 
 
 @router.message(CommandFilter("status"))
