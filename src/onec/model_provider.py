@@ -121,15 +121,20 @@ class OnecProvider(Listener):
         при сбое: иначе снимок, не доехавший из-за моргнувшей сети, не поехал бы никогда, и
         форма замерла бы на старом состоянии, ничем этого не показав.
         """
-        try:
-            await self._finish_sent(queue)
-        except Exception:                               # noqa: BLE001
-            logger.warning("Не удалось подтвердить команды 1С", exc_info=True)
-
+        # СНИМОК УХОДИТ ПЕРВЫМ, до отчёта о судьбе команд, и это не мелочь. Форма гасит
+        # кнопки, пока команда не закрыта; закрыв её раньше снимка, мы на мгновение
+        # отдали бы админу живые кнопки поверх СТАРЫХ данных — он увидел бы задачу
+        # неизменившейся и решил бы, что нажатие пропало. В обратном порядке результат
+        # появляется первым, а кнопки оживают уже поверх него.
         try:
             await self._push_state()
         except Exception:                               # noqa: BLE001
             logger.warning("Снимок состояния не доехал до 1С", exc_info=True)
+
+        try:
+            await self._finish_sent(queue)
+        except Exception:                               # noqa: BLE001
+            logger.warning("Не удалось подтвердить команды 1С", exc_info=True)
 
         try:
             await self._pull_commands(queue)

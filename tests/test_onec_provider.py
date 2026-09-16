@@ -261,6 +261,30 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
                  if i["state"] in ("выполнена", "отклонена")}
         self.assertEqual(final, {"c1": "выполнена", "c2": "выполнена"})
 
+    async def test_snapshot_goes_before_the_outcome(self):
+        """Порядок важен для глаз админа, а не для машины.
+
+        Форма гасит кнопки, пока команда не закрыта. Закрыв её раньше снимка, мы на
+        мгновение отдали бы живые кнопки поверх СТАРЫХ данных: задача выглядит
+        неизменившейся, и нажатие кажется пропавшим.
+        """
+        onec = FakeOnec([command()])
+        order = []
+        onec.set_model_state = lambda prices: order.append("снимок") or {"version": 1}
+        onec.agent_commands_state = lambda items: order.append(
+            "судьба:" + items[0]["state"]) or {"updated": len(items)}
+
+        provider = self.make(onec)
+        await provider.collect(self.queue)
+        taken = await self.queue.take()
+        await self.queue.done(taken[0].id)
+        order.clear()
+
+        await provider.notify(Event(EventKind.TASK_STATUS, text="задача закрыта"))
+        await provider.collect(self.queue)
+
+        self.assertEqual(order[:2], ["снимок", "судьба:выполнена"])
+
     async def test_still_pending_command_is_not_reported_done(self):
         onec = FakeOnec([command()])
         provider = self.make(onec)

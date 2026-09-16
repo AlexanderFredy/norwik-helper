@@ -160,6 +160,19 @@ class Probe:
         self.check("code = command_not_found", got.get("code") == "command_not_found",
                    str(r6)[:300])
 
+        print("\n8а. Отчёт, который ничего не изменил, версию НЕ двигает")
+        # Счётчик версии — единственное, что читает таймер формы. Начни он расти на
+        # каждом опросе — форма перечитывала бы списки каждые пять секунд, и вся
+        # экономия из §2.5 пропала бы. Обратную половину (закрытие команды ДОЛЖНО
+        # двигать версию) отсюда не проверить: команду ставит форма, HTTP её не заводит.
+        code, before = self.call("/get-products/set-model-state", {"prices": []})
+        self.call("/get-products/agent-commands-state",
+                  {"commands": [{"id": "нет-такой", "state": "выполнена"}]})
+        code, after = self.call("/get-products/set-model-state", {"prices": []})
+        self.check("версия не выросла на пустом отчёте",
+                   after.get("version") == before.get("version"),
+                   "%s → %s" % (before.get("version"), after.get("version")))
+
         print("\n9. Неизвестное состояние — отвергается со списком допустимых")
         code, r7 = self.call("/get-products/agent-commands-state",
                              {"commands": [{"id": "что-угодно", "state": "потерялась"}]})
