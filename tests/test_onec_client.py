@@ -366,5 +366,79 @@ class SetItemsTest(unittest.TestCase):
             c.set_items([])
 
 
+class RetryTest(unittest.TestCase):
+    """Повторы при обрыве сети.
+
+    Провайдер модели опрашивает 1С раз в 5 секунд бесконечно, и сервер РВЁТ простаивающее
+    keep-alive соединение по своему таймауту. Найдено живым прогоном: цикл падал на
+    `WinError 10054` (`httpx.ReadError`) через пару минут ожидания.
+    """
+
+    def setUp(self):
+        # Паузы между попытками не нужны в тесте: проверяется, что повтор ЕСТЬ, а не
+        # сколько он ждёт. Без подмены тест спал бы по шесть секунд на каждый случай.
+        import src.onec.client as mod
+        self._sleep = mod.time.sleep
+        mod.time.sleep = lambda _s: None
+        self.addCleanup(lambda: setattr(mod.time, "sleep", self._sleep))
+
+    def _flaky(self, fails, error):
+        """Клиент, чей транспорт падает `fails` раз, а потом отвечает."""
+        state = {"n": 0}
+
+        def handler(request):
+            state["n"] += 1
+            if state["n"] <= fails:
+                raise error
+            return httpx.Response(200, content=b'{"version": 7, "changed": 0}')
+
+        c = OnecClient("http://example.invalid/api", "token", retries=4)
+        c._client = httpx.Client(base_url="http://example.invalid/api",
+                                 transport=httpx.MockTransport(handler))
+        return c, state
+
+    def test_post_retries_a_dropped_keepalive(self):
+        """До правки повторов у POST не было вовсе, и снимок терялся на ровном месте."""
+        c, state = self._flaky(2, httpx.ReadError("[WinError 10054]"))
+        self.assertEqual(c.set_model_state([])["version"], 7)
+        self.assertEqual(state["n"], 3)
+
+    def test_get_retries_a_dropped_keepalive(self):
+        c, state = self._flaky(1, httpx.ReadError("[WinError 10054]"))
+        c.agent_commands()
+        self.assertEqual(state["n"], 2)
+
+    def test_connect_error_is_retried_too(self):
+        """Прежний повод — 1С не принимает соединение (WinError 10060)."""
+        c, state = self._flaky(2, httpx.ConnectError("[WinError 10060]"))
+        c.agent_commands()
+        self.assertEqual(state["n"], 3)
+
+    def test_gives_up_after_the_limit(self):
+        """Бесконечный повтор подвесил бы оборот цикла молча."""
+        c, _ = self._flaky(99, httpx.ReadError("сеть легла"))
+        with self.assertRaises(httpx.ReadError):
+            c.set_model_state([])
+
+    def test_server_error_is_not_retried(self):
+        """500 от 1С — это ОТВЕТ, а не обрыв: повтор приведёт тот же самый.
+
+        Отличать их обязательно: ошибка BSL иначе множилась бы на четыре попытки, а
+        `set-model-state` четырежды пытался бы применить снимок, который 1С отвергла.
+        """
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            return httpx.Response(500, content=b'{"error": "handler_failed"}')
+
+        c = OnecClient("http://example.invalid/api", "token", retries=4)
+        c._client = httpx.Client(base_url="http://example.invalid/api",
+                                 transport=httpx.MockTransport(handler))
+        with self.assertRaises(httpx.HTTPStatusError):
+            c.set_model_state([])
+        self.assertEqual(calls["n"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

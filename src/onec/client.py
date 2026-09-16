@@ -281,12 +281,34 @@ class OnecClient:
         self._client.close()
 
     def _get(self, path: str, params: dict | None = None) -> httpx.Response:
-        """GET с повторами: сервис 1С периодически не принимает соединение (WinError 10060)."""
+        """GET с повторами. Сеть до 1С рвётся по двум разным поводам, и оба штатные."""
+        return self._retry(lambda: self._client.get(path, params=params))
+
+    def _retry(self, call):
+        """Повторить запрос, если оборвалась сеть. Ошибки самой 1С не трогаются.
+
+        **Ловится `TransportError`, а не три отдельных исключения.** Поводов два, и второй
+        нашёлся только на длинном прогоне:
+
+          * `WinError 10060` — сервис не принимает соединение, было известно давно;
+          * `WinError 10054` (`httpx.ReadError`) — сервер РВЁТ простаивающее keep-alive
+            соединение, и следующий запрос уходит в уже мёртвый сокет. Провайдер модели
+            опрашивает 1С раз в 5 секунд бесконечно, так что это не редкость, а
+            расписание: клиент живёт часами, а IIS закрывает неиспользуемые соединения
+            по своему таймауту.
+
+        Повтор здесь и лечит: httpx открывает новое соединение взамен закрытого.
+        `TransportError` — общий предок всех сетевых сбоев httpx, и перечислять их
+        поимённо значит ждать следующего забытого.
+
+        `HTTPStatusError` сюда НЕ попадает: 500 от 1С это ответ, а не обрыв, и повторять
+        его бессмысленно — приедет тот же самый.
+        """
         last: Exception | None = None
         for attempt in range(self._retries):
             try:
-                return self._client.get(path, params=params)
-            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
+                return call()
+            except httpx.TransportError as exc:
                 last = exc
                 time.sleep(2 * (attempt + 1))
         raise last  # type: ignore[misc]
@@ -530,7 +552,16 @@ class OnecClient:
 
     def _post_json(self, path: str, payload: dict, timeout: float = 60) -> dict:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        r = self._client.post(path, content=body, headers=JSON_UTF8, timeout=timeout)
+        # Повторы обязательны и здесь, а не только у GET: провайдер зовёт эти маршруты в
+        # том же бесконечном цикле, и оборванное keep-alive соединение достаётся тому
+        # запросу, который случился первым, — POST ничем не защищённее GET.
+        #
+        # Повтор БЕЗОПАСЕН, потому что оба POST идемпотентны по построению:
+        # `set-model-state` кладёт полный снимок (повтор даст `changed = 0`), а
+        # `agent-commands-state` двигает состояние команды только вперёд и на повторное
+        # сообщение отвечает `already_final`.
+        r = self._retry(lambda: self._client.post(
+            path, content=body, headers=JSON_UTF8, timeout=timeout))
         text = r.content.decode("utf-8-sig", errors="replace")
         # Необработанное исключение BSL веб-сервер подменяет своей страницей: текста 1С в
         # ней нет вовсе, и без этой проверки мы бы разбирали HTML как JSON.
