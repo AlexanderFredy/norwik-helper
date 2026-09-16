@@ -231,46 +231,64 @@ def watch(stand):
     print("Ctrl+C — вычистить зеркало и выйти.\n")
 
     while True:
-        answer = stand.client.agent_commands()
-
-        if answer.get("missing"):
-            print("!! в 1С не хватает объектов: %s" % ", ".join(answer["missing"]))
-        if answer.get("error"):
-            print("!! эндпоинт команд ответил ошибкой: %s" % answer["error"])
-
-        commands = answer.get("commands") or []
-        if commands:
-            # «принята» — ПЕРВЫМ делом, до применения: форма обязана видеть, что команду
-            # забрали, даже если применение затянется или упадёт.
-            stand.client.agent_commands_state(
-                [{"id": c["id"], "state": "принята", "message": ""}
-                 for c in commands])
-
-            results = []
-            for raw in commands:
-                stand.seen += 1
-                print("→ %s" % describe(raw))
-
-                # Разбор идёт РАБОЧИМ кодом провайдера, а не отдельным: проверяем то, что
-                # поедет в бою, включая нули вместо пустых значений и приставку `1c:`.
-                parsed = stand.parser._parse(raw)
-                if parsed is None:
-                    results.append({"id": raw["id"], "state": "отклонена",
-                                    "message": "неизвестный вид команды"})
-                    print("   отклонено: провайдер не знает такой вид")
-                    continue
-
-                ok, reason = stand.apply(raw)
-                results.append({"id": raw["id"],
-                                "state": "выполнена" if ok else "отклонена",
-                                "message": reason})
-                print("   %s" % ("применено" if ok else "отклонено: " + reason))
-
-            stand.push()
-            stand.client.agent_commands_state(results)
-            print("   снимок обновлён, форма покажет через ~5 с\n")
+        # ОБОРОТ НЕ ИМЕЕТ ПРАВА УБИТЬ СТЕНД. Стенд живёт часами, пока форму правят в
+        # конфигураторе, а обновление конфигурации базы данных роняет сервис на
+        # несколько секунд: 1С отдаёт страницу веб-сервера «500», и разбор падает.
+        # Умереть на этом значит бросить человека без стенда ровно в тот момент, когда
+        # он выложил правку и идёт её проверять.
+        #
+        # Боевой провайдер устроен так же (`OnecProvider.collect` ловит каждый шаг
+        # отдельно) — и по той же причине, только у него это ещё и про сеть.
+        try:
+            turn(stand)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:                        # noqa: BLE001
+            print("!! оборот сорвался: %s" % exc)
+            print("   жду и пробую снова — обновление конфигурации 1С выглядит так же\n")
 
         time.sleep(PERIOD)
+
+
+def turn(stand):
+    answer = stand.client.agent_commands()
+
+    if answer.get("missing"):
+        print("!! в 1С не хватает объектов: %s" % ", ".join(answer["missing"]))
+    if answer.get("error"):
+        print("!! эндпоинт команд ответил ошибкой: %s" % answer["error"])
+
+    commands = answer.get("commands") or []
+    if commands:
+        # «принята» — ПЕРВЫМ делом, до применения: форма обязана видеть, что команду
+        # забрали, даже если применение затянется или упадёт.
+        stand.client.agent_commands_state(
+            [{"id": c["id"], "state": "принята", "message": ""}
+             for c in commands])
+
+        results = []
+        for raw in commands:
+            stand.seen += 1
+            print("→ %s" % describe(raw))
+
+            # Разбор идёт РАБОЧИМ кодом провайдера, а не отдельным: проверяем то, что
+            # поедет в бою, включая нули вместо пустых значений и приставку `1c:`.
+            parsed = stand.parser._parse(raw)
+            if parsed is None:
+                results.append({"id": raw["id"], "state": "отклонена",
+                                "message": "неизвестный вид команды"})
+                print("   отклонено: провайдер не знает такой вид")
+                continue
+
+            ok, reason = stand.apply(raw)
+            results.append({"id": raw["id"],
+                            "state": "выполнена" if ok else "отклонена",
+                            "message": reason})
+            print("   %s" % ("применено" if ok else "отклонено: " + reason))
+
+        stand.push()
+        stand.client.agent_commands_state(results)
+        print("   снимок обновлён, форма покажет через ~5 с\n")
 
 
 def main():
