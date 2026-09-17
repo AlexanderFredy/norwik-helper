@@ -267,6 +267,25 @@ class SilentAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "Обновлено 5 цен в коллекции.")
 
 
+class AdminEditTest(unittest.TestCase):
+    """Правка админа старше рассуждений агента, и он должен это знать.
+
+    Описание уезжает одним куском, и отличить «анализ агента» от «ответа админа» по
+    структуре нельзя — поля разные у них нет. Значит правило должно быть в промпте:
+    иначе агент читает свой же вопрос, не замечает ответа ниже и решает заново сам.
+    """
+
+    def test_prompt_names_the_admin_edit_authoritative(self):
+        from src.model.executor import PROMPT
+        self.assertIn("его слова старше твоих", PROMPT)
+        self.assertIn("действуй по ОТВЕТУ", PROMPT)
+
+    def test_prompt_says_he_cannot_ask_mid_run(self):
+        """Ключевое ограничение: спросить посреди работы нельзя, только `finish`."""
+        from src.model.executor import PROMPT
+        self.assertIn("Переспросить посреди работы ты не можешь", PROMPT)
+
+
 class BriefTest(unittest.TestCase):
 
     def test_brief_carries_what_the_agent_needs(self):
