@@ -231,6 +231,9 @@ class OnecProvider(Listener):
             "description": task.description,
             "result": task.result,
             "done_at": task.done_at,
+            # Отметка о ПРОГОНЕ — отдельно от даты выполнения: по `done_at` не отличить
+            # «не брались» от «пробовали и не вышло», а админу это разное.
+            "run_at": task.run_at,
         }
 
     async def _supplier_name(self, supplier_id: int) -> str:

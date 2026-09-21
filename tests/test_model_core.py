@@ -129,6 +129,21 @@ class TaskTest(unittest.TestCase):
         self.assertEqual(t.status, TaskStatus.TODO)
         self.assertIsNone(t.done_at)
 
+    def test_run_mark_is_set_whatever_the_outcome(self):
+        """Прогон был — значит отметка есть, даже если задача вернулась в очередь."""
+        t = task()
+        self.assertIsNone(t.run_at)
+        t.complete(TaskStatus.TODO, "1С не ответила")
+        self.assertIsNotNone(t.run_at)
+        self.assertIsNone(t.done_at)
+
+    def test_run_mark_survives_reopen(self):
+        """Иначе «не брались» и «пробовали трижды» снова стали бы неразличимы."""
+        t = task()
+        t.complete(TaskStatus.DONE)
+        t.reopen()
+        self.assertIsNotNone(t.run_at)
+
     def test_absorb_appends_description_and_merges_identifiers(self):
         first = task(description="сверить размеры")
         second = task(address=addr(collection="Quartz", coll_code="YO-77"),

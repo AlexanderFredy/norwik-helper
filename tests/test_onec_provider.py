@@ -207,6 +207,8 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["order"], TaskKind.CHANGE_PRICES.order + 1)
         self.assertEqual(item["status"], "выполнена")
         self.assertEqual(item["result"], "готово")
+        # отметка о прогоне едет в 1С отдельно от `done_at`: колонка «Выполнялась»
+        self.assertEqual(item["run_at"], task.run_at)
         # снимок обязан сериализоваться: Неопределено в нём ломало бы запись в 1С
         json.dumps(snapshot, ensure_ascii=False)
 

@@ -70,6 +70,10 @@ CREATE TABLE IF NOT EXISTS price_task (
     result          TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL,
     done_at         TEXT,
+    -- Когда задачу ЗАПУСКАЛИ в последний раз, чем бы прогон ни кончился. Отдельно от
+    -- `done_at`: тот ставится только при закрытии и снимается при возврате в очередь, и
+    -- по нему не отличить «не брались» от «пробовали и не вышло».
+    run_at          TEXT,
     tm_code         TEXT NOT NULL DEFAULT '',
     tm_names        TEXT NOT NULL DEFAULT '[]',
     subject_code    TEXT NOT NULL DEFAULT '',
@@ -102,6 +106,12 @@ class ModelStore:
             # База могла быть создана до появления захвата — дописываем колонки.
             cur = await db.execute("PRAGMA table_info(price)")
             have = {row[1] for row in await cur.fetchall()}
+            # Задача: отметка о прогоне появилась позже самих задач.
+            cur = await db.execute("PRAGMA table_info(price_task)")
+            task_have = {row[1] for row in await cur.fetchall()}
+            if task_have and "run_at" not in task_have:
+                await db.execute("ALTER TABLE price_task ADD COLUMN run_at TEXT")
+
             for column, ddl in (
                 ("lock_actor", "TEXT"),
                 ("lock_generation", "INTEGER NOT NULL DEFAULT 0"),
@@ -138,8 +148,8 @@ class ModelStore:
             tasks: dict[int, list[PriceTask]] = {}
             cur = await db.execute(
                 "SELECT id, price_id, kind, subject, status, description, result, "
-                "created_at, done_at, tm_code, tm_names, subject_code, subject_article, "
-                "subject_names FROM price_task ORDER BY created_at, id")
+                "created_at, done_at, run_at, tm_code, tm_names, subject_code, "
+                "subject_article, subject_names FROM price_task ORDER BY created_at, id")
             for row in await cur.fetchall():
                 tasks.setdefault(row[1], []).append(_task_from_row(row))
 
@@ -242,10 +252,12 @@ class ModelStore:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
                 "UPDATE price_task SET kind = ?, subject = ?, status = ?, description = ?, "
-                "result = ?, done_at = ?, tm_code = ?, tm_names = ?, subject_code = ?, "
+                "result = ?, done_at = ?, run_at = ?, tm_code = ?, tm_names = ?, "
+                "subject_code = ?, "
                 "subject_article = ?, subject_names = ? WHERE id = ?",
                 (task.kind.value, task.subject.value, task.status.value, task.description,
-                 task.result, task.done_at, addr.tm.code, _dump(addr.tm.names),
+                 task.result, task.done_at, task.run_at, addr.tm.code,
+                 _dump(addr.tm.names),
                  addr.subject.code, addr.subject.article, _dump(addr.subject.names),
                  task.id))
             await db.commit()
@@ -338,10 +350,12 @@ class ModelStore:
         addr = task.address
         cur = await db.execute(
             "INSERT INTO price_task (price_id, kind, subject, status, description, result, "
-            "created_at, done_at, tm_code, tm_names, subject_code, subject_article, "
-            "subject_names) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "created_at, done_at, run_at, tm_code, tm_names, subject_code, "
+            "subject_article, subject_names) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (price_id, task.kind.value, task.subject.value, task.status.value,
              task.description, task.result, task.created_at, task.done_at,
+             task.run_at,
              addr.tm.code, _dump(addr.tm.names), addr.subject.code,
              addr.subject.article, _dump(addr.subject.names)))
         task.id = cur.lastrowid
@@ -350,7 +364,8 @@ class ModelStore:
 def _task_from_row(row) -> PriceTask:
     """Собрать задачу обратно из строки. Имена уже нормализованы при записи."""
     (task_id, _price_id, kind, subject, status, description, result,
-     created_at, done_at, tm_code, tm_names, subj_code, subj_article, subj_names) = row
+     created_at, done_at, run_at, tm_code, tm_names, subj_code, subj_article,
+     subj_names) = row
 
     address = TaskAddress(
         tm=Ref(code=tm_code, names=_names(tm_names)),
@@ -359,5 +374,5 @@ def _task_from_row(row) -> PriceTask:
 
     task = PriceTask(kind=TaskKind(kind), address=address, description=description,
                      status=TaskStatus(status), result=result, id=task_id,
-                     created_at=created_at, done_at=done_at)
+                     created_at=created_at, done_at=done_at, run_at=run_at)
     return task

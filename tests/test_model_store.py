@@ -119,6 +119,20 @@ class RoundTripTest(Base):
         self.assertIsNotNone(loaded.done_at)
         self.assertTrue(loaded.closed)
 
+    async def test_run_mark_survives_a_failed_attempt(self):
+        """Задача снова «к обработке», но отметка о прогоне обязана пережить перезапуск:
+        по ней админ в 1С отличает «не брались» от «пробовали и не вышло»."""
+        p = price()
+        t = p.add_task(task())
+        await self.store.add_price(p)
+        t.complete(TaskStatus.TODO, "1С не ответила")
+        await self.store.update_task(t)
+
+        loaded = (await self.store.load_all())[0].tasks[0]
+        self.assertEqual(loaded.status, TaskStatus.TODO)
+        self.assertIsNone(loaded.done_at)
+        self.assertEqual(loaded.run_at, t.run_at)
+
     async def test_item_subject_survives(self):
         p = price()
         p.add_task(PriceTask(kind=TaskKind.CHANGE_PROPERTIES, address=TaskAddress(
