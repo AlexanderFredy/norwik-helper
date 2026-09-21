@@ -196,6 +196,113 @@ class ToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("не адресуема", out)
 
 
+class CompareTest(unittest.IsolatedAsyncioTestCase):
+    """Сверка коллекции с 1С — то, ради чего задачи стали конкретными.
+
+    Без неё агент мог написать только «проверить, все ли 8 декоров заведены». После
+    сверки он знает: трёх нет, и пишет именно это.
+    """
+
+    def onec(self, items, tm="Egger"):
+        from src.onec.client import NomItem
+
+        class Nom:
+            def __init__(self, xs):
+                self.items = list(xs)
+                self.tm = tm
+                self.total = len(self.items)
+                self.errors = []
+
+        class Fake(FakeOnec):
+            def by_tm_all(self, tm_code, **kw):
+                return Nom(items)
+
+        return Fake()
+
+    def nom(self, ref, article, site="Бах", collection="Vintage", props=(),
+            not_exported=False):
+        from src.onec.client import ItemProperty, NomItem
+        return NomItem(
+            ref=ref, id="", name=f"Ламинат Egger {collection} {site}", article=article,
+            unit="м2", size="", product_type="Ламинат", collection=collection,
+            parent=collection, collection_ref="F1", alt_units={},
+            purchase=None, retail=None, rrc=None, site_name=site,
+            product_type_ref="000000003", not_exported=not_exported,
+            properties=tuple(ItemProperty(property=p, code="", value=v, value_code="")
+                             for p, v in props))
+
+    async def compare(self, tools, articles, collection="Vintage"):
+        out = await tools.execute("compare_with_1c", {
+            "tm_code": "T1", "collection": collection, "articles": articles})
+        return json.loads(out)
+
+    async def test_missing_in_1c_is_named_not_counted(self):
+        """Админу нужны артикулы, а не «трёх не хватает»: по числу работать нельзя."""
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx",
+                                 onec=self.onec([self.nom("R1", "3309")]))
+        got = await self.compare(tools, ["3309", "3311 Бетховен", "3315"])
+        self.assertEqual(got["missing_in_1c"], ["3311 Бетховен", "3315"])
+        self.assertEqual(got["in_1c"], 1)
+
+    async def test_articles_match_regardless_of_separators(self):
+        """«LE-263», «LE 263» и «le263» — один артикул: поставщики пишут как придётся."""
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx",
+                                 onec=self.onec([self.nom("R1", "LE-263")]))
+        got = await self.compare(tools, ["le 263"])
+        self.assertEqual(got["missing_in_1c"], [])
+
+    async def test_missing_in_price_is_a_candidate_not_a_verdict(self):
+        """Поставщик мог прислать частичный прайс — решать админу."""
+        tools = TaskBuilderTools(
+            workbook(), "Прайс.xlsx",
+            onec=self.onec([self.nom("R1", "3309"), self.nom("R2", "3301", site="Лист")]))
+        got = await self.compare(tools, ["3309"])
+        self.assertEqual(len(got["missing_in_price"]), 1)
+        self.assertIn("3301", got["missing_in_price"][0])
+
+    async def test_discontinued_are_not_counted_as_missing_from_the_price(self):
+        """Снятые в прайсе и не должны быть — иначе каждая сверка звала бы снимать их
+        заново."""
+        tools = TaskBuilderTools(
+            workbook(), "Прайс.xlsx",
+            onec=self.onec([self.nom("R1", "3309"),
+                            self.nom("R2", "3301", not_exported=True)]))
+        got = await self.compare(tools, ["3309"])
+        self.assertEqual(got["missing_in_price"], [])
+
+    async def test_empty_properties_are_those_empty_everywhere(self):
+        """«Ни у одной», а не «у какой-нибудь»: разнобой внутри коллекции — другой
+        разговор, а сплошь пустое свойство просто не заводили."""
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", props=[("Класс", ""), ("Фаска", "V4")]),
+            self.nom("R2", "3310", props=[("Класс", ""), ("Фаска", "")]),
+        ]))
+        got = await self.compare(tools, ["3309", "3310"])
+        self.assertEqual(got["empty_properties"], ["Класс"])
+
+    async def test_absent_collection_is_named_as_such(self):
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx",
+                                 onec=self.onec([self.nom("R1", "3309")]))
+        got = await self.compare(tools, ["9001"], collection="Совсем Новая")
+        self.assertEqual(got["in_1c"], 0)
+        self.assertIn("нет вовсе", got["note"])
+
+    async def test_nomenclature_does_not_leak_into_the_answer(self):
+        """В ЭТОМ ВСЯ ЭКОНОМИЯ: выгрузка поехала бы в каждый следующий запрос."""
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx",
+                                 onec=self.onec([self.nom("R1", "3309")]))
+        out = await tools.execute("compare_with_1c", {
+            "tm_code": "T1", "collection": "Vintage", "articles": ["3309"]})
+        self.assertNotIn("Ламинат Egger Vintage", out)
+        self.assertLess(len(out), 400)
+
+    async def test_without_1c_it_says_so_instead_of_guessing(self):
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx")
+        out = await tools.execute("compare_with_1c", {
+            "tm_code": "T1", "collection": "Vintage", "articles": ["3309"]})
+        self.assertIn("не настроена", out)
+
+
 class Folder:
     """Узел дерева папок 1С — столько полей, сколько читает `owner_map`."""
 
@@ -344,7 +451,10 @@ class BuildTest(unittest.IsolatedAsyncioTestCase):
         await build(orc, workbook(), "Прайс.xlsx")
         prompt = orc.systems[0]
         self.assertIn("НЕ утверждай того, чего не проверял", prompt)
-        self.assertIn("выгрузки номенклатуры 1С", prompt)
+        # Раньше правило звучало «выгрузки у тебя нет». Теперь сверка есть, и правило
+        # стало сильнее: не «пиши проверить», а «сначала спроси, потом пиши числа».
+        self.assertIn("сначала спроси", prompt)
+        self.assertIn("ПИШИ ТО, ЧТО ЗНАЕШЬ, А НЕ ТО, ЧТО НАДО ПРОВЕРИТЬ", prompt)
 
 
 class ServiceFallbackTest(unittest.IsolatedAsyncioTestCase):
