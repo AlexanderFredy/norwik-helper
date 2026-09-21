@@ -228,6 +228,51 @@ class CollectionPropertyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("«Коллекция» (код 0000003) НЕ ЗАПОЛНЯЙ", write["description"])
 
 
+class DiscontinuedAreHiddenTest(unittest.IsolatedAsyncioTestCase):
+    """Снятые не попадают в живую выгрузку — агенту про них знать незачем.
+
+    РЕШЕНИЕ АДМИНА (21.09.2026). Часть коллекций висит под маркой с флагом «Не
+    выгружать»: они уже сняты, а в папки снятых их перенесут отдельно и не сейчас. Видя
+    их, агент начинал предлагать по ним работу — у Most Flooring так всплыли Quick и
+    Prestige в отчёте по совсем другой задаче.
+    """
+
+    def mixed(self):
+        live = nom(ref="R1", article="3309", name="Ламинат Egger Vintage Дуб")
+        dead = nom(ref="R2", article="9001", name="Ламинат Egger Quick Ясень")
+        object.__setattr__(dead, "not_exported", True)
+        object.__setattr__(dead, "collection", "Quick")
+        object.__setattr__(dead, "parent", "Quick")
+        return [live, dead]
+
+    async def test_discontinued_are_not_returned(self):
+        tools = TaskTools(FakeOnec(self.mixed()), b"", "p.xlsx", allow,
+                          kind=TaskKind.ADD_NEW)
+        out = await tools.execute("get_1c_items", {"tm_code": "TM1"})
+        self.assertIn("3309", out)
+        self.assertNotIn("9001", out)
+
+    async def test_the_cache_still_has_them(self):
+        """Сборке правок снятые НУЖНЫ: без них создание позиции не увидит, что товар уже
+        есть, и заведёт дубль. Поэтому фильтруется выдача, а не кеш."""
+        tools = TaskTools(FakeOnec(self.mixed()), b"", "p.xlsx", allow,
+                          kind=TaskKind.ADD_NEW)
+        await tools.execute("get_1c_items", {"tm_code": "TM1"})
+        cached = await tools._nomenclature("TM1")
+        self.assertEqual(len(cached), 2)
+
+    async def test_empty_answer_points_at_find_items(self):
+        dead = nom(ref="R2", article="9001")
+        object.__setattr__(dead, "not_exported", True)
+        tools = TaskTools(FakeOnec([dead]), b"", "p.xlsx", allow, kind=TaskKind.ADD_NEW)
+        out = await tools.execute("get_1c_items", {"tm_code": "TM1"})
+        self.assertIn("find_1c_items", out)
+
+    def test_prompt_forbids_discussing_them(self):
+        from src.model.executor import PROMPT
+        self.assertIn("СНЯТОЕ НЕ ТРОГАЙ И НЕ ОБСУЖДАЙ", PROMPT)
+
+
 class OrchestratorContractTest(unittest.IsolatedAsyncioTestCase):
     """Исполнитель обязан отвечать на то, о чём его спрашивает оркестратор.
 
