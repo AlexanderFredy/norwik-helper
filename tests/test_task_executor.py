@@ -228,6 +228,35 @@ class CollectionPropertyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("«Коллекция» (код 0000003) НЕ ЗАПОЛНЯЙ", write["description"])
 
 
+class OrchestratorContractTest(unittest.IsolatedAsyncioTestCase):
+    """Исполнитель обязан отвечать на то, о чём его спрашивает оркестратор.
+
+    СЛУЧАЙ С БОЯ (21.09.2026). `handle_turn` перед каждым инструментом зовёт
+    `extra_executor.handles(name)`. Метода не было — `AttributeError` рушил ВЕСЬ прогон,
+    а не отдельный вызов, и задача «перенос в снятые» вернула «прогон сорвался». Все
+    инструменты по отдельности при этом работали, поэтому искать было негде.
+    """
+
+    def test_own_tools_are_recognised(self):
+        from src.model.executor import TOOLS
+        tools = TaskTools(FakeOnec(), b"", "p.xlsx", allow)
+        for tool in TOOLS:
+            self.assertTrue(tools.handles(tool["name"]), tool["name"])
+
+    def test_foreign_tools_are_declined(self):
+        """Чужой инструмент должен уйти менеджерскому исполнителю, а не сюда."""
+        tools = TaskTools(FakeOnec(), b"", "p.xlsx", allow)
+        self.assertFalse(tools.handles("search_emails"))
+        self.assertFalse(tools.handles("read_price_file"))
+
+    async def test_the_orchestrator_contract_is_satisfied(self):
+        """Проверка ровно тем вызовом, которым падало: `handles` + `execute`."""
+        tools = TaskTools(FakeOnec(), b"", "p.xlsx", allow)
+        name = "get_1c_items"
+        self.assertTrue(tools.handles(name))
+        self.assertTrue(await tools.execute(name, {"tm_code": "TM1"}))
+
+
 class OutcomeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_finish_records_the_outcome(self):
@@ -414,6 +443,11 @@ class ServiceWiringTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(task.status, TaskStatus.TODO)
         self.assertIn("проверьте в 1С", task.result)
+        # ПРИЧИНА — В САМОМ РЕЗУЛЬТАТЕ. Прежний текст отсылал «в журнал», которого нет:
+        # лог идёт в консоль процесса, и админ, читающий форму 1С, искал его в журнале
+        # регистрации 1С и не находил.
+        self.assertIn("1С недоступна", task.result)
+        self.assertNotIn("в журнале", task.result)
 
     async def test_guard_refuses_after_the_lock_is_gone(self):
         """Сердцевина защиты: захват сняли посреди прогона — запись обязана отвалиться."""
