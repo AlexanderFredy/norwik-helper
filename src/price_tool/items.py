@@ -28,10 +28,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from src.price_tool import discontinued
-from src.price_tool.naming import (collection_case, drop_own_article,
-                                   ensure_type_prefix, folder_name, format_size,
-                                   size_in_folder, size_in_name, tidy, uniform_size,
-                                   violations)
+from src.price_tool.naming import (collection_case, collection_from_folder,
+                                   drop_own_article, ensure_type_prefix, folder_name,
+                                   format_size, size_in_folder, size_in_name, tidy,
+                                   uniform_size, violations)
 
 # Поля, изменение которых показывается админу и менеджерам поимённо (§19.9).
 WATCHED = ("parent_ref", "collection", "article", "unit", "pack_coefficient",
@@ -522,7 +522,14 @@ def _folder_title(name, type_name: str, type_code, inp: dict, current: list,
         if _form(item.collection) == wanted and not item.not_exported:
             sizes.append(format_size(item.length_from, item.width_from, item.thickness))
 
-    return folder_name(name, uniform_size(sizes))
+    # ИМЯ МОГЛО УЖЕ НЕСТИ РАЗМЕР. Модель видит в 1С папки вида «Ле Паркет 600x600x14» и
+    # честно повторяет образец, передавая `name` вместе с размером. Дописав свой, мы
+    # получаем «Классик 600x238x12 600x238x12» — так и вышло на бою 21.09.2026.
+    #
+    # Снимаем ТОЧНОЙ обратной операцией к `folder_name`: хвост, равный тому самому
+    # размеру, который собираемся дописать. Ничего похожего «на глаз» не режем.
+    size = uniform_size(sizes)
+    return folder_name(collection_from_folder(name, size), size)
 
 def _in_scope(product_type: str, scope: list[str]) -> bool:
     """Нестрогое сравнение, как в `scope.py`: «плитка» покрывает «Керамическую плитку»."""

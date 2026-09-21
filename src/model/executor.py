@@ -534,6 +534,19 @@ class TaskTools:
         # прогон могли отменить: истёк захват, админ снял его, прайс уничтожили.
         self._guard()
 
+        # НОВАЯ КОЛЛЕКЦИЯ — ЗАВОДИМ ЕЙ ЗНАЧЕНИЕ СВОЙСТВА «Коллекция». Без него позиция
+        # попадает на сайт без признака коллекции, а `collection_of` вынужден выводить имя
+        # из папки — с размером внутри. Агент этого не сделал и не мог: операции не было в
+        # инструментах (бой 21.09.2026, «Классик» у A+ Floor).
+        #
+        # ОТДЕЛЬНЫМ ВЫЗОВОМ, потому что `value_code` не разрешает ссылки `$id`: в одной
+        # пачке создать значение и сослаться на него нельзя. Зато `add_property_value`
+        # идемпотентна — на повтор отвечает `exists` и тем же кодом.
+        # Заметка идёт В ОТЧЁТ, а не в `summary`: тот собран выше и уже не изменится.
+        value_note = ""
+        if plan.new_folder:
+            value_note = await self._ensure_collection_value(plan, ops)
+
         result = await asyncio.to_thread(self._onec.set_items, ops)
         # Выгрузка устарела: мы только что завели папки, позиции и значения свойств.
         self._items_cache.pop(tm_code, None)
@@ -551,7 +564,47 @@ class TaskTools:
         if errors:
             report += (f" НЕ ЗАПИСАНО {len(errors)}:\n"
                        + "\n".join(f"— {e}" for e in self.errors[-len(errors):]))
-        return summary + "\n\n" + report
+        return summary + "\n\n" + report + value_note
+
+    async def _ensure_collection_value(self, plan, ops: list[dict]) -> str:
+        """Завести значение свойства «Коллекция» и проставить его создаваемым позициям.
+
+        Возвращает заметку для отчёта: пусто — всё прошло молча, как и должно.
+
+        Значение кладётся в папку МАРКИ внутри ветки вида товара — иначе оно теряется
+        среди трёх тысяч значений в корне (§19.2.1). Папку 1С заводит сама по
+        `folder_name` + `product_type`, если её ещё нет: у новой марки её нет по
+        определению.
+        """
+        creating = [o for o in ops if o.get("op") == "create_item"]
+        if not creating or not plan.collection:
+            return ""
+
+        answer = await asyncio.to_thread(self._onec.set_items, [{
+            "op": "add_property_value",
+            "property": nz.COLLECTION_PROPERTY,
+            "value": plan.collection,
+            "folder_name": plan.tm_name,
+            "product_type": plan.product_type,
+        }])
+
+        made = next((r for r in (answer.get("results") or [])
+                     if r.get("op") == "add_property_value" and r.get("ref")), None)
+        if made is None:
+            errors = answer.get("errors") or []
+            why = "; ".join(f"{e.get('code')} {e.get('message')}" for e in errors[:2])
+            # Позиции всё равно создаём: карточка без свойства лучше, чем её отсутствие,
+            # а заполнить свойство админ сможет руками.
+            return f"\n⚠️ Значение свойства «Коллекция» завести не удалось: {why or '—'}."
+
+        for op in creating:
+            props = [p for p in (op.get("properties") or [])
+                     if str(p.get("property")) != nz.COLLECTION_PROPERTY]
+            props.append({"property": nz.COLLECTION_PROPERTY,
+                          "value_code": made["ref"]})
+            op["properties"] = props
+
+        return ""
 
     async def _write_prices(self, inp: dict) -> str:
         tm_code = str(inp.get("tm_code") or "").strip()
@@ -560,11 +613,26 @@ class TaskTools:
             return "Нужны tm_code и collection."
 
         current = await self._nomenclature(tm_code)
+
+        # КОЛЛЕКЦИЯ ОПОЗНАЁТСЯ ЧЕРЕЗ `collection_of`, а не по сырому свойству. У ТОЛЬКО
+        # ЧТО СОЗДАННЫХ позиций свойство «Коллекция» пусто — его заводят отдельно, — и
+        # поиск по нему не находил ничего: агент завёл восемь позиций «Классик» и не смог
+        # проставить им цены, перебрав все варианты имени (бой 21.09.2026).
+        wanted = collection.casefold()
         in_collection = [i for i in current
-                         if (i.collection or "").strip().lower() == collection.lower()]
+                         if nz.collection_of(i).casefold() == wanted]
+
+        # Имя папки могло нести размер, а модель передать имя без него (или наоборот).
         if not in_collection:
-            return (f"В 1С нет коллекции «{collection}» у этой марки. Проверь имя через "
-                    "get_1c_items — цены писать некуда.")
+            ref = str(inp.get("collection_ref") or "").strip()
+            if ref:
+                in_collection = [i for i in current if i.collection_ref == ref]
+
+        if not in_collection:
+            known = sorted({nz.collection_of(i) for i in current
+                            if not i.not_exported and nz.collection_of(i)})
+            return (f"В 1С нет коллекции «{collection}» у этой марки. Живые коллекции: "
+                    + ", ".join(known[:20]) + ". Цены писать некуда.")
 
         tm_name = (inp.get("tm_name") or "").strip()
         rows = inp.get("items") or []

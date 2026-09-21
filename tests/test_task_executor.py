@@ -228,6 +228,96 @@ class CollectionPropertyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("«Коллекция» (код 0000003) НЕ ЗАПОЛНЯЙ", write["description"])
 
 
+class NewCollectionTest(unittest.IsolatedAsyncioTestCase):
+    """Создание новой коллекции: имя папки, значение свойства, цены следом.
+
+    СЛУЧАЙ С БОЯ (21.09.2026, «Классик» у A+ Floor). Три ошибки разом: папка получила
+    размер дважды, свойство «Коллекция» не завелось вовсе, а `write_prices` потом не
+    нашёл только что созданную коллекцию и цены остались непроставленными.
+    """
+
+    def payload(self, folder_name="Классик 600x238x12"):
+        return {
+            "tm_code": "TM1", "tm_name": "A+ Floor",
+            "product_type": "000000003", "product_type_name": "Ламинат",
+            "collection": "Классик",
+            "new_folder": {"parent_ref": "F-TM", "name": folder_name},
+            "items": [{"op": "create", "ref": "", "article": "301",
+                       "title": "Аристо", "length": 600, "width": 238,
+                       "thickness": 12}],
+        }
+
+    def onec(self):
+        class Fake(FakeOnec):
+            def __init__(self):
+                super().__init__([], tm_name="A+ Floor")
+                self.batches = []
+
+            def set_items(self, ops):
+                self.batches.append(ops)
+                if ops and ops[0].get("op") == "add_property_value":
+                    return {"results": [{"op": "add_property_value",
+                                         "ref": "V-777", "status": "created"}],
+                            "created": 1, "updated": 0, "errors": []}
+                return {"created": len(ops), "updated": 0, "errors": []}
+
+        return Fake()
+
+    async def run_write(self, onec, folder_name="Классик 600x238x12"):
+        tools = TaskTools(onec, b"", "p.xlsx", allow, kind=TaskKind.ADD_NEW)
+        return await tools.execute("write_items", self.payload(folder_name))
+
+    async def test_size_is_not_doubled_in_the_folder_name(self):
+        """Модель видит в 1С папки вида «Ле Паркет 600x600x14» и повторяет образец,
+        передавая имя УЖЕ с размером. Дописав свой, получаем размер дважды."""
+        onec = self.onec()
+        await self.run_write(onec)
+        folder = next(o for b in onec.batches for o in b
+                      if o.get("op") == "create_folder")
+        self.assertEqual(folder["name"].count("600x238x12"), 1, folder["name"])
+
+    async def test_name_without_a_size_still_gets_one(self):
+        onec = self.onec()
+        await self.run_write(onec, folder_name="Классик")
+        folder = next(o for b in onec.batches for o in b
+                      if o.get("op") == "create_folder")
+        self.assertIn("600x238x12", folder["name"])
+
+    async def test_collection_property_value_is_created_and_attached(self):
+        """Без значения свойства позиция уходит на сайт без признака коллекции."""
+        from src.model.normalize import COLLECTION_PROPERTY
+        onec = self.onec()
+        await self.run_write(onec)
+
+        first = onec.batches[0][0]
+        self.assertEqual(first["op"], "add_property_value")
+        self.assertEqual(first["value"], "Классик")
+        # значение кладётся в папку МАРКИ, иначе теряется среди трёх тысяч в корне
+        self.assertEqual(first["folder_name"], "A+ Floor")
+
+        created = next(o for o in onec.batches[1] if o.get("op") == "create_item")
+        self.assertIn({"property": COLLECTION_PROPERTY, "value_code": "V-777"},
+                      created["properties"])
+
+    async def test_items_are_still_created_if_the_value_fails(self):
+        """Карточка без свойства лучше, чем её отсутствие: свойство админ проставит."""
+        class Broken(FakeOnec):
+            def __init__(self):
+                super().__init__([], tm_name="A+ Floor")
+                self.batches = []
+
+            def set_items(self, ops):
+                self.batches.append(ops)
+                if ops[0].get("op") == "add_property_value":
+                    return {"results": [], "errors": [{"code": "x", "message": "нет"}]}
+                return {"created": len(ops), "updated": 0, "errors": []}
+
+        onec = Broken()
+        out = await self.run_write(onec)
+        self.assertTrue(any(o.get("op") == "create_item" for o in onec.batches[1]))
+        self.assertIn("завести не удалось", out)
+
+
 class DiscontinuedAreHiddenTest(unittest.IsolatedAsyncioTestCase):
     """Снятые не попадают в живую выгрузку — агенту про них знать незачем.
 
