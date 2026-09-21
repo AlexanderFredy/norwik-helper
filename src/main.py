@@ -24,6 +24,7 @@ from src.storage.pricing import PricingStore
 from src.model.service import PriceListService
 from src.storage.command_queue import CommandQueue
 from src.storage.model_store import ModelStore
+from src.storage.sightings import SightingStore
 from src.storage.suppliers import SupplierStore
 from src.storage.users import UserStore
 from src.website_tool.norwik import NorwikClient
@@ -51,6 +52,10 @@ async def main() -> None:
     # задач поднимается в память, но команд, которые его меняют, ещё нет.
     model_store = ModelStore(config.db_path)
     await model_store.init()
+    # Журнал встреч артикулов в прайсах (§6.1): по нему коллекция, которую возит другой
+    # поставщик, не уезжает в снятые. Наполняется кодом, токенов не стоит.
+    sightings = SightingStore(config.db_path)
+    await sightings.init()
 
     # Очередь команд визуалов (§7). Взятая, но не завершённая команда означает одно:
     # процесс умер, не доработав. Живых взятых в момент старта быть не может — агент
@@ -104,10 +109,25 @@ async def main() -> None:
         """Список задач составляет агент (§6.1). Метки расхода — как у прайсового
         прогона: по ним видно, во что обходится формирование (§9.6.3)."""
         from src.model.task_builder import build
+
+        # ЖУРНАЛ ВСТРЕЧ (§6.1): что этот прайс показал — туда, что показали ЧУЖИЕ прайсы
+        # — оттуда. Коллекция, которую возит другой поставщик, не снимается с производства.
+        supplier_id = price.supplier_price.supplier_id
+        supplier = await supplier_store.get_supplier(supplier_id)
+        signature = price.supplier_price.signature or ""
+
+        async def remember(articles):
+            await sightings.remember(
+                supplier_id, signature, articles,
+                supplier=supplier.name if supplier else "",
+                price_date=price.supplier_price.price_date)
+
         # Ответ агента едет дальше вместе с задачами: когда их ноль, только он и
         # объясняет, почему — «расхождений нет» или «разобрал не тот лист».
         return await build(orchestrator, content, filename, onec=onec,
-                           usage_labels={"kind": "pricing", "price_doc": filename})
+                           usage_labels={"kind": "pricing", "price_doc": filename},
+                           elsewhere=await sightings.elsewhere(supplier_id),
+                           remember=remember)
 
     async def run_task(price, task, content, guard):
         """Выполнение задачи агентом (§6.2) — С НАСТОЯЩЕЙ ЗАПИСЬЮ в 1С.

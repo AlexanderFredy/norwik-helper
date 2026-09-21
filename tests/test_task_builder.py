@@ -421,6 +421,48 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(got["цены"], str)
         self.assertIn("price_columns", got["цены"])
 
+    async def test_articles_lying_in_discontinued_are_a_revival(self):
+        """Коллекцию однажды унесли в снятые, а поставщик привёз её снова. Выгрузка марки
+        её не видит, и без поиска по всей базе агент завёл бы всё заново — сто дублей с
+        потерянной историей цен."""
+        from src.onec.client import FoundItem, FoundItems
+
+        class Fake(self.onec([self.nom("R1", "3309")]).__class__):
+            def find_items(self, articles=None, limit=50, **kw):
+                return FoundItems(items=[FoundItem(
+                    ref="YO-00006107", name="Дуб Прато", article="3310",
+                    parent_name="Снятые с производства Ламинат",
+                    not_exported=True)], total=1)
+
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=Fake())
+        got = await self.compare(tools, ["3309", "3310"], collection="Millenium Pro")
+        self.assertIn("YO-00006107", got["уже_есть_в_1С_вне_коллекции"][0])
+
+        await tools.execute("add_task", {
+            "kind": "добавление новых", "tm": "Egger", "tm_code": "T1",
+            "collection": "Millenium Pro", "description": "завести 3310"})
+        text = tools.collected[0].description
+        # текст пишет КОД: коды 1С — то, по чему задача исполняется
+        self.assertIn("ВОЗВРАТ РАНЕЕ СНЯТОГО", text)
+        self.assertIn("YO-00006107", text)
+        self.assertIn("Снятые с производства Ламинат", text)
+
+    async def test_revival_note_only_lands_on_add_new(self):
+        """У задачи по ценам или свойствам возврата из снятых быть не может."""
+        from src.onec.client import FoundItem, FoundItems
+
+        class Fake(self.onec([self.nom("R1", "3309")]).__class__):
+            def find_items(self, articles=None, limit=50, **kw):
+                return FoundItems(items=[FoundItem(ref="YO-1", name="Х", article="3310")],
+                                  total=1)
+
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=Fake())
+        await self.compare(tools, ["3309", "3310"], collection="Millenium Pro")
+        await tools.execute("add_task", {
+            "kind": "изменение цен", "tm": "Egger", "tm_code": "T1",
+            "collection": "Millenium Pro", "description": "цены"})
+        self.assertNotIn("ВОЗВРАТ", tools.collected[0].description)
+
     async def test_truly_new_collection_says_so_with_a_caveat(self):
         """Ни один артикул не нашёлся — либо коллекция правда новая, либо колонка
         артикула прочитана не та. Второе стоит проверить до заведения всего заново."""
@@ -448,6 +490,65 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         ]))
         await self.compare(tools, ["3309"], collection="Миллениум Про")
         self.assertEqual(tools.untouched_collections(), {})
+
+    async def test_collection_of_another_supplier_is_not_discontinued(self):
+        """СЛУЧАЙ, РАДИ КОТОРОГО ЗАВЕДЁН ЖУРНАЛ. Коллекции нет в этом прайсе, но её возит
+        другой поставщик: это смена канала, а не снятие с производства. Задачи быть не
+        должно — вместо неё строка админу."""
+        from src.model.task_builder import _add_discontinued_candidates
+        from src.storage.sightings import Sighting
+
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", collection="Millenium Pro"),
+            self.nom("R2", "A11701", collection="Brilliant"),
+        ]), elsewhere={"a11701": Sighting(supplier_id=9, supplier="Паркет-Холл",
+                                          collection="Бриллиант",
+                                          price_date="2026-09-15")})
+        await self.compare(tools, ["3309"], collection="Миллениум Про")
+        await tools.execute("add_task", {"kind": "изменение цен", "tm": "Egger",
+                                         "tm_code": "T1", "collection": "Millenium Pro",
+                                         "description": "цены"})
+
+        notes = _add_discontinued_candidates(tools)
+        kinds = [t.kind for t in tools.collected]
+        self.assertNotIn(TaskKind.MOVE_DISCONTINUED, kinds)
+        self.assertIn("Паркет-Холл", notes[0])
+
+    async def test_unknown_collection_is_still_discontinued(self):
+        """Пока журнал пуст, поведение прежнее: обратного никто не показывал."""
+        from src.model.task_builder import _add_discontinued_candidates
+
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", collection="Millenium Pro"),
+            self.nom("R2", "A11701", collection="Brilliant"),
+        ]))
+        await self.compare(tools, ["3309"], collection="Миллениум Про")
+        await tools.execute("add_task", {"kind": "изменение цен", "tm": "Egger",
+                                         "tm_code": "T1", "collection": "Millenium Pro",
+                                         "description": "цены"})
+
+        self.assertEqual(_add_discontinued_candidates(tools), [])
+        self.assertIn(TaskKind.MOVE_DISCONTINUED,
+                      [t.kind for t in tools.collected])
+
+    async def test_gone_item_carried_by_another_is_told_apart(self):
+        """В сверке по коллекции — то же самое, но по одной позиции."""
+        from src.storage.sightings import Sighting
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309"), self.nom("R2", "3310"), self.nom("R3", "3311"),
+        ]), elsewhere={"3311": Sighting(9, "Паркет-Холл", "Про", "2026-09-15")})
+
+        got = await self.compare(tools, ["3309"])
+        self.assertEqual(got["missing_in_price"], ["3310 Бах"])
+        self.assertIn("Паркет-Холл", got["есть_у_другого_поставщика"][0])
+
+    async def test_articles_of_this_price_go_into_the_journal(self):
+        """Журнал наполняется тем, что модель и так перечислила: ноль лишних токенов."""
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx",
+                                 onec=self.onec([self.nom("R1", "3309")]))
+        await self.compare(tools, ["3309", "LE-263"], collection="Миллениум Про")
+        self.assertEqual(tools.seen_articles,
+                         {"3309": "Миллениум Про", "le263": "Миллениум Про"})
 
     async def test_missing_in_1c_is_named_not_counted(self):
         """Админу нужны артикулы, а не «трёх не хватает»: по числу работать нельзя."""

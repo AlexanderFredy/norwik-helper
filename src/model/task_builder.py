@@ -72,6 +72,23 @@ def _price_notes_only(text: str | None) -> str:
     return "" if len(out) < 15 else out
 
 
+def _revival_brief(items) -> str:
+    """Текст про возврат из снятых: коды 1С и папка, где позиции лежат сейчас.
+
+    Пишется КОДОМ по ответу 1С — админ и исполняющий агент читают тут идентификаторы, а
+    не пересказ. Формулировка прямая («вернуть», а не «проверить»): это уже проверено
+    запросом, решать нечего.
+    """
+    lines = [f"— {i.article} «{i.name}» — код 1С {i.ref}"
+             + (f", сейчас в «{i.parent_name}»" if i.parent_name else "")
+             for i in items[:40]]
+    tail = f"\n…и ещё {len(items) - 40}" if len(items) > 40 else ""
+    return ("ВОЗВРАТ РАНЕЕ СНЯТОГО, не заведение заново. Эти позиции в 1С УЖЕ ЕСТЬ и лежат "
+            "вне живой коллекции — создавать их повторно нельзя, получится дубль с "
+            "потерянной историей цен. Вернуть сменой родителя на папку живой коллекции:\n"
+            + "\n".join(lines) + tail)
+
+
 def normalize_brief() -> str:
     """Что написано в описании задачи нормализации. Текст задаёт КОД, а не модель.
 
@@ -198,10 +215,21 @@ TOOLS = [
 class TaskBuilderTools:
     """Исполнитель инструментов одного прогона формирования задач."""
 
-    def __init__(self, content: bytes, filename: str, onec=None) -> None:
+    def __init__(self, content: bytes, filename: str, onec=None,
+                 elsewhere: dict | None = None) -> None:
         self._content = content
         self._filename = filename
         self._onec = onec
+        # Артикул → где его видели у ДРУГИХ поставщиков (`storage/sightings.py`). Снимок
+        # берётся один раз перед ходом: спрашивать базу из синхронного кода инструментов
+        # неоткуда, а таблица мала.
+        self._elsewhere = elsewhere or {}
+        # Что этот прайс показал: артикул → коллекция, как она названа В ПРАЙСЕ. Ляжет в
+        # тот же журнал после прогона — из него и узнает о коллекции следующий прайс.
+        self.seen_articles: dict[str, str] = {}
+        # Коллекция (нормализованно) → позиции, которые в 1С УЖЕ ЕСТЬ, но вне живой папки:
+        # чаще всего снятые. Заводить их заново нельзя — это дубль.
+        self._revivals: dict[str, list] = {}
         self.collected: list[PriceTask] = []
         self.marks: list[dict] = []
         self._sheets = None
@@ -356,6 +384,13 @@ class TaskBuilderTools:
         found = [by_article[key] for key, _ in from_price if key in by_article]
         missing_in_1c = [shown for key, shown in from_price if key not in by_article]
 
+        # ЧТО ЭТОТ ПРАЙС ВИДЕЛ — в журнал встреч (`storage/sightings.py`). Артикулы уже
+        # перечислены моделью, коллекция названа ею же: запись стоит ноль токенов и ноль
+        # обращений к 1С. Ради неё и заведён журнал — следующий прайс другого поставщика
+        # узнает отсюда, что коллекция жива, и не предложит её снимать.
+        for key, _shown in from_price:
+            self.seen_articles[key] = collection
+
         # Куда на самом деле легли найденные артикулы. Обычно одна коллекция; несколько —
         # значит раздел прайса собран из разных, и это тоже надо показать.
         where: dict[str, int] = {}
@@ -365,10 +400,18 @@ class TaskBuilderTools:
 
         # Обратная сторона: позиции ТЕХ ЖЕ коллекций, которых в прайсе не встретилось, —
         # кандидаты в снятые. Только КАНДИДАТЫ: прайс мог быть частичным.
-        missing_in_price = [f"{i.article} {i.site_name or i.name}".strip()
-                            for i in live
-                            if collection_of(i) in where
-                            and norm_article(i.article) not in seen]
+        gone = [i for i in live
+                if collection_of(i) in where and norm_article(i.article) not in seen]
+        # …и сразу отсекаем те, что возит КТО-ТО ДРУГОЙ: они не сняты с производства, у
+        # них сменился поставщик. Решает это код по журналу встреч, а не рассуждение.
+        kept, missing_in_price = [], []
+        for i in gone:
+            met = self._elsewhere.get(norm_article(i.article))
+            line = f"{i.article} {i.site_name or i.name}".strip()
+            if met is None:
+                missing_in_price.append(line)
+            else:
+                kept.append(f"{line} — {met.label()}")
 
         # Отмечаем, какие коллекции 1С этот раздел прайса закрыл: незакрытые всплывут
         # после хода отдельной проверкой (`untouched_collections`).
@@ -396,6 +439,19 @@ class TaskBuilderTools:
                 1 for i in live
                 if collection_of(i) in where and not (i.collection or "").strip()),
         }
+
+        # Эти два ключа кладутся, ТОЛЬКО когда им есть что сказать. Пустой список в ответе
+        # инструмента — не «ничего», а восемь десятков символов, которые поедут в каждый
+        # следующий запрос: цикл ручной, история целиком.
+        revival = self._revival_note(missing_in_1c, collection)
+        if revival:
+            # Уже заведены в 1С, но лежат вне живой папки — почти всегда в снятых.
+            # Заводить заново нельзя: будет дубль. Описание допишет код (см. `_add`).
+            out["уже_есть_в_1С_вне_коллекции"] = revival
+        if kept:
+            # Пропали из этого прайса, но возит другой поставщик: снимать НЕ надо.
+            out["есть_у_другого_поставщика"] = kept[:40]
+
         if not found:
             out["note"] = ("ни один артикул не нашёлся у этой марки — коллекция и правда "
                            "новая ЛИБО артикулы в прайсе записаны иначе; проверь колонку "
@@ -422,6 +478,35 @@ class TaskBuilderTools:
                 if prop.value:
                     filled.add(prop.property)
         return sorted(known - filled)
+
+    def _revival_note(self, missing: list[str], collection: str) -> list[str]:
+        """Проверить, не лежат ли «недостающие» артикулы в 1С где-то ещё (§19.11).
+
+        **ЭТО ВОЗВРАТ, А НЕ ЗАВЕДЕНИЕ.** Коллекцию, которую однажды унесли в снятые,
+        поставщик может привезти снова — свой или чужой. Выгрузка марки её уже не видит
+        (снятые лежат в другой ветке), и без проверки агент завёл бы всё заново: сто
+        позиций-дублей и потерянная история цен.
+
+        Спрашиваем ПАЧКОЙ, один запрос на коллекцию: цену определяет число вызовов.
+        Запрос идёт из кода, то есть круга ручного цикла не стоит вовсе.
+        """
+        if self._onec is None or not missing:
+            return []
+        articles = [m.split()[0] for m in missing if m.split()]
+        try:
+            found = self._onec.find_items(articles=articles[:100], limit=200)
+        except Exception:                               # noqa: BLE001
+            logger.warning("Поиск по всей номенклатуре не удался", exc_info=True)
+            return []
+
+        out, refs = [], []
+        for item in found.items:
+            where = item.parent_name or item.tm or "вне марки"
+            out.append(f"{item.article} «{item.name}» → код {item.ref}, лежит в «{where}»")
+            refs.append(item)
+        if refs:
+            self._revivals[normalize(collection)] = refs
+        return out[:40]
 
     def _price_diff(self, found: list, inp: dict):
         """Сверить цены найденных позиций с прайсом (§6.1, `src/model/price_check.py`).
@@ -530,6 +615,15 @@ class TaskBuilderTools:
             kind_of = TaskSubject.COLLECTION
             description = (inp.get("description") or "").strip()
 
+        # ВОЗВРАТ ИЗ СНЯТЫХ дописывает КОД, а не модель. Коды 1С — то, по чему задача
+        # будет исполняться, и пересказ их моделью однажды разойдётся с ответом 1С
+        # (проверено на шаблоне наименований: она его выдумывала дважды). Речь о задаче
+        # «добавление новых», потому что именно там дубль и возникает.
+        if kind == TaskKind.ADD_NEW:
+            back = self._revivals.get(normalize(collection))
+            if back:
+                description += "\n\n" + _revival_brief(back)
+
         task = PriceTask(
             kind=kind,
             address=TaskAddress(tm=mark, subject=subject, subject_kind=kind_of),
@@ -630,8 +724,13 @@ PROMPT = """Ты — контент-менеджер интернет-магаз
   скольким позициям не проставлено свойство «Коллекция» и какое значение нужно. По этому
   свойству коллекция опознаётся на сайте, и пустое оно заставляет выводить имя из папки;
 — «перенос в снятые» — сверка нашла позиции 1С, которых в прайсе не встретилось. Назови
-  сколько и какие, и напиши, что это кандидаты: прайс мог быть частичным;
-— «добавление новых» — сверка нашла артикулы прайса, которых нет в 1С. Перечисли их;
+  сколько и какие, и напиши, что это кандидаты: прайс мог быть частичным. **Про то, что
+  попало в `есть_у_другого_поставщика`, задачу НЕ заводи** — эти позиции возит кто-то ещё,
+  они не сняты с производства, у них сменился канал. Упомяни их одной строкой в ответе;
+— «добавление новых» — сверка нашла артикулы прайса, которых нет в 1С. Перечисли их.
+  Если в ответе есть `уже_есть_в_1С_вне_коллекции` — это ВОЗВРАТ ранее снятого, а не
+  заведение: позиции в 1С есть, их надо вернуть из снятых. Коды 1С и список допишет код,
+  тебе перечислять их не нужно — просто заведи задачу на эту коллекцию;
 — «изменение цен» — ТОЛЬКО если сверка показала расхождение. Передай в `compare_with_1c`
   `price_columns` (где артикул, где закупка, где РРЦ — один раз на лист), и в ответе
   придёт `цены`. Пусто в `расходятся` — задачи НЕТ: цены в 1С уже такие, прогон по ней
@@ -653,7 +752,7 @@ PROMPT = """Ты — контент-менеджер интернет-магаз
 Закончив, коротко ответь, сколько задач завёл и по каким маркам."""
 
 
-def _add_discontinued_candidates(tools) -> None:
+def _add_discontinued_candidates(tools) -> list[str]:
     """Завести задачи по коллекциям 1С, которых прайс не закрыл.
 
     **КАНДИДАТЫ, А НЕ ПРИГОВОР.** Поставщик дробит прайс по типам товара и присылает
@@ -662,12 +761,28 @@ def _add_discontinued_candidates(tools) -> None:
 
     Заводит КОД, потому что назвать такую коллекцию агент не в состоянии: он идёт от
     прайса, а её там нет.
+
+    **Коллекция, которую возит ДРУГОЙ поставщик, не снимается.** Это не производство
+    закрылось, а сменился канал: артикулы стоят в чьём-то свежем прайсе (журнал встреч,
+    `storage/sightings.py`). Задачи тогда нет вовсе — вместо неё строка в сводке. Пока
+    журнал пуст, поведение прежнее: снимаем, потому что обратного никто не показывал.
+
+    Возвращает строки для сводки — то, о чём админу сказать надо, а задачу заводить не за
+    что.
     """
+    notes: list[str] = []
     for tm_code, names in tools.untouched_collections().items():
         mark_name = tools._tm_names.get(tm_code, "")
         mark = Ref.make(code=tm_code, names=[mark_name] if mark_name else [])
         if mark.empty:
             continue
+
+        # Артикулы каждой коллекции — чтобы спросить журнал, не возит ли её кто-то ещё.
+        articles: dict[str, list[str]] = {}
+        for item in tools._items_cache.get(tm_code, ()):
+            if item.article:
+                articles.setdefault(collection_of(item), []).append(
+                    norm_article(item.article))
 
         # Код папки коллекции запоминаем СРАЗУ: сейчас позиции ещё живы и ссылаются на
         # неё, а к моменту выполнения могут уехать поодиночке, и папку придётся угадывать
@@ -679,6 +794,13 @@ def _add_discontinued_candidates(tools) -> None:
                 folders.setdefault(collection_of(item), item.collection_ref)
 
         for name in names:
+            met = next((tools._elsewhere[k] for k in articles.get(name, ())
+                        if k in tools._elsewhere), None)
+            if met is not None:
+                notes.append(f"«{name}» ({mark_name}) не в этом прайсе, но {met.label()} "
+                             f"— оставлена, задачу на снятие не заводил")
+                continue
+
             task = PriceTask(
                 kind=TaskKind.MOVE_DISCONTINUED,
                 address=TaskAddress(tm=mark,
@@ -692,6 +814,7 @@ def _add_discontinued_candidates(tools) -> None:
                     f"тогда задачу просто закрыть."))
             if not any(t.matches(task) for t in tools.collected):
                 tools.collected.append(task)
+    return notes
 
 
 def owner_map(folders, marks) -> dict[str, set]:
@@ -776,13 +899,19 @@ def fix_marks(tasks: list[PriceTask], owners: dict[str, set]) -> list[str]:
 
 
 async def build(orchestrator, content: bytes, filename: str, onec=None,
-                usage_labels: dict | None = None) -> tuple[list[PriceTask], str]:
+                usage_labels: dict | None = None,
+                elsewhere: dict | None = None,
+                remember=None) -> tuple[list[PriceTask], str]:
     """Прогон формирования задач. Возвращает (задачи, короткий ответ агента).
 
     Пустой список — не ошибка: агент мог не найти, за что зацепиться. Вызывающий решает,
     падать ли обратно на заглушку.
+
+    `elsewhere` — снимок журнала встреч по ЧУЖИМ поставщикам (артикул → где видели);
+    `remember(артикулы)` — куда сложить то, что показал этот прайс. Оба необязательны:
+    без них поведение прежнее, то есть «нет в прайсе — кандидат в снятые».
     """
-    tools = TaskBuilderTools(content, filename, onec=onec)
+    tools = TaskBuilderTools(content, filename, onec=onec, elsewhere=elsewhere)
     task = f"Прайс «{filename}». Составь список задач по нему."
 
     answer, _ = await orchestrator.handle_turn(
@@ -795,9 +924,25 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
     # Именно так осталась незамеченной Brilliant у Most Flooring — восемь живых позиций.
     if onec is not None and tools.collected:
         try:
-            _add_discontinued_candidates(tools)
+            kept = _add_discontinued_candidates(tools)
+            if kept:
+                # Это не задача, а факт: коллекция жива, её возит другой. Молчать нельзя —
+                # админ помнит, что в прошлый раз её предлагали снять.
+                answer += "\n\nНе сняты, потому что есть у других поставщиков:\n— " \
+                          + "\n— ".join(kept)
         except Exception:                               # noqa: BLE001
             logger.warning("Не удалось найти коллекции вне прайса", exc_info=True)
+
+    # ЖУРНАЛ ВСТРЕЧ ПОПОЛНЯЕТСЯ ВСЕГДА — даже когда задач не вышло ни одной.
+    #
+    # Ценность журнала в полноте: прайс, по которому делать было нечего, всё равно
+    # доказывает, что коллекция жива. Пишем ПОСЛЕ хода, потому что артикулы приносит сам
+    # ход — модель перечисляет их в `compare_with_1c`.
+    if remember is not None and tools.seen_articles:
+        try:
+            await remember(tools.seen_articles)
+        except Exception:                               # noqa: BLE001
+            logger.warning("Не удалось записать журнал встреч", exc_info=True)
 
     # СВЕРКА МАРОК ПО 1С — ПОСЛЕ хода и БЕЗ участия модели.
     #
