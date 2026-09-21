@@ -18,14 +18,21 @@ from src.model.task import PriceTask
 from src.onec.client import NomItem
 
 
+#: Коды видов товара в 1С (`ВидТовара.Код`) — по ним `naming.size_in_name` решает, пишется
+#: ли размер в наименование. У керамики пишется, у ламината нет.
+CERAMIC_CODE = "000000010"
+LAMINATE_CODE = "000000005"
+
+
 def item(ref="T1", article="3309", site="Бах", collection="Миллениум Про",
-         product_type="Ламинат", name="", size="", not_exported=False):
+         product_type="Ламинат", name="", size="", not_exported=False,
+         product_type_ref=LAMINATE_CODE):
     return NomItem(
         ref=ref, id="", name=name or f"Ламинат MOST FLOOR {collection} {site}",
         article=article, unit="м2", size=size, product_type=product_type,
         collection=collection, parent=collection, collection_ref="F1", alt_units={},
         purchase=None, retail=None, rrc=None,
-        full_name="", site_name=site, product_type_ref="PT1",
+        full_name="", site_name=site, product_type_ref=product_type_ref,
         not_exported=not_exported)
 
 
@@ -52,12 +59,26 @@ class FakeOnec:
 
 
 def task(collection="Миллениум Про", tm_code="000000311"):
+    """Задача нормализации по ОДНОЙ коллекции.
+
+    Такие теперь не создаются — `add_task` делает их на марку целиком, — но в базе лежат
+    заведённые прежней версией, и обрабатывать их надо.
+    """
     return PriceTask(
         kind=TaskKind.NORMALIZE_NAMES,
         address=TaskAddress(tm=Ref.make(code=tm_code, names=["Most Flooring"]),
                             subject=Ref.make(names=[collection]),
                             subject_kind=TaskSubject.COLLECTION),
         description="привести к шаблону", id=5)
+
+
+def mark_task(tm_code="000000311"):
+    """Задача на МАРКУ ЦЕЛИКОМ — то, что заводит `add_task` сейчас."""
+    mark = Ref.make(code=tm_code, names=["Most Flooring"])
+    return PriceTask(kind=TaskKind.NORMALIZE_NAMES,
+                     address=TaskAddress(tm=mark, subject=mark,
+                                         subject_kind=TaskSubject.MARK),
+                     description="привести к шаблону", id=5)
 
 
 def allow():
@@ -133,6 +154,68 @@ class PlanTest(unittest.TestCase):
              item(ref="T3", collection="A", product_type="Плитка")],
             "000000311", "Most Flooring")
         self.assertEqual(len(inputs), 3)
+
+
+class ProductTypeTest(unittest.IsolatedAsyncioTestCase):
+    """Под одной маркой лежат РАЗНЫЕ виды товара, и шаблон имени у каждого свой.
+
+    Задача одна на марку — значит развилку по видам обязан держать код. Проверяется не то,
+    что групп получилось много (это `PlanTest`), а что к каждой применился СВОЙ шаблон.
+    """
+
+    def mixed(self):
+        """Керамика и ламинат у одной марки, у обоих размер заполнен."""
+        return [
+            item(ref="C1", collection="Мадейра", product_type="Керамическая плитка",
+                 product_type_ref=CERAMIC_CODE, site="Беж", size="60x60",
+                 name="MOST FLOOR Мадейра Беж"),
+            item(ref="L1", collection="Ле Паркет", product_type="Ламинат",
+                 product_type_ref=LAMINATE_CODE, site="Дуб Ява", size="1290x190x8",
+                 name="MOST FLOOR Ле Паркет Дуб Ява"),
+        ]
+
+    def written(self, onec):
+        names = {}
+        for pack in onec.writes:
+            for op in pack:
+                if op.get("name"):
+                    names[op.get("ref") or op.get("$id")] = op["name"]
+        return names
+
+    async def test_each_type_gets_its_own_template(self):
+        onec = FakeOnec(self.mixed())
+        status, text = await run_normalization(
+            onec, mark_task(), allow)              # задача на марку целиком
+        names = self.written(onec)
+
+        # Вид товара стоит ПЕРВЫМ и у каждого свой (§19.5).
+        self.assertTrue(names["C1"].startswith("Керамическая плитка"), names["C1"])
+        self.assertTrue(names["L1"].startswith("Ламинат"), names["L1"])
+
+    async def test_size_goes_into_the_name_only_for_ceramics(self):
+        """Ровно то, ради чего развилка и нужна: у керамики в одной коллекции лежат
+        форматы 30x60 и 60x60, у ламината формат один на всю коллекцию."""
+        onec = FakeOnec(self.mixed())
+        await run_normalization(onec, mark_task(), allow)
+        names = self.written(onec)
+
+        self.assertIn("60x60", names["C1"])
+        self.assertNotIn("1290x190x8", names["L1"])
+
+    async def test_two_types_in_one_collection_do_not_mix(self):
+        """Одно имя коллекции у двух видов товара — две группы, а не одна: иначе вид
+        товара первого попал бы в имена второго."""
+        onec = FakeOnec([
+            item(ref="A1", collection="Гранд", product_type="Ламинат",
+                 product_type_ref=LAMINATE_CODE, site="Дуб"),
+            item(ref="A2", collection="Гранд", product_type="Керамогранит",
+                 product_type_ref=CERAMIC_CODE, site="Беж"),
+        ])
+        await run_normalization(onec, task(collection="Гранд"), allow)
+        names = self.written(onec)
+
+        self.assertTrue(names["A1"].startswith("Ламинат"), names["A1"])
+        self.assertTrue(names["A2"].startswith("Керамогранит"), names["A2"])
 
 
 class ReportTest(unittest.TestCase):
