@@ -214,6 +214,31 @@ def plan(items, tm_code: str, tm_name: str, only_collection: str = ""):
     return inputs, skipped, discontinued
 
 
+def pending_work(items, tm_code: str, tm_name: str, scope=None) -> int:
+    """Сколько правок дала бы нормализация прямо сейчас. Ноль — делать нечего.
+
+    **ЗАЧЕМ СЧИТАТЬ ЗАРАНЕЕ.** Задача заводится на марку целиком и никакой проверки до
+    сих пор не проходила — в отличие от остальных видов, где есть `compare_with_1c`. На
+    Most Flooring это вылезло сразу: восемь коллекций, сто позиций, и НИ ОДНОЙ правки —
+    имена давно приведены. Админ получил задачу, открыл, выполнил и увидел «менять было
+    нечего». Такие задачи обесценивают список: их перестают читать вместе с настоящими.
+
+    Считается ТЕМ ЖЕ `plan_collection`, что и выполнит работу, — иначе оценка разошлась бы
+    с делом. Дорого это не стоит: выгрузка уже лежит в кеше прогона, модель не участвует.
+    """
+    from src.price_tool import items as item_rules
+
+    inputs, skipped, _ = plan(items, tm_code, tm_name)
+    # Пропущенные — это тоже работа: админу есть что решить, и задача нужна.
+    if skipped:
+        return len(skipped)
+
+    total = 0
+    for inp in inputs:
+        total += len(item_rules.plan_collection(inp, list(items), list(scope or [])).ops())
+    return total
+
+
 def report(written: int, skipped: list, discontinued: int, groups: int) -> str:
     """Короткий отчёт админу: сделанное одной строкой, разбирательства — списком."""
     lines = []

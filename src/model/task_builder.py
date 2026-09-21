@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 
 from src.model.enums import TaskKind, TaskSubject
 from src.model.normalize import collection_of
@@ -37,6 +38,33 @@ logger = logging.getLogger(__name__)
 
 MAX_SHEET_ROWS = 200        # строк листа в один ответ инструмента
 MAX_TASKS = 200             # потолок на прогон: защита от разгона, а не рабочий предел
+
+
+def _price_notes_only(text: str | None) -> str:
+    """Оставить в тексте агента ТОЛЬКО наблюдения по прайсу, убрав повтор стандарта.
+
+    Агент, которому велено «не описывай шаблон», всё равно начинает с «Привести
+    наименования марки к шаблону §19.5» — и описание выходит с двумя одинаковыми
+    предложениями подряд, своим и его. Ему это не в укор: он пишет описание задачи, а то,
+    что стандарт допишет код, для него невидимо.
+
+    Режется ПО ПРЕДЛОЖЕНИЯМ и только те, где он пересказывает канон: упоминание §19.5 или
+    «привести … к шаблону». Всё остальное — про прайс — остаётся нетронутым.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+
+    kept = []
+    for part in re.split(r"(?<=[.!?])\s+", raw):
+        probe = part.lower()
+        if "19.5" in probe or ("шаблон" in probe and "привести" in probe):
+            continue
+        kept.append(part)
+
+    out = " ".join(kept).strip()
+    # Осталась одна связка вроде «Наблюдения по прайсу:» — смысла в ней нет.
+    return "" if len(out) < 15 else out
 
 
 def normalize_brief() -> str:
@@ -154,6 +182,7 @@ class TaskBuilderTools:
         self.marks: list[dict] = []
         self._sheets = None
         self._items_cache: dict[str, list] = {}
+        self._tm_names: dict[str, str] = {}     # код марки → её имя В 1С
 
     def handles(self, name: str) -> bool:
         return name in {t["name"] for t in TOOLS}
@@ -205,6 +234,33 @@ class TaskBuilderTools:
         self.marks = [{"name": m.name, "code": m.code, "selling": m.selling}
                       for m in marks]
         return json.dumps(self.marks, ensure_ascii=False)
+
+    def _normalization_pointless(self, tm_code: str) -> str:
+        """Отказ, если нормализовать нечего. Пустая строка — задача нужна.
+
+        Сбой сверки задачу НЕ отменяет: не сумев проверить, безопаснее завести — админ
+        откроет и увидит «менять было нечего», а вот пропущенная работа не всплывёт никак.
+        """
+        if self._onec is None or not tm_code:
+            return ""
+        try:
+            from src.model import normalize as nz
+            items = self._nomenclature(tm_code)
+            if nz.pending_work(items, tm_code, self._tm_name(tm_code)) > 0:
+                return ""
+        except Exception:                               # noqa: BLE001
+            logger.warning("Не удалось оценить нормализацию марки %s", tm_code,
+                           exc_info=True)
+            return ""
+
+        return ("Нормализация этой марке не нужна: наименования уже собраны по шаблону "
+                "§19.5. Задачу не завёл. Если в прайсе есть НАБЛЮДЕНИЯ, о которых стоит "
+                "сказать админу, — вынеси их в свой итоговый ответ.")
+
+    def _tm_name(self, tm_code: str) -> str:
+        """Имя марки как оно записано в 1С."""
+        self._nomenclature(tm_code)
+        return self._tm_names.get(tm_code, "")
 
     def _compare(self, inp: dict) -> str:
         """Сверка коллекции прайса с 1С. Наружу идёт СВОДКА, не выгрузка.
@@ -288,6 +344,9 @@ class TaskBuilderTools:
         if tm_code not in self._items_cache:
             nom = self._onec.by_tm_all(tm_code, include_not_exported=True)
             self._items_cache[tm_code] = list(nom.items)
+            # `.strip()` не косметика: на бою марка записана как «Most Flooring » — с
+            # висячим пробелом, и он уехал бы в каждое собранное наименование.
+            self._tm_names[tm_code] = (nom.tm or "").strip()
         return self._items_cache[tm_code]
 
     def _add(self, inp: dict) -> str:
@@ -325,11 +384,21 @@ class TaskBuilderTools:
             # потому что видит их в прайсе, и помнить исключение для одного вида задач
             # ей неоткуда.
             subject, kind_of = mark, TaskSubject.MARK
+
+            # ПУСТУЮ ЗАДАЧУ НЕ ЗАВОДИМ. Нормализация адресована марке целиком и никакой
+            # проверки до сих пор не проходила — в отличие от остальных видов, где есть
+            # `compare_with_1c`. На Most Flooring вышло восемь коллекций, сто позиций и
+            # НИ ОДНОЙ правки: имена давно приведены. Админ открыл задачу, выполнил и
+            # увидел «менять было нечего». Такие задачи обесценивают список.
+            refusal = self._normalization_pointless(mark.code)
+            if refusal:
+                return refusal
+
             # Стандарт формулирует КОД (см. `normalize_brief`). Текст агента остаётся
             # НИЖЕ и подписан как наблюдение по прайсу: в прайсе он правда кое-что видит
             # — два написания бренда, пометки NEW/АКЦИЯ в заголовках, — и терять это не
             # надо. Но стандартом 1С это не является, и выдавать одно за другое нельзя.
-            seen = (inp.get("description") or "").strip()
+            seen = _price_notes_only(inp.get("description"))
             description = normalize_brief()
             if seen:
                 description += f"\n\nЗамечено в прайсе (наблюдение агента): {seen}"

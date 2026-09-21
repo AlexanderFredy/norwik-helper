@@ -196,6 +196,105 @@ class ToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("не адресуема", out)
 
 
+class PointlessNormalizationTest(unittest.IsolatedAsyncioTestCase):
+    """Задачу, которой нечего делать, не заводят.
+
+    СЛУЧАЙ С БОЯ (21.09.2026). У Most Flooring восемь коллекций, сто позиций — и ни одной
+    правки: имена давно собраны по шаблону. Админ открыл задачу, выполнил и увидел
+    «менять было нечего». Нормализация адресуется марке целиком и до сих пор не проходила
+    никакой проверки, в отличие от остальных видов, где есть `compare_with_1c`.
+    """
+
+    def onec(self, names):
+        from src.onec.client import NomItem
+
+        # `full_name` заполняется тем же, что и `name`: в 1С он так и стоит, а пустой
+        # дал бы правку сам по себе — и «уже канонический» образец перестал бы им быть.
+        items = [NomItem(ref=f"R{n}", id="", name=name, article=f"A{n}", unit="м2",
+                         size="", product_type="Ламинат", collection="Brilliant",
+                         parent="Brilliant", collection_ref="F1", alt_units={},
+                         purchase=None, retail=None, rrc=None, site_name=site,
+                         full_name=name, product_type_ref="000000003")
+                 for n, (name, site) in enumerate(names)]
+
+        class Nom:
+            def __init__(self):
+                self.items = items
+                self.tm = "Egger"
+                self.total = len(items)
+                self.errors = []
+
+        class Fake(FakeOnec):
+            def by_tm_all(self, tm_code, **kw):
+                return Nom()
+
+        return Fake()
+
+    async def add(self, tools):
+        return await tools.execute("add_task", {
+            "kind": "нормализация наименований", "tm": "Egger", "tm_code": "T1",
+            "description": "привести к шаблону"})
+
+    async def test_canonical_names_produce_no_task(self):
+        onec = self.onec([("Ламинат Egger Brilliant Дуб серый", "Дуб серый")])
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=onec)
+        out = await self.add(tools)
+        self.assertEqual(tools.collected, [])
+        self.assertIn("не нужна", out)
+
+    async def test_broken_names_do_produce_a_task(self):
+        onec = self.onec([("Egger Brilliant Дуб серый", "Дуб серый")])  # нет вида товара
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=onec)
+        await self.add(tools)
+        self.assertEqual(len(tools.collected), 1)
+
+    async def test_a_failed_check_still_creates_the_task(self):
+        """Не сумев проверить, безопаснее завести: админ увидит «менять было нечего», а
+        вот пропущенная работа не всплывёт никак."""
+        class Broken(FakeOnec):
+            def by_tm_all(self, tm_code, **kw):
+                raise RuntimeError("1С недоступна")
+
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=Broken())
+        await self.add(tools)
+        self.assertEqual(len(tools.collected), 1)
+
+    async def test_without_1c_the_task_is_created(self):
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx")
+        await self.add(tools)
+        self.assertEqual(len(tools.collected), 1)
+
+
+class PriceNotesTest(unittest.TestCase):
+    """Повтор стандарта вычищается из наблюдения агента.
+
+    Ему велено «не описывай шаблон», но он всё равно начинает с «Привести наименования к
+    шаблону §19.5» — и описание выходит с двумя одинаковыми предложениями подряд. Это не
+    в укор: он пишет описание задачи, а то, что стандарт допишет код, ему невидимо.
+    """
+
+    def notes(self, text):
+        from src.model.task_builder import _price_notes_only
+        return _price_notes_only(text)
+
+    def test_the_standard_is_stripped_but_observations_stay(self):
+        out = self.notes("Привести наименования марки к шаблону §19.5. "
+                         "В заголовках пометки NEW и АКЦИЯ, их тащить не нужно.")
+        self.assertNotIn("19.5", out)
+        self.assertIn("NEW", out)
+
+    def test_nothing_but_the_standard_leaves_nothing(self):
+        self.assertEqual(self.notes("Привести наименования марки к шаблону §19.5."), "")
+
+    def test_pure_observations_pass_untouched(self):
+        text = "Бренд в файле пишется как MOST FLOOR, в 1С марка «Most Flooring»."
+        self.assertEqual(self.notes(text), text)
+
+    def test_empty_stays_empty(self):
+        self.assertEqual(self.notes(None), "")
+        self.assertEqual(self.notes("   "), "")
+
+
 class CompareTest(unittest.IsolatedAsyncioTestCase):
     """Сверка коллекции с 1С — то, ради чего задачи стали конкретными.
 
