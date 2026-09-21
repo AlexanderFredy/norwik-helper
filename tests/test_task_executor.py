@@ -225,7 +225,10 @@ class CollectionPropertyTest(unittest.IsolatedAsyncioTestCase):
     async def test_tool_description_states_the_rule(self):
         from src.model.executor import TOOLS
         write = next(t for t in TOOLS if t["name"] == "write_items")
-        self.assertIn("«Коллекция» (код 0000003) НЕ ЗАПОЛНЯЙ", write["description"])
+        # Правило стало точнее: раньше свойство было запрещено вовсе, теперь модель может
+        # ПОПРОСИТЬ его проставить, но значение выбирает код по имени коллекции.
+        self.assertIn("САМ НЕ ЗАПОЛНЯЙ", write["description"])
+        self.assertIn("set_collection_property", write["description"])
 
 
 class NewCollectionTest(unittest.IsolatedAsyncioTestCase):
@@ -298,6 +301,41 @@ class NewCollectionTest(unittest.IsolatedAsyncioTestCase):
         created = next(o for o in onec.batches[1] if o.get("op") == "create_item")
         self.assertIn({"property": COLLECTION_PROPERTY, "value_code": "V-777"},
                       created["properties"])
+
+    async def test_existing_items_get_the_property_on_request(self):
+        """Свойство «Коллекция» у восьми позиций «Классик» не завелось вовсе, и заполнить
+        его было нечем: код отбрасывал любое значение от модели. Теперь модель может
+        ПОПРОСИТЬ, а значение выбирает код по имени коллекции."""
+        from src.model.normalize import COLLECTION_PROPERTY
+        onec = self.onec()
+        tools = TaskTools(onec, b"", "p.xlsx", allow, kind=TaskKind.CHANGE_PROPERTIES)
+        await tools.execute("write_items", {
+            "tm_code": "TM1", "tm_name": "A+ Floor",
+            "product_type": "000000003", "product_type_name": "Ламинат",
+            "collection": "Классик", "set_collection_property": True,
+            "items": [{"op": "update", "ref": "T1", "title": "Аристо"}]})
+
+        self.assertEqual(onec.batches[0][0]["op"], "add_property_value")
+        updated = next(o for o in onec.batches[1] if o.get("op") == "update_item")
+        self.assertIn({"property": COLLECTION_PROPERTY, "value_code": "V-777"},
+                      updated["properties"])
+
+    async def test_the_model_cannot_choose_the_value(self):
+        """Просить можно, выбирать значение — нет: запрет «не заполнять именем папки»
+        держится тем, что код берёт имя коллекции, а не то, что прислала модель."""
+        from src.model.normalize import COLLECTION_PROPERTY
+        onec = self.onec()
+        tools = TaskTools(onec, b"", "p.xlsx", allow, kind=TaskKind.CHANGE_PROPERTIES)
+        await tools.execute("write_items", {
+            "tm_code": "TM1", "tm_name": "A+ Floor",
+            "product_type": "000000003", "product_type_name": "Ламинат",
+            "collection": "Классик", "set_collection_property": True,
+            "items": [{"op": "update", "ref": "T1", "title": "Аристо",
+                       "properties": [{"property": COLLECTION_PROPERTY,
+                                       "value_code": "ЧУЖОЙ"}]}]})
+        written = json.dumps(onec.batches, ensure_ascii=False)
+        self.assertNotIn("ЧУЖОЙ", written)
+        self.assertIn("V-777", written)
 
     async def test_items_are_still_created_if_the_value_fails(self):
         """Карточка без свойства лучше, чем её отсутствие: свойство админ проставит."""

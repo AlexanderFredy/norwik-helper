@@ -132,10 +132,10 @@ TOOLS = [
             "марка — решает справочник, а не прайс. Написания разошлись — скажи об этом "
             "в finish, менять его вправе только админ.\n"
             "Передавай только то, что МЕНЯЕТСЯ: отсутствие поля значит «не трогать».\n"
-            "СВОЙСТВО «Коллекция» (код 0000003) НЕ ЗАПОЛНЯЙ. Пустое оно остаётся пустым: "
-            "в выгрузке коллекция могла быть выведена из имени папки, а имя папки несёт "
-            "размер и меняется при пересортировке справочника. Поставить это значение "
-            "вправе только админ.\n"
+            "СВОЙСТВО «Коллекция» (код 0000003) САМ НЕ ЗАПОЛНЯЙ — переданное тобой "
+            "значение отбрасывается. Нужно проставить его позициям коллекции — передай "
+            "`set_collection_property: true`, и код заведёт значение по имени коллекции "
+            "сам. При создании новой коллекции это делается без просьбы.\n"
             "Цены сюда НЕ передаются — для них отдельный инструмент."),
         "input_schema": {
             "type": "object",
@@ -145,6 +145,11 @@ TOOLS = [
                 "product_type": {"type": "string", "description": "код вида товара"},
                 "product_type_name": {"type": "string"},
                 "collection": {"type": "string"},
+                "set_collection_property": {
+                    "type": "boolean",
+                    "description": ("проставить позициям свойство «Коллекция»; значение "
+                                    "код заведёт сам по имени коллекции"),
+                },
                 "new_folder": {
                     "type": "object",
                     "description": "создать папку коллекции: parent_ref — код папки ТМ",
@@ -543,9 +548,18 @@ class TaskTools:
         # пачке создать значение и сослаться на него нельзя. Зато `add_property_value`
         # идемпотентна — на повтор отвечает `exists` и тем же кодом.
         # Заметка идёт В ОТЧЁТ, а не в `summary`: тот собран выше и уже не изменится.
+        #
+        # ЗНАЧЕНИЕ ВЫБИРАЕТ КОД, А НЕ МОДЕЛЬ. Она может лишь ПОПРОСИТЬ проставить свойство
+        # (`set_collection_property`), а какое значение — решает `plan.collection`, и оно
+        # заводится через `add_property_value`. Так запрет «не заполнять свойство именем
+        # папки» остаётся в силе: подсунуть произвольный код модель по-прежнему не может
+        # (`strip_collection_property`), а имя коллекции админ видит в описании задачи до
+        # того, как нажмёт «Выполнить».
         value_note = ""
-        if plan.new_folder:
-            value_note = await self._ensure_collection_value(plan, ops)
+        asked_property = bool(inp.get("set_collection_property"))
+        if plan.new_folder or asked_property:
+            value_note = await self._ensure_collection_value(
+                plan, ops, existing=asked_property)
 
         result = await asyncio.to_thread(self._onec.set_items, ops)
         # Выгрузка устарела: мы только что завели папки, позиции и значения свойств.
@@ -566,8 +580,11 @@ class TaskTools:
                        + "\n".join(f"— {e}" for e in self.errors[-len(errors):]))
         return summary + "\n\n" + report + value_note
 
-    async def _ensure_collection_value(self, plan, ops: list[dict]) -> str:
-        """Завести значение свойства «Коллекция» и проставить его создаваемым позициям.
+    async def _ensure_collection_value(self, plan, ops: list[dict],
+                                       existing: bool = False) -> str:
+        """Завести значение свойства «Коллекция» и проставить его позициям.
+
+        `existing=True` — проставить и уже существующим, а не только создаваемым.
 
         Возвращает заметку для отчёта: пусто — всё прошло молча, как и должно.
 
@@ -576,7 +593,8 @@ class TaskTools:
         `folder_name` + `product_type`, если её ещё нет: у новой марки её нет по
         определению.
         """
-        creating = [o for o in ops if o.get("op") == "create_item"]
+        wanted = ("create_item", "update_item") if existing else ("create_item",)
+        creating = [o for o in ops if o.get("op") in wanted]
         if not creating or not plan.collection:
             return ""
 
