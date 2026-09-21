@@ -12,7 +12,7 @@ from decimal import Decimal
 
 from src.model import normalize as nz
 from src.model.enums import TaskKind, TaskStatus, TaskSubject
-from src.model.executor import run_normalization
+from src.model.executor import run_discontinue, run_normalization
 from src.model.refs import Ref, TaskAddress
 from src.model.task import PriceTask
 from src.onec.client import NomItem
@@ -274,6 +274,128 @@ class FolderSizeTest(unittest.IsolatedAsyncioTestCase):
         written = {op["ref"]: op["name"]
                    for pack in onec.writes for op in pack if op.get("name")}
         self.assertEqual(written.get("A2"), "Ламинат A+ Floor Ле Паркет Тироль")
+
+
+class DiscontinueTest(unittest.IsolatedAsyncioTestCase):
+    """Коллекция уходит в снятые ПАПКОЙ, одной операцией.
+
+    СЛУЧАЙ С БОЯ (21.09.2026). В инструментах агента не было переноса папки, и он двигал
+    позиции по одной: восемь вызовов там, где хватало одного, а пустая папка осталась
+    висеть в живой ветке. Решать здесь нечего — папка известна, цель выводится из вида
+    товара, — поэтому модель тут не участвует.
+    """
+
+    LAMINATE = "000000003"        # вид товара «Ламинат»
+    TARGET = "YO-00006107"        # его папка снятых по `discontinued.MAPPING`
+
+    class Folder:
+        def __init__(self, ref, name, kind="collection", not_exported=False,
+                     product_type_ref="000000003"):
+            self.ref = ref
+            self.name = name
+            self.kind = kind
+            self.parent_ref = "TM1"
+            self.level = 2
+            self.not_exported = not_exported
+            self.product_type_ref = product_type_ref
+
+    class Tree:
+        def __init__(self, items):
+            self.items = list(items)
+            self.total = len(self.items)
+            self.errors = []
+
+    def onec(self, items, folders):
+        outer = self
+
+        class Fake(FakeOnec):
+            def __init__(self):
+                super().__init__(items)
+                self.ops = None
+
+            def folders(self, **kw):
+                return outer.Tree(folders)
+
+            def set_items(self, ops):
+                self.ops = ops
+                return {"created": 0, "updated": len(ops), "errors": []}
+
+        return Fake()
+
+    def task_for(self, name="Brilliant", code=""):
+        mark = Ref.make(code="000000311", names=["Most Flooring"])
+        return PriceTask(kind=TaskKind.MOVE_DISCONTINUED,
+                         address=TaskAddress(tm=mark,
+                                             subject=Ref.make(code=code, names=[name]),
+                                             subject_kind=TaskSubject.COLLECTION),
+                         description="проверить", id=9)
+
+    def item_in(self, ref, collection="Brilliant", folder="F-BR", dead=False):
+        it = item(ref=ref, collection=collection, product_type="Ламинат",
+                  product_type_ref=self.LAMINATE, not_exported=dead)
+        object.__setattr__(it, "collection_ref", folder)
+        return it
+
+    async def test_one_operation_moves_the_whole_folder(self):
+        onec = self.onec([self.item_in("R1"), self.item_in("R2")],
+                         [self.Folder("F-BR", "Коллекция Brilliant - 10 декоров")])
+        status, text = await run_discontinue(onec, self.task_for(code="F-BR"), allow)
+
+        self.assertEqual(onec.ops, [{"op": "update_folder", "ref": "F-BR",
+                                     "parent_ref": self.TARGET}])
+        self.assertEqual(status, TaskStatus.DONE)
+        self.assertIn("2 позиц", text)
+
+    async def test_empty_folder_still_moves(self):
+        """Позиции могли уехать в снятые поодиночке раньше — папка остаётся живой, и
+        убрать её всё равно надо. Ровно это и было с Brilliant."""
+        onec = self.onec([self.item_in("R1", dead=True)],
+                         [self.Folder("F-BR", "Коллекция Brilliant - 10 декоров")])
+        status, text = await run_discontinue(onec, self.task_for(code="F-BR"), allow)
+        self.assertIsNotNone(onec.ops)
+        self.assertIn("сняты раньше", text)
+
+    async def test_already_discontinued_folder_is_left_alone(self):
+        onec = self.onec([], [self.Folder("F-BR", "Brilliant", not_exported=True)])
+        status, text = await run_discontinue(onec, self.task_for(code="F-BR"), allow)
+        self.assertIsNone(onec.ops)
+        self.assertEqual(status, TaskStatus.DONE)
+
+    async def test_shared_folder_is_refused(self):
+        """Перенос утащил бы соседей: позиции без своей папки лежат прямо в папке марки."""
+        onec = self.onec([self.item_in("R1"), self.item_in("R2", collection="Accord")],
+                         [self.Folder("F-BR", "Общая папка")])
+        status, text = await run_discontinue(onec, self.task_for(code="F-BR"), allow)
+        self.assertIsNone(onec.ops)
+        self.assertEqual(status, TaskStatus.TODO)
+        self.assertIn("другие коллекции", text)
+
+    async def test_folder_found_by_name_when_the_task_has_no_code(self):
+        """Задачи прежней версии кода папки не несут — ищем по имени как по слову."""
+        onec = self.onec([self.item_in("R1")],
+                         [self.Folder("F-BR", "Коллекция Brilliant - 10 декоров")])
+        status, _ = await run_discontinue(onec, self.task_for(), allow)
+        self.assertEqual(onec.ops[0]["ref"], "F-BR")
+
+    async def test_ambiguous_name_moves_nothing(self):
+        onec = self.onec([self.item_in("R1")],
+                         [self.Folder("F1", "Brilliant"),
+                          self.Folder("F2", "Brilliant Plus")])
+        status, text = await run_discontinue(onec, self.task_for(), allow)
+        self.assertIsNone(onec.ops)
+        self.assertEqual(status, TaskStatus.TODO)
+
+    async def test_guard_stops_the_move(self):
+        from src.model.executor import WriteRefused
+
+        def deny():
+            raise WriteRefused("захват потерян")
+
+        onec = self.onec([self.item_in("R1")],
+                         [self.Folder("F-BR", "Brilliant")])
+        with self.assertRaises(WriteRefused):
+            await run_discontinue(onec, self.task_for(code="F-BR"), deny)
+        self.assertIsNone(onec.ops)
 
 
 class CollectionPropertyTest(unittest.TestCase):

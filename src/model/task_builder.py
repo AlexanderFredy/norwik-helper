@@ -574,10 +574,21 @@ def _add_discontinued_candidates(tools) -> None:
         if mark.empty:
             continue
 
+        # Код папки коллекции запоминаем СРАЗУ: сейчас позиции ещё живы и ссылаются на
+        # неё, а к моменту выполнения могут уехать поодиночке, и папку придётся угадывать
+        # по имени. Имена папок разнородны — «Коллекция Brilliant - 10 декоров» рядом с
+        # «Provence», — так что угадывание однажды промахнётся.
+        folders = {}
+        for item in tools._items_cache.get(tm_code, ()):
+            if item.collection_ref:
+                folders.setdefault(collection_of(item), item.collection_ref)
+
         for name in names:
             task = PriceTask(
                 kind=TaskKind.MOVE_DISCONTINUED,
-                address=TaskAddress(tm=mark, subject=Ref.make(names=[name]),
+                address=TaskAddress(tm=mark,
+                                    subject=Ref.make(code=folders.get(name),
+                                                     names=[name]),
                                     subject_kind=TaskSubject.COLLECTION),
                 description=(
                     f"Коллекция «{name}» есть в 1С, но в этом прайсе не встретилась "

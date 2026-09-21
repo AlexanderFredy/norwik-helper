@@ -220,7 +220,10 @@ TOOLS = [
             "status: «выполнена» — сделано всё задуманное; «частично обработана» — часть "
             "не удалась, и тогда в result ОБЯЗАТЕЛЬНЫ причина и что именно сделано; "
             "«к обработке» — не получилось ничего, задача возвращается в очередь.\n"
-            "result — что ты изменил в 1С, числами. Админ читает только это."),
+            "result — ЧТО ИЗМЕНЕНО В 1С, числами и кодами. Коротко: несколько строк, а "
+            "не отчёт. НЕ пересказывай ход работы, не перечисляй, что проверил и почему "
+            "решил, не подводи итогов по прайсу целиком — админ видел задачу и читает "
+            "только исход. Соседнее расхождение, если заметил, — ОДНОЙ строкой в конце."),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -634,7 +637,10 @@ PROMPT = """Ты — контент-менеджер интернет-магаз
 — Сначала ПОСМОТРИ, потом пиши. Прочитай прайс и выгрузку 1С, сопоставь, и только затем
   записывай.
 — Пиши ТОЛЬКО то, что относится к этой задаче. Увидел соседнее расхождение — скажи о нём
-  в `finish`, но не трогай: админ его не запускал.
+  в `finish` ОДНОЙ СТРОКОЙ и не трогай: админ его не запускал.
+
+— Отчёт краткий. Админ читает исход, а не ход работы: что изменено в 1С, числами. Ни
+  пересказа проверок, ни обоснования решения, ни сводки по прайсу целиком.
 — Не выдумывай данные. Нет в прайсе размера — не пиши размер.
 
 Порядок работы:
@@ -726,6 +732,115 @@ async def run_normalization(onec, task, guard, scope=None):
     return status, text
 
 
+async def run_discontinue(onec, task, guard):
+    """Перенос ЦЕЛОЙ коллекции в снятые — кодом, одним вызовом (§6.2).
+
+    **ПЕРЕНОСИМ ПАПКУ, А НЕ ПОЗИЦИИ.** Коллекция ушла из прайса целиком, значит и в снятые
+    она уходит целиком: одна операция `update_folder` вместо N штук `update_item`. Агент,
+    не имея в инструментах переноса папки, двигал позиции по одной — восемь вызовов там,
+    где хватало одного, и пустая папка осталась висеть в живых.
+
+    **РЕШАТЬ ЗДЕСЬ НЕЧЕГО**, поэтому и модели здесь нет: папка известна из самих позиций,
+    целевая папка снятых — из вида товара (`discontinued.folder_for`), а она же выбирает
+    ПРОФИЛЬНУЮ папку, а не общую свалку.
+    """
+    from src.price_tool import discontinued as dc
+
+    tm_code = (task.address.tm.code or "").strip()
+    wanted = task.address.subject.label()
+    if not tm_code or not wanted:
+        return (TaskStatus.TODO,
+                "У задачи нет кода марки или имени коллекции — переносить нечего.")
+
+    nom = await asyncio.to_thread(onec.by_tm_all, tm_code, include_not_exported=True)
+    mine = [i for i in nom.items
+            if nz.collection_of(i).casefold() == wanted.casefold()]
+    live = [i for i in mine if not i.not_exported]
+
+    # ПАПКУ ИЩЕМ В ДЕРЕВЕ, А НЕ ТОЛЬКО ПО ПОЗИЦИЯМ. Позиции коллекции могли уже уехать в
+    # снятые по одной — так и вышло с Brilliant, — и тогда `collection_ref` у них ведёт
+    # уже не сюда, а папка остаётся висеть в живой ветке пустой. Именно её и надо убрать.
+    tree = await asyncio.to_thread(onec.folders, tm=tm_code)
+    folder = _collection_folder(tree.items, task.address.subject, wanted)
+
+    if folder is None:
+        return (TaskStatus.TODO,
+                f"Папка коллекции «{wanted}» у этой марки не нашлась — перенести нечего. "
+                "Возможно, позиции лежат прямо в папке марки.")
+
+    if folder.not_exported:
+        return (TaskStatus.DONE,
+                f"Папка «{folder.name}» уже помечена невыгружаемой — коллекция снята.")
+
+    # ПАПКА ДОЛЖНА БЫТЬ НАША ЦЕЛИКОМ: перенос утащит всё, что внутри.
+    strangers = sorted({nz.collection_of(i) for i in nom.items
+                        if i.collection_ref == folder.ref
+                        and nz.collection_of(i).casefold() != wanted.casefold()})
+    if strangers:
+        return (TaskStatus.TODO,
+                f"В папке «{folder.name}» лежат и другие коллекции "
+                f"({', '.join(strangers[:5])}) — перенос утащил бы их следом. "
+                "Разберите папку либо перенесите позиции по одной.")
+
+    # Вид товара берём у позиций коллекции; если их не осталось — у папки.
+    type_ref = (mine[0].product_type_ref if mine else folder.product_type_ref)
+    target = dc.folder_for(type_ref)
+    if not target:
+        return (TaskStatus.TODO,
+                dc.refusal(type_ref, mine[0].product_type if mine else ""))
+
+    guard()
+    result = await asyncio.to_thread(
+        onec.set_items,
+        [{"op": "update_folder", "ref": folder.ref, "parent_ref": target}])
+
+    errors = result.get("errors") or []
+    if errors:
+        return (TaskStatus.TODO,
+                f"Папку «{folder.name}» перенести не удалось: "
+                + "; ".join(f"{e.get('code')} {e.get('message')}" for e in errors[:3]))
+
+    text = (f"Папка «{folder.name}» перенесена в снятые ({target}) целиком, "
+            f"вместе с ней {len(live)} позиц. Наименования и цены не менялись.")
+    gone = len(mine) - len(live)
+    if gone:
+        text += (f"\nЕщё {gone} позиц. этой коллекции были сняты раньше и лежат в другой "
+                 "папке снятых — их не трогал.")
+    return TaskStatus.DONE, text
+
+
+def _collection_folder(folders, subject, wanted: str):
+    """Папка коллекции в дереве марки. None — не нашлась.
+
+    Сперва по КОДУ из адреса задачи: его кладёт `_add_discontinued_candidates`, и это
+    точное попадание без всякого сопоставления имён. Имена папок в базе разнородны —
+    «Коллекция Brilliant - 10 декоров» рядом с «Provence», — и угадывать по ним значит
+    однажды перенести не ту.
+
+    Кода нет (задача заведена прежней версией) — ищем по имени как по СЛОВУ: «Brilliant»
+    внутри «Коллекция Brilliant - 10 декоров» есть, а «Accord» внутри «Accord Plus» —
+    другое слово. Нашлось несколько — не двигаем ничего.
+    """
+    from src.price_tool.scope import normalize
+
+    by_ref = {f.ref: f for f in folders}
+    code = (subject.code or "").strip()
+    if code and code in by_ref:
+        return by_ref[code]
+
+    probe = normalize(wanted)
+    if not probe:
+        return None
+
+    hits = [f for f in folders
+            if f.kind == "collection" and probe in normalize(f.name).split()]
+    # Составное имя («ECO plus») одним словом не найти — пробуем вхождением целиком.
+    if not hits:
+        hits = [f for f in folders
+                if f.kind == "collection" and probe in normalize(f.name)]
+    return hits[0] if len(hits) == 1 else None
+
+
 def task_brief(price, task) -> str:
     """Что именно предстоит сделать — одним куском для модели."""
     lines = [
@@ -763,6 +878,13 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
     # самой карточки. Платить за круги цикла и терпеть непредсказуемость незачем.
     if task.kind == TaskKind.NORMALIZE_NAMES:
         return await run_normalization(onec, task, guard, scope=scope)
+
+    # ПЕРЕНОС ЦЕЛОЙ КОЛЛЕКЦИИ — тоже мимо модели: папка известна из позиций, целевая
+    # папка снятых — из вида товара. Одна операция вместо N, и рассуждать не о чем.
+    # Задача про ОДИН товар остаётся агенту: там надо понять, что именно снимают.
+    if (task.kind == TaskKind.MOVE_DISCONTINUED
+            and task.subject == TaskSubject.COLLECTION):
+        return await run_discontinue(onec, task, guard)
 
     tools = TaskTools(onec, content, price.supplier_price.filename, guard,
                       scope=scope, kind=task.kind)
