@@ -117,9 +117,11 @@ TOOLS = [
         "name": "compare_with_1c",
         "description": (
             "Сверить коллекцию из прайса с 1С. Передай tm_code, collection и articles — "
-            "СПИСОК артикулов, которые ты увидел в этой коллекции прайса.\n"
-            "Вернётся КОРОТКАЯ сводка: чего из прайса нет в 1С, чего из 1С нет в прайсе, "
-            "какие свойства у позиций коллекции пустые.\n"
+            "СПИСОК артикулов, которые ты увидел в этой коллекции прайса. АРТИКУЛЫ "
+            "ОБЯЗАТЕЛЬНЫ: сопоставление идёт по ним, а не по имени.\n"
+            "Вернётся КОРОТКАЯ сводка, и в ней `collection_в_1С` — КАК ЭТА ЖЕ КОЛЛЕКЦИЯ "
+            "НАЗЫВАЕТСЯ В СПРАВОЧНИКЕ. Имена расходятся штатно: в прайсе «Миллениум Про», "
+            "в 1С «Millenium Pro». Адресуй задачу именем из 1С.\n"
             "ЗОВИ ЭТО ПЕРЕД add_task по каждой коллекции. Без сверки ты можешь написать "
             "только «проверить», а со сверкой — «завести 3 недостающих: …». Выгрузка "
             "номенклатуры при этом в ответ НЕ попадает: сравнение делает код."),
@@ -183,6 +185,7 @@ class TaskBuilderTools:
         self._sheets = None
         self._items_cache: dict[str, list] = {}
         self._tm_names: dict[str, str] = {}     # код марки → её имя В 1С
+        self._touched: dict[str, set] = {}      # код марки → коллекции 1С, закрытые сверкой
 
     def handles(self, name: str) -> bool:
         return name in {t["name"] for t in TOOLS}
@@ -235,6 +238,26 @@ class TaskBuilderTools:
                       for m in marks]
         return json.dumps(self.marks, ensure_ascii=False)
 
+    def untouched_collections(self) -> dict[str, list[str]]:
+        """Живые коллекции 1С, которых прайс не закрыл ВОВСЕ. Код марки → имена.
+
+        **ЗАЧЕМ ЭТО ОТДЕЛЬНО.** `compare_with_1c` идёт ОТ ПРАЙСА: агент называет коллекцию,
+        которую там увидел. Коллекция, существующая только в 1С, в этот обход не попадает
+        никогда — её просто не о чем спрашивать. Так у Most Flooring осталась незамеченной
+        Brilliant: восемь живых позиций, которых в прайсе нет, и никто о них не сказал.
+
+        Считается ПОСЛЕ хода, по следу вызовов сверки: какие коллекции агент закрыл, такие
+        и вычитаем. Модель не участвует — она и не может, у неё нет списка коллекций 1С.
+        """
+        out: dict[str, list[str]] = {}
+        for tm_code, items in self._items_cache.items():
+            covered = self._touched.get(tm_code, set())
+            live = {collection_of(i) for i in items if not i.not_exported}
+            rest = sorted(name for name in live if name and name not in covered)
+            if rest:
+                out[tm_code] = rest
+        return out
+
     def _normalization_pointless(self, tm_code: str) -> str:
         """Отказ, если нормализовать нечего. Пустая строка — задача нужна.
 
@@ -283,11 +306,7 @@ class TaskBuilderTools:
             return "Нужны tm_code и collection."
 
         items = self._nomenclature(tm_code)
-        wanted = normalize(collection)
-        # Коллекция берётся `collection_of`: у части марок свойство пустое, и остаётся имя
-        # папки — с размером внутри, который к имени коллекции не относится.
-        mine = [i for i in items
-                if normalize(collection_of(i)) == wanted and not i.not_exported]
+        live = [i for i in items if not i.not_exported]
 
         from_price = []
         seen = set()
@@ -297,28 +316,56 @@ class TaskBuilderTools:
                 seen.add(key)
                 from_price.append((key, str(raw).strip()))
 
-        in_1c = {norm_article(i.article): i for i in mine if i.article}
+        # СОПОСТАВЛЕНИЕ ПО АРТИКУЛУ, А НЕ ПО ИМЕНИ КОЛЛЕКЦИИ.
+        #
+        # Имена расходятся штатно: у Most Flooring в 1С коллекции названы латиницей
+        # («Millenium Pro», «Provence», «High Glossy»), а в прайсе — кириллицей
+        # («Миллениум Про», «Прованс», «Супер Глянец»). Поиск по имени не находил ничего,
+        # сверка отвечала «коллекции в 1С нет вовсе», и агент завёл СЕМЬ задач «добавить
+        # всё» по коллекциям, которые давно заведены. Выполнение дало бы ~56 дублей.
+        #
+        # Артикул же одинаков в обоих источниках — 3309 и в прайсе 3309, и в 1С. По нему
+        # и сопоставляем, а имя коллекции 1С ВОЗВРАЩАЕМ агенту: пусть адресует задачу так,
+        # как она называется в справочнике.
+        by_article = {norm_article(i.article): i for i in live if i.article}
+        found = [by_article[key] for key, _ in from_price if key in by_article]
+        missing_in_1c = [shown for key, shown in from_price if key not in by_article]
 
-        missing_in_1c = [shown for key, shown in from_price if key not in in_1c]
-        # Обратная сторона: позиция есть в 1С, но в прайсе её не стало — кандидат в
-        # снятые. Только КАНДИДАТ: поставщик мог прислать частичный прайс, и решать это
-        # админу, а не прогону.
+        # Куда на самом деле легли найденные артикулы. Обычно одна коллекция; несколько —
+        # значит раздел прайса собран из разных, и это тоже надо показать.
+        where: dict[str, int] = {}
+        for i in found:
+            name = collection_of(i)
+            where[name] = where.get(name, 0) + 1
+
+        # Обратная сторона: позиции ТЕХ ЖЕ коллекций, которых в прайсе не встретилось, —
+        # кандидаты в снятые. Только КАНДИДАТЫ: прайс мог быть частичным.
         missing_in_price = [f"{i.article} {i.site_name or i.name}".strip()
-                            for key, i in in_1c.items() if key not in seen]
+                            for i in live
+                            if collection_of(i) in where
+                            and norm_article(i.article) not in seen]
 
-        empty = self._empty_properties(mine)
+        # Отмечаем, какие коллекции 1С этот раздел прайса закрыл: незакрытые всплывут
+        # после хода отдельной проверкой (`untouched_collections`).
+        self._touched.setdefault(tm_code, set()).update(where)
 
         out = {
-            "collection": collection,
-            "in_1c": len(mine),
-            "from_price": len(from_price),
+            "collection_в_прайсе": collection,
+            "collection_в_1С": sorted(where) or None,
+            "нашлось_в_1С": len(found),
+            "прислано_из_прайса": len(from_price),
             "missing_in_1c": missing_in_1c[:40],
             "missing_in_price": missing_in_price[:40],
-            "empty_properties": empty,
+            "empty_properties": self._empty_properties(
+                [i for i in live if collection_of(i) in where]),
         }
-        if not mine:
-            out["note"] = ("коллекции в 1С нет вовсе — её придётся заводить вместе с "
-                           "позициями")
+        if not found:
+            out["note"] = ("ни один артикул не нашёлся у этой марки — коллекция и правда "
+                           "новая ЛИБО артикулы в прайсе записаны иначе; проверь колонку "
+                           "артикула, прежде чем заводить всё заново")
+        elif len(where) > 1:
+            out["note"] = ("артикулы раздела лежат в РАЗНЫХ коллекциях 1С — заводи задачи "
+                           "по каждой отдельно")
         return json.dumps(out, ensure_ascii=False)
 
     @staticmethod
@@ -437,8 +484,18 @@ PROMPT = """Ты — контент-менеджер интернет-магаз
 2. `get_selling_tm` — сопоставь бренды прайса с марками 1С. Названия бывают двуязычными
    («Latin / Кириллица») — сравнивай без учёта регистра и пунктуации.
 3. `compare_with_1c` НА КАЖДУЮ КОЛЛЕКЦИЮ — передай артикулы, которые увидел в ней.
-   Вернётся, чего нет в 1С, чего нет в прайсе и какие свойства пустые.
+   Вернётся, чего нет в 1С, чего нет в прайсе, какие свойства пустые и КАК КОЛЛЕКЦИЯ
+   НАЗЫВАЕТСЯ В 1С.
 4. `add_task` на каждую пару (марка, коллекция), по которой есть что делать.
+
+ИМЕНА КОЛЛЕКЦИЙ В ПРАЙСЕ И В 1С РАЗНЫЕ — это норма, а не ошибка. У Most Flooring в
+справочнике «Millenium Pro», «Provence», «High Glossy», а в прайсе «Миллениум Про»,
+«Прованс», «Супер Глянец». Сопоставляет их КОД, по артикулам, и возвращает тебе имя из
+1С — адресуй задачу им.
+
+НЕ РЕШАЙ ПО ИМЕНИ, ЧТО КОЛЛЕКЦИИ НЕТ. Пока `compare_with_1c` не сказал «ни один артикул
+не нашёлся», коллекция в 1С ЕСТЬ. Задача «завести всю коллекцию» по коллекции, которая
+давно заведена, создаёт дубли — на Most Flooring так едва не вышло 56 штук.
 
 ПИШИ ТО, ЧТО ЗНАЕШЬ, А НЕ ТО, ЧТО НАДО ПРОВЕРИТЬ. После `compare_with_1c` ты знаешь
 точно — значит и задача должна быть точной:
@@ -499,6 +556,36 @@ PROMPT = """Ты — контент-менеджер интернет-магаз
 заводи задачу на раздел целиком и так и напиши.
 
 Закончив, коротко ответь, сколько задач завёл и по каким маркам."""
+
+
+def _add_discontinued_candidates(tools) -> None:
+    """Завести задачи по коллекциям 1С, которых прайс не закрыл.
+
+    **КАНДИДАТЫ, А НЕ ПРИГОВОР.** Поставщик дробит прайс по типам товара и присылает
+    частями — коллекция, которой нет в ЭТОМ файле, может лежать в соседнем. Поэтому
+    задача формулируется как проверка, а решает админ.
+
+    Заводит КОД, потому что назвать такую коллекцию агент не в состоянии: он идёт от
+    прайса, а её там нет.
+    """
+    for tm_code, names in tools.untouched_collections().items():
+        mark_name = tools._tm_names.get(tm_code, "")
+        mark = Ref.make(code=tm_code, names=[mark_name] if mark_name else [])
+        if mark.empty:
+            continue
+
+        for name in names:
+            task = PriceTask(
+                kind=TaskKind.MOVE_DISCONTINUED,
+                address=TaskAddress(tm=mark, subject=Ref.make(names=[name]),
+                                    subject_kind=TaskSubject.COLLECTION),
+                description=(
+                    f"Коллекция «{name}» есть в 1С, но в этом прайсе не встретилась "
+                    f"ни одним артикулом. Проверить, снята ли она с производства, и если "
+                    f"да — перенести в снятые. Поставщик мог прислать частичный прайс: "
+                    f"тогда задачу просто закрыть."))
+            if not any(t.matches(task) for t in tools.collected):
+                tools.collected.append(task)
 
 
 def owner_map(folders, marks) -> dict[str, set]:
@@ -595,6 +682,16 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
     answer, _ = await orchestrator.handle_turn(
         [{"role": "user", "content": task}], system=PROMPT, extra_tools=TOOLS,
         extra_executor=tools, base_tools=False, usage_labels=usage_labels)
+
+    # КОЛЛЕКЦИИ, КОТОРЫХ ПРАЙС НЕ КОСНУЛСЯ, — задача заводится КОДОМ.
+    #
+    # Агент их назвать не может: он идёт от прайса, а такая коллекция есть только в 1С.
+    # Именно так осталась незамеченной Brilliant у Most Flooring — восемь живых позиций.
+    if onec is not None and tools.collected:
+        try:
+            _add_discontinued_candidates(tools)
+        except Exception:                               # noqa: BLE001
+            logger.warning("Не удалось найти коллекции вне прайса", exc_info=True)
 
     # СВЕРКА МАРОК ПО 1С — ПОСЛЕ хода и БЕЗ участия модели.
     #

@@ -335,13 +335,59 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
             "tm_code": "T1", "collection": collection, "articles": articles})
         return json.loads(out)
 
+    async def test_cyrillic_price_name_matches_latin_1c_name(self):
+        """СЛУЧАЙ С БОЯ (21.09.2026). В 1С коллекции названы латиницей («Millenium Pro»),
+        в прайсе кириллицей («Миллениум Про»). Поиск по имени не находил ничего, сверка
+        отвечала «коллекции в 1С нет», и агент завёл СЕМЬ задач «завести всю коллекцию»
+        по коллекциям, которые давно заведены: ~56 дублей, если бы их выполнили.
+
+        Артикул одинаков в обоих источниках — по нему и сопоставляем.
+        """
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", collection="Millenium Pro"),
+            self.nom("R2", "3310", collection="Millenium Pro"),
+        ]))
+        got = await self.compare(tools, ["3309", "3310"], collection="Миллениум Про")
+        self.assertEqual(got["нашлось_в_1С"], 2)
+        self.assertEqual(got["missing_in_1c"], [])
+        # и агент узнаёт, как коллекция называется в справочнике
+        self.assertEqual(got["collection_в_1С"], ["Millenium Pro"])
+
+    async def test_truly_new_collection_says_so_with_a_caveat(self):
+        """Ни один артикул не нашёлся — либо коллекция правда новая, либо колонка
+        артикула прочитана не та. Второе стоит проверить до заведения всего заново."""
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx",
+                                 onec=self.onec([self.nom("R1", "3309")]))
+        got = await self.compare(tools, ["9001", "9002"], collection="Совсем Новая")
+        self.assertEqual(got["нашлось_в_1С"], 0)
+        self.assertIn("колонку артикула", got["note"])
+
+    async def test_untouched_collections_are_found(self):
+        """Коллекция, которой в прайсе НЕТ, в обход по прайсу не попадает никогда — её
+        не о чем спрашивать. Так осталась незамеченной Brilliant у Most Flooring."""
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", collection="Millenium Pro"),
+            self.nom("R2", "A11701", collection="Brilliant"),
+        ]))
+        await self.compare(tools, ["3309"], collection="Миллениум Про")
+        self.assertEqual(tools.untouched_collections(), {"T1": ["Brilliant"]})
+
+    async def test_discontinued_collections_are_not_candidates_again(self):
+        """Снятую коллекцию звать снимать заново незачем."""
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", collection="Millenium Pro"),
+            self.nom("R2", "X1", collection="Prestige", not_exported=True),
+        ]))
+        await self.compare(tools, ["3309"], collection="Миллениум Про")
+        self.assertEqual(tools.untouched_collections(), {})
+
     async def test_missing_in_1c_is_named_not_counted(self):
         """Админу нужны артикулы, а не «трёх не хватает»: по числу работать нельзя."""
         tools = TaskBuilderTools(workbook(), "Прайс.xlsx",
                                  onec=self.onec([self.nom("R1", "3309")]))
         got = await self.compare(tools, ["3309", "3311 Бетховен", "3315"])
         self.assertEqual(got["missing_in_1c"], ["3311 Бетховен", "3315"])
-        self.assertEqual(got["in_1c"], 1)
+        self.assertEqual(got["нашлось_в_1С"], 1)
 
     async def test_articles_match_regardless_of_separators(self):
         """«LE-263», «LE 263» и «le263» — один артикул: поставщики пишут как придётся."""
@@ -383,8 +429,8 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         tools = TaskBuilderTools(workbook(), "Прайс.xlsx",
                                  onec=self.onec([self.nom("R1", "3309")]))
         got = await self.compare(tools, ["9001"], collection="Совсем Новая")
-        self.assertEqual(got["in_1c"], 0)
-        self.assertIn("нет вовсе", got["note"])
+        self.assertEqual(got["нашлось_в_1С"], 0)
+        self.assertIsNone(got["collection_в_1С"])
 
     async def test_nomenclature_does_not_leak_into_the_answer(self):
         """В ЭТОМ ВСЯ ЭКОНОМИЯ: выгрузка поехала бы в каждый следующий запрос."""
