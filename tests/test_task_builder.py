@@ -118,6 +118,18 @@ class ToolsTest(unittest.IsolatedAsyncioTestCase):
                 "collection": collection, "description": f"по {collection}"})
         self.assertEqual(len(self.tools.collected), 1)
 
+    async def test_prompt_forbids_judging_names_it_has_not_seen(self):
+        """Выгрузки 1С у него нет — значит и судить о соответствии шаблону не по чему.
+
+        Ровно это породило описание на десять строк про «единый ли шаблон» и «маркетинговые
+        пометки»: агент рассуждал о том, чего не видел. Шаблон §19.5 живёт в коде, и
+        сверяет с ним тоже код.
+        """
+        from src.model.task_builder import PROMPT
+        self.assertIn("НЕ рассуждай о том, соответствуют ли наименования 1С шаблону",
+                      PROMPT)
+        self.assertIn("§19.5", PROMPT)
+
     async def test_normalization_needs_no_collection(self):
         out = await self.tools.execute("add_task", {
             "kind": "нормализация наименований", "tm": "Egger",
