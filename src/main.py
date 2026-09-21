@@ -104,9 +104,10 @@ async def main() -> None:
         """Список задач составляет агент (§6.1). Метки расхода — как у прайсового
         прогона: по ним видно, во что обходится формирование (§9.6.3)."""
         from src.model.task_builder import build
-        tasks, _ = await build(orchestrator, content, filename, onec=onec,
-                               usage_labels={"kind": "pricing", "price_doc": filename})
-        return tasks
+        # Ответ агента едет дальше вместе с задачами: когда их ноль, только он и
+        # объясняет, почему — «расхождений нет» или «разобрал не тот лист».
+        return await build(orchestrator, content, filename, onec=onec,
+                           usage_labels={"kind": "pricing", "price_doc": filename})
 
     async def run_task(price, task, content, guard):
         """Выполнение задачи агентом (§6.2) — С НАСТОЯЩЕЙ ЗАПИСЬЮ в 1С.

@@ -698,7 +698,7 @@ class ServiceFallbackTest(unittest.IsolatedAsyncioTestCase):
             return [PriceTask(kind=TaskKind.CHANGE_PRICES,
                               address=TaskAddress(tm=Ref.make(names=["Egger"]),
                                                   subject=Ref.make(names=["Vintage"])),
-                              description="от агента")]
+                              description="от агента")], "завёл одну задачу"
 
         model = self.make(builder)
         await model.load()
@@ -708,27 +708,41 @@ class ServiceFallbackTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(tasks), 1)
         self.assertEqual(tasks[0].description, "от агента")
 
-    async def test_empty_answer_falls_back_to_the_stub(self):
-        """Молчаливо пустой список админ прочтёт как «разбирать нечего»."""
+    async def test_nothing_to_do_is_a_result_not_a_stub(self):
+        """СЛУЧАЙ С БОЯ (21.09.2026). По разобранному прайсу агент честно не нашёл работы
+        — цены совпали, нормализация отклонена как пустая, — а код подставил пять
+        заглушек, каждая из которых при выполнении ничего бы не сделала."""
+        said = []
+
         async def builder(content, filename, price):
-            return []
+            return [], "Расхождений нет: цены совпадают, позиции заведены."
+
+        class Ear:
+            async def notify(self, event):
+                said.append(event.text)
 
         model = self.make(builder)
+        model.events.subscribe(Ear())
         await model.load()
         await model.submit(workbook(), "Прайс.xlsx", supplier_hint="Монарх")
 
-        tasks = model.prices[0].tasks
-        self.assertTrue(tasks)
-        self.assertIn("ЗАГЛУШКА", tasks[0].description)
+        self.assertEqual(model.prices[0].tasks, [])
+        told = " ".join(said)
+        self.assertIn("работы нет", told)
+        # и слова агента доезжают: без них «работы нет» неотличимо от «прочитал не тот лист»
+        self.assertIn("цены совпадают", told)
 
-    async def test_agent_failure_falls_back_too(self):
+    async def test_agent_failure_falls_back_to_the_stub(self):
+        """Заглушка остаётся ровно для сорвавшегося прогона: тут пустота была бы ложью."""
         async def builder(content, filename, price):
             raise RuntimeError("нет связи с моделью")
 
         model = self.make(builder)
         await model.load()
         await model.submit(workbook(), "Прайс.xlsx", supplier_hint="Монарх")
-        self.assertTrue(model.prices[0].tasks)
+        tasks = model.prices[0].tasks
+        self.assertTrue(tasks)
+        self.assertIn("ЗАГЛУШКА", tasks[0].description)
 
 
 if __name__ == "__main__":

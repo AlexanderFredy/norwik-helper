@@ -469,17 +469,17 @@ class TaskBuilderTools:
 
     def _add(self, inp: dict) -> str:
         if len(self.collected) >= MAX_TASKS:
-            return f"Достигнут потолок в {MAX_TASKS} задач — заканчивай."
+            return self._refuse(f"Достигнут потолок в {MAX_TASKS} задач — заканчивай.")
 
         raw = (inp.get("kind") or "").strip().lower()
         kind = next((k for k in TaskKind if k.value == raw), None)
         if kind is None:
-            return ("Неизвестный вид задачи. Допустимо: "
-                    + ", ".join(k.value for k in TaskKind))
+            return self._refuse("Неизвестный вид задачи. Допустимо: "
+                                + ", ".join(k.value for k in TaskKind))
 
         tm = (inp.get("tm") or "").strip()
         if not tm:
-            return "Не указана марка — без неё задача не адресуема."
+            return self._refuse("Не указана марка — без неё задача не адресуема.")
 
         item = (inp.get("item") or "").strip()
         collection = (inp.get("collection") or "").strip()
@@ -488,7 +488,8 @@ class TaskBuilderTools:
         # Нормализация адресуется МАРКОЙ, поэтому предмет ей не нужен — требовать его
         # значило бы отклонять правильно составленную задачу.
         if kind != TaskKind.NORMALIZE_NAMES and not item and not collection:
-            return "Нужна коллекция либо товар: задача без предмета не адресуема."
+            return self._refuse(
+                "Нужна коллекция либо товар: задача без предмета не адресуема.")
 
         if kind == TaskKind.NORMALIZE_NAMES:
             # НОРМАЛИЗАЦИЯ — ВСЕГДА НА МАРКУ ЦЕЛИКОМ, что бы ни передала модель.
@@ -510,7 +511,7 @@ class TaskBuilderTools:
             # увидел «менять было нечего». Такие задачи обесценивают список.
             refusal = self._normalization_pointless(mark.code)
             if refusal:
-                return refusal
+                return self._refuse(refusal)
 
             # Стандарт формулирует КОД (см. `normalize_brief`). Текст агента остаётся
             # НИЖЕ и подписан как наблюдение по прайсу: в прайсе он правда кое-что видит
@@ -543,6 +544,16 @@ class TaskBuilderTools:
 
         self.collected.append(task)
         return f"Задача заведена: {task.label()}. Всего: {len(self.collected)}."
+
+    def _refuse(self, reason: str) -> str:
+        """Отказ заводить задачу — В ЖУРНАЛ, а не только в ответ модели.
+
+        21.09.2026 прогон кончился нулём задач, и по журналу нельзя было сказать, почему:
+        отказы жили только в истории диалога, которая никуда не сохраняется. Гадать по
+        числу вызовов — не диагностика.
+        """
+        logger.info("add_task отклонён: %s", reason)
+        return reason
 
 
 PROMPT = """Ты — контент-менеджер интернет-магазина напольных покрытий. Тебе дали прайс

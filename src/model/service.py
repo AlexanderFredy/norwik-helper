@@ -26,6 +26,11 @@ from src.model.task import PriceTask
 
 logger = logging.getLogger(__name__)
 
+# Сколько слов агента показывать, когда задач не вышло. Его итоговый ответ бывает на
+# тысячу с лишним токенов, а в сообщении Telegram всего 4096 символов — и текст едет не
+# один, рядом ещё строка события.
+AGENT_SAY_LIMIT = 700
+
 
 def _description(command: Command) -> str:
     """Текст правки описания из полезной нагрузки команды.
@@ -49,7 +54,10 @@ class PriceListService:
         self._store = model_store
         self._suppliers = supplier_store
         self._save_file = save_file
-        # Формирование задач агентом (§6.1). None — падаем на заглушку: так тесты идут
+        # Формирование задач агентом (§6.1): `build_tasks(content, filename, price)` →
+        # (задачи, что агент сказал). Ответ нужен именно здесь: пустой список законен, и
+        # без слов агента он неотличим от «прочитал не тот лист».
+        # None — падаем на заглушку: так тесты идут
         # без сети и без ключа, а бот без настроенного 1С всё равно показывает список.
         self._build_tasks = build_tasks
         # Выполнение задачи агентом (§6.2): `run_task(price, task, content, guard)` →
@@ -338,8 +346,17 @@ class PriceListService:
                           filename: str) -> list[PriceTask]:
         """Список задач: агентом, если он есть, иначе заглушкой.
 
-        Пустой ответ агента — не повод оставить прайс без задач: падаем на заглушку и
-        говорим об этом. Молчаливо пустой список админ прочтёт как «разбирать нечего».
+        **ПУСТОЙ СПИСОК — ЭТО РЕЗУЛЬТАТ, А НЕ СБОЙ.** Пока проверок не было, пустой ответ
+        означал только одно — агент не справился, и заглушка была честнее пустоты. Теперь
+        расхождения ищет КОД: цены сверяются с 1С, нормализация отклоняется, если менять
+        нечего, недостающие позиции считает сверка. Прайс, по которому всё уже сделано,
+        законно даёт НОЛЬ задач — так и вышло 21.09.2026 на повторной сборке по Most
+        Floor, а админ получил пять выдуманных задач, каждая из которых при выполнении
+        ничего бы не сделала.
+
+        Поэтому заглушка остаётся ровно для одного случая: прогон СОРВАЛСЯ. Успешный
+        прогон без задач докладывается словами, и к ним прикладывается ответ агента —
+        без него «работы нет» неотличимо от «прочитал не тот лист».
         """
         from src.model.intake import read_signature, stub_tasks
 
@@ -347,13 +364,21 @@ class PriceListService:
         name = supplier.name if supplier else "поставщик"
 
         if self._build_tasks is not None:
+            answer, broke = "", False
             try:
-                tasks = await self._build_tasks(content, filename, price)
+                tasks, answer = await self._build_tasks(content, filename, price)
             except Exception:                           # noqa: BLE001
                 logger.exception("Агент не составил задачи по %s", filename)
-                tasks = []
+                tasks, broke = [], True
             if tasks:
                 return tasks
+            if not broke:
+                said = (answer or "").strip()
+                await self.events.publish(Event(
+                    EventKind.TASKS_REBUILT, price_id=price.id,
+                    text=f"По прайсу №{price.id} работы нет: расхождений с 1С не нашлось."
+                         + (f"\n\n{said[:AGENT_SAY_LIMIT]}" if said else "")))
+                return []
             await self.events.publish(Event(
                 EventKind.TASKS_REBUILT, price_id=price.id,
                 text="Агент не смог составить задачи — подставил заглушку. "
