@@ -835,15 +835,54 @@ class ServiceFallbackTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_agent_failure_falls_back_to_the_stub(self):
         """Заглушка остаётся ровно для сорвавшегося прогона: тут пустота была бы ложью."""
+        said = []
+
+        class Ear:
+            async def notify(self, event):
+                said.append(event.text)
+
         async def builder(content, filename, price):
-            raise RuntimeError("нет связи с моделью")
+            raise RuntimeError("credit balance is too low")
 
         model = self.make(builder)
+        model.events.subscribe(Ear())
         await model.load()
         await model.submit(workbook(), "Прайс.xlsx", supplier_hint="Монарх")
         tasks = model.prices[0].tasks
         self.assertTrue(tasks)
         self.assertIn("ЗАГЛУШКА", tasks[0].description)
+        # причина обязана доехать до админа: в консоль из Telegram не заглянешь
+        self.assertIn("credit balance", " ".join(said))
+
+    async def test_broken_rebuild_keeps_the_tasks_it_had(self):
+        """СЛУЧАЙ С БОЯ (21.09.2026): прогон упал посреди хода на 400 «credit balance is
+        too low». На новом прайсе это стоило пяти заглушек, а на пересборке стоило бы
+        всего живого списка — задачи не устарели от того, что модель не ответила."""
+        from src.model.commands import Command, CommandKind
+        from src.model.refs import Ref, TaskAddress
+        from src.model.task import PriceTask
+
+        good = [PriceTask(kind=TaskKind.CHANGE_PRICES,
+                          address=TaskAddress(tm=Ref.make(names=["Egger"]),
+                                              subject=Ref.make(names=["Vintage"])),
+                          description="настоящая задача")]
+        answers = [(good, "собрал")]
+
+        async def builder(content, filename, price):
+            if answers:
+                return answers.pop()
+            raise RuntimeError("credit balance is too low")
+
+        model = self.make(builder)
+        await model.load()
+        await model.submit(workbook(), "Прайс.xlsx", supplier_hint="Монарх")
+        price_id = model.prices[0].id
+
+        await model.apply(Command(kind=CommandKind.REBUILD_TASKS, price_id=price_id,
+                                  actor="admin"))
+
+        tasks = model.prices[0].tasks
+        self.assertEqual([t.description for t in tasks], ["настоящая задача"])
 
 
 if __name__ == "__main__":

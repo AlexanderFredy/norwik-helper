@@ -333,7 +333,12 @@ class PriceListService:
         if content is None:
             return await self._reject(command, "файл прайса не найден на сервере")
 
-        fresh = await self._make_tasks(price, content, price.supplier_price.filename)
+        fresh, broke = await self._make_tasks(
+            price, content, price.supplier_price.filename, fallback=False)
+        if broke:
+            # Прежние задачи остаются на месте: они не устарели от того, что модель не
+            # ответила. Админу — причина, а не молчание.
+            return await self._reject(command, f"агент не ответил, задачи не тронуты ({broke})")
         price.rebuild(fresh)
         await self._store.replace_tasks(price.id, price.tasks)
 
@@ -342,9 +347,15 @@ class PriceListService:
             text=f"Задачи прайса №{price.id} собраны заново: {len(price.tasks)}. "
                  "Статусы и правки описаний не переносятся."))
 
-    async def _make_tasks(self, price: Price, content: bytes,
-                          filename: str) -> list[PriceTask]:
-        """Список задач: агентом, если он есть, иначе заглушкой.
+    async def _make_tasks(self, price: Price, content: bytes, filename: str,
+                          fallback: bool = True) -> tuple[list[PriceTask], str]:
+        """Список задач: агентом, если он есть, иначе заглушкой. Возвращает (задачи, сбой).
+
+        `fallback=False` — НЕ подставлять заглушку: так зовёт пересборка. У прайса в этот
+        момент УЖЕ ЕСТЬ задачи, и заменить живой список выдуманным из-за того, что модель
+        не ответила, — потеря работы. 21.09.2026 прогон сорвался на 400 «credit balance
+        is too low» ровно посреди хода; на новом прайсе это стоило пяти заглушек, на
+        пересборке стоило бы всего списка.
 
         **ПУСТОЙ СПИСОК — ЭТО РЕЗУЛЬТАТ, А НЕ СБОЙ.** Пока проверок не было, пустой ответ
         означал только одно — агент не справился, и заглушка была честнее пустоты. Теперь
@@ -364,32 +375,38 @@ class PriceListService:
         name = supplier.name if supplier else "поставщик"
 
         if self._build_tasks is not None:
-            answer, broke = "", False
+            answer, broke = "", ""
             try:
                 tasks, answer = await self._build_tasks(content, filename, price)
-            except Exception:                           # noqa: BLE001
+            except Exception as exc:                    # noqa: BLE001
                 logger.exception("Агент не составил задачи по %s", filename)
-                tasks, broke = [], True
+                # ПРИЧИНА ЕДЕТ АДМИНУ, а не только в консоль. 21.09.2026 прогон по прайсу
+                # Westerhof кончился заглушками, и чтобы узнать, почему, пришлось поднимать
+                # базу расхода токенов и гадать по числу вызовов: сама ошибка осталась в
+                # журнале процесса, до которого из Telegram не дотянуться.
+                tasks, broke = [], f"{type(exc).__name__}: {exc}"[:300]
             if tasks:
-                return tasks
+                return tasks, ""
+            if broke and not fallback:
+                return [], broke
             if not broke:
                 said = (answer or "").strip()
                 await self.events.publish(Event(
                     EventKind.TASKS_REBUILT, price_id=price.id,
                     text=f"По прайсу №{price.id} работы нет: расхождений с 1С не нашлось."
                          + (f"\n\n{said[:AGENT_SAY_LIMIT]}" if said else "")))
-                return []
+                return [], ""
             await self.events.publish(Event(
                 EventKind.TASKS_REBUILT, price_id=price.id,
-                text="Агент не смог составить задачи — подставил заглушку. "
-                     "Повторить: /rebuild " + str(price.id)))
+                text=f"Прогон сорвался — подставил заглушку.\nПричина: {broke}\n"
+                     f"Повторить: /rebuild {price.id}"))
 
         _, sheets = read_signature(content, filename)
-        return stub_tasks(sheets, name)
+        return stub_tasks(sheets, name), ""
 
     async def _fill_tasks(self, price: Price, content: bytes, filename: str) -> None:
         """Задачи при приёме. Прайс уже записан — дописываем список отдельно."""
-        tasks = await self._make_tasks(price, content, filename)
+        tasks, _ = await self._make_tasks(price, content, filename)
         price.rebuild(tasks)
         await self._store.replace_tasks(price.id, price.tasks)
 
