@@ -320,6 +320,53 @@ class NewCollectionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn({"property": COLLECTION_PROPERTY, "value_code": "V-777"},
                       updated["properties"])
 
+    async def test_property_is_set_even_when_nothing_else_changes(self):
+        """СЛУЧАЙ С БОЯ («Натур» у A+ Floor). Имена были в порядке, `plan_collection`
+        правок не нашёл — и метод выходил на «расхождений нет» ещё ДО того, как дело
+        доходило до свойства. Задача честно докладывала «изменений в 1С нет».
+
+        Проставить свойство — само по себе работа, даже когда больше менять нечего.
+        """
+        from src.model.normalize import COLLECTION_PROPERTY
+        empty = nom(ref="T1", article="A1", collection="")
+        object.__setattr__(empty, "parent", "Натур")
+        onec = self.onec()
+        onec._items = [empty]
+
+        tools = TaskTools(onec, b"", "p.xlsx", allow, kind=TaskKind.CHANGE_PROPERTIES)
+        out = await tools.execute("write_items", {
+            "tm_code": "TM1", "tm_name": "A+ Floor",
+            "product_type": "000000003", "product_type_name": "Ламинат",
+            "collection": "Натур", "set_collection_property": True,
+            "items": [],                      # модель ничего не правит — только просит
+        })
+
+        updates = [o for o in onec.batches[1] if o.get("op") == "update_item"]
+        self.assertEqual(len(updates), 1)
+        self.assertIn({"property": COLLECTION_PROPERTY, "value_code": "V-777"},
+                      updates[0]["properties"])
+        # и отчёт не противоречит сам себе
+        self.assertIn("проставлено", out)
+
+    async def test_items_that_already_have_it_are_not_touched(self):
+        filled = nom(ref="T1", article="A1", collection="Натур")
+        onec = self.onec()
+        onec._items = [filled]
+
+        tools = TaskTools(onec, b"", "p.xlsx", allow, kind=TaskKind.CHANGE_PROPERTIES)
+        await tools.execute("write_items", {
+            "tm_code": "TM1", "tm_name": "A+ Floor",
+            "product_type": "000000003", "product_type_name": "Ламинат",
+            "collection": "Натур", "set_collection_property": True, "items": []})
+        self.assertEqual(onec.batches, [])
+
+    def test_tool_says_the_property_is_absent_from_the_type_list(self):
+        """Агент, не найдя «Коллекцию» в свойствах вида товара, заключил, что её надо
+        заводить в конфигурации. Она там и не должна быть — свойство общее."""
+        from src.model.executor import TOOLS
+        props = next(t for t in TOOLS if t["name"] == "get_1c_properties")
+        self.assertIn("«Коллекции» в этом списке НЕТ", props["description"])
+
     async def test_the_model_cannot_choose_the_value(self):
         """Просить можно, выбирать значение — нет: запрет «не заполнять именем папки»
         держится тем, что код берёт имя коллекции, а не то, что прислала модель."""

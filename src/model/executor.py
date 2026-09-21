@@ -111,7 +111,11 @@ TOOLS = [
         "description": (
             "Свойства вида товара и их допустимые значения с кодами. Без этого нельзя "
             "заполнить properties у позиции: значение задаётся КОДОМ, не текстом. "
-            "Один вызов на вид товара."),
+            "Один вызов на вид товара.\n"
+            "«Коллекции» в этом списке НЕТ и не будет — она общая, а не привязана к виду "
+            "товара. Это НЕ значит, что её нельзя проставить: её ставит код по "
+            "`set_collection_property`. Не делай из её отсутствия вывода, что свойство "
+            "надо заводить в конфигурации."),
         "input_schema": {
             "type": "object",
             "properties": {"product_type": {"type": "string"}},
@@ -532,6 +536,27 @@ class TaskTools:
         ops = plan.ops()
         summary = item_rules.render(plan) + note
 
+        asked_property = bool(inp.get("set_collection_property"))
+
+        # ПРОСТАВИТЬ СВОЙСТВО — САМО ПО СЕБЕ РАБОТА, даже когда больше менять нечего.
+        #
+        # `plan_collection` сравнивает имена и поля; свойство «Коллекция» он не смотрит
+        # вовсе. У коллекции «Натур» имена были в порядке, правок не нашлось, и метод
+        # выходил на «расхождений нет» ещё ДО того, как дело доходило до свойства.
+        # Задача честно докладывала «изменений в 1С нет» (бой 21.09.2026).
+        #
+        # Цели берём из 1С, а не из того, что прислала модель: свойство нужно ровно тем
+        # позициям коллекции, у которых его нет.
+        if asked_property and plan.collection:
+            known = {o.get("ref") for o in ops if o.get("ref")}
+            wanted = plan.collection.casefold()
+            for i in current:
+                if (not i.not_exported
+                        and i.ref not in known
+                        and not (i.collection or "").strip()
+                        and nz.collection_of(i).casefold() == wanted):
+                    ops.append({"op": "update_item", "ref": i.ref})
+
         if not ops:
             return summary + "\n\n[Записывать нечего — расхождений не нашлось.]"
 
@@ -556,7 +581,6 @@ class TaskTools:
         # (`strip_collection_property`), а имя коллекции админ видит в описании задачи до
         # того, как нажмёт «Выполнить».
         value_note = ""
-        asked_property = bool(inp.get("set_collection_property"))
         if plan.new_folder or asked_property:
             value_note = await self._ensure_collection_value(
                 plan, ops, existing=asked_property)
@@ -622,7 +646,11 @@ class TaskTools:
                           "value_code": made["ref"]})
             op["properties"] = props
 
-        return ""
+        # Говорим о сделанном ПРЯМО. Сводка плана считает только имена и поля и на
+        # свойство не смотрит: без этой строки отчёт выходил противоречивым — «править
+        # нечего» и тут же «изменено 10».
+        return (f"\nСвойство «Коллекция» = «{plan.collection}» проставлено "
+                f"{len(creating)} поз.")
 
     async def _write_prices(self, inp: dict) -> str:
         tm_code = str(inp.get("tm_code") or "").strip()
