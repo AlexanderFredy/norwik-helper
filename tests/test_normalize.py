@@ -276,6 +276,58 @@ class FolderSizeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(written.get("A2"), "Ламинат A+ Floor Ле Паркет Тироль")
 
 
+class CollectionPropertyTest(unittest.TestCase):
+    """Пустое свойство «Коллекция» НЕ заполняется именем папки.
+
+    Папка и свойство — разные вещи. Имя папки несёт размер (§19.5) и меняется при
+    пересортировке справочника; свойство попадает на сайт как признак коллекции.
+    Переписать одно другим значит подменить справочные данные производной величиной,
+    выведенной ради сборки строки.
+    """
+
+    def test_normalization_never_writes_properties_at_all(self):
+        """У нормализации в правке нет свойств вовсе — ей нечего там менять."""
+        inputs, _, _ = nz.plan([item()], "000000311", "Most Flooring")
+        self.assertNotIn("properties", inputs[0])
+
+    def test_collection_property_is_stripped_from_a_write(self):
+        """Свойства лежат ВНУТРИ позиции: фильтр, смотрящий на верхний уровень, пропустил
+        бы их все — так и было в первой редакции."""
+        inp = {"items": [{"op": "update", "ref": "T1", "properties": [
+            {"property": nz.COLLECTION_PROPERTY, "value_code": "V1"},
+            {"property": "0000007", "value_code": "V2"}]}]}
+        out, note = nz.strip_collection_property(inp)
+        self.assertEqual([p["property"] for p in out["items"][0]["properties"]],
+                         ["0000007"])
+        self.assertIn("Коллекция", note)
+
+    def test_other_properties_pass_untouched(self):
+        inp = {"items": [{"op": "update", "ref": "T1",
+                          "properties": [{"property": "0000007", "value_code": "V2"}]}]}
+        out, note = nz.strip_collection_property(inp)
+        self.assertEqual(out["items"][0]["properties"], inp["items"][0]["properties"])
+        self.assertEqual(note, "")
+
+    def test_only_the_offending_rows_are_copied(self):
+        """Позиции без нарушения остаются теми же объектами: правка касается лишь тех,
+        кого она правда касается."""
+        clean = {"op": "update", "ref": "T2",
+                 "properties": [{"property": "0000007"}]}
+        inp = {"items": [
+            {"op": "update", "ref": "T1",
+             "properties": [{"property": nz.COLLECTION_PROPERTY}]},
+            clean,
+        ]}
+        out, _ = nz.strip_collection_property(inp)
+        self.assertIs(out["items"][1], clean)
+
+    def test_write_without_properties_is_left_alone(self):
+        inp = {"tm_code": "T1", "collection": "Vintage"}
+        out, note = nz.strip_collection_property(inp)
+        self.assertIs(out, inp)
+        self.assertEqual(note, "")
+
+
 class ReportTest(unittest.TestCase):
 
     def test_silent_work_is_one_line(self):

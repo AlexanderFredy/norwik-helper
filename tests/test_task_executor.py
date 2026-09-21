@@ -7,6 +7,7 @@
 ГЛАВНОЕ ЗДЕСЬ — ЗАЩИТА ЗАПИСИ. Проверка права стоит вплотную перед вызовом 1С, потому что
 необратима именно запись: статус мы поправим, а цены в справочнике нет.
 """
+import json
 import tempfile
 import unittest
 from decimal import Decimal
@@ -196,6 +197,35 @@ class BrandNameTest(unittest.IsolatedAsyncioTestCase):
             "collection": "Vintage",
             "items": [{"op": "update", "ref": "T1", "title": "Дуб Медовый"}]})
         self.assertNotIn("⚠️ Марка", out)
+
+
+class CollectionPropertyTest(unittest.IsolatedAsyncioTestCase):
+    """Модель не может заполнить свойство «Коллекция», даже если попытается.
+
+    Запрет стоит у самой записи, а не только в промпте: выгрузка отдаёт коллекцию уже
+    ВЫВЕДЕННОЙ (из имени папки, когда реквизит пуст), и модель, добросовестно увидев её,
+    возвращает то же значение свойством. Имя папки для этого не годится — оно несёт
+    размер и меняется при пересортировке справочника.
+    """
+
+    async def test_property_is_dropped_before_the_write(self):
+        from src.model.normalize import COLLECTION_PROPERTY
+        onec = FakeOnec()
+        tools = TaskTools(onec, b"", "p.xlsx", allow, kind=TaskKind.CHANGE_PROPERTIES)
+        out = await tools.execute("write_items", {
+            "tm_code": "TM1", "product_type": "PT1", "product_type_name": "Ламинат",
+            "collection": "Vintage",
+            "items": [{"op": "update", "ref": "T1", "title": "Дуб Медовый",
+                       "properties": [{"property": COLLECTION_PROPERTY,
+                                       "value_code": "V1"}]}]})
+        self.assertIn("Коллекция", out)
+        written = json.dumps(onec.item_writes, ensure_ascii=False)
+        self.assertNotIn(COLLECTION_PROPERTY, written)
+
+    async def test_tool_description_states_the_rule(self):
+        from src.model.executor import TOOLS
+        write = next(t for t in TOOLS if t["name"] == "write_items")
+        self.assertIn("«Коллекция» (код 0000003) НЕ ЗАПОЛНЯЙ", write["description"])
 
 
 class OutcomeTest(unittest.IsolatedAsyncioTestCase):
