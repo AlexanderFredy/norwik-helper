@@ -69,10 +69,10 @@ CREATE TABLE IF NOT EXISTS price_task (
     description     TEXT NOT NULL DEFAULT '',
     result          TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL,
-    done_at         TEXT,
-    -- Когда задачу ЗАПУСКАЛИ в последний раз, чем бы прогон ни кончился. Отдельно от
-    -- `done_at`: тот ставится только при закрытии и снимается при возврате в очередь, и
-    -- по нему не отличить «не брались» от «пробовали и не вышло».
+    -- Когда задачу ЗАПУСКАЛИ в последний раз, чем бы прогон ни кончился. Прежний `done_at`
+    -- ставился только при закрытии и снимался при возврате в очередь, и по нему не
+    -- отличить «не брались» от «пробовали и не вышло». Значения старой колонки переезжают
+    -- сюда в `init()`: у закрытой задачи это был тот же самый прогон.
     run_at          TEXT,
     tm_code         TEXT NOT NULL DEFAULT '',
     tm_names        TEXT NOT NULL DEFAULT '[]',
@@ -106,11 +106,16 @@ class ModelStore:
             # База могла быть создана до появления захвата — дописываем колонки.
             cur = await db.execute("PRAGMA table_info(price)")
             have = {row[1] for row in await cur.fetchall()}
-            # Задача: отметка о прогоне появилась позже самих задач.
+            # Задача: дата закрытия стала датой ПРОГОНА. Значения переносятся, а не
+            # выбрасываются — у закрытой задачи закрывший её прогон тот же самый.
             cur = await db.execute("PRAGMA table_info(price_task)")
             task_have = {row[1] for row in await cur.fetchall()}
             if task_have and "run_at" not in task_have:
                 await db.execute("ALTER TABLE price_task ADD COLUMN run_at TEXT")
+            if task_have and "done_at" in task_have:
+                await db.execute("UPDATE price_task SET run_at = done_at "
+                                 "WHERE run_at IS NULL AND done_at IS NOT NULL")
+                await db.execute("ALTER TABLE price_task DROP COLUMN done_at")
 
             for column, ddl in (
                 ("lock_actor", "TEXT"),
@@ -148,7 +153,7 @@ class ModelStore:
             tasks: dict[int, list[PriceTask]] = {}
             cur = await db.execute(
                 "SELECT id, price_id, kind, subject, status, description, result, "
-                "created_at, done_at, run_at, tm_code, tm_names, subject_code, "
+                "created_at, run_at, tm_code, tm_names, subject_code, "
                 "subject_article, subject_names FROM price_task ORDER BY created_at, id")
             for row in await cur.fetchall():
                 tasks.setdefault(row[1], []).append(_task_from_row(row))
@@ -252,11 +257,11 @@ class ModelStore:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
                 "UPDATE price_task SET kind = ?, subject = ?, status = ?, description = ?, "
-                "result = ?, done_at = ?, run_at = ?, tm_code = ?, tm_names = ?, "
+                "result = ?, run_at = ?, tm_code = ?, tm_names = ?, "
                 "subject_code = ?, "
                 "subject_article = ?, subject_names = ? WHERE id = ?",
                 (task.kind.value, task.subject.value, task.status.value, task.description,
-                 task.result, task.done_at, task.run_at, addr.tm.code,
+                 task.result, task.run_at, addr.tm.code,
                  _dump(addr.tm.names),
                  addr.subject.code, addr.subject.article, _dump(addr.subject.names),
                  task.id))
@@ -350,12 +355,11 @@ class ModelStore:
         addr = task.address
         cur = await db.execute(
             "INSERT INTO price_task (price_id, kind, subject, status, description, result, "
-            "created_at, done_at, run_at, tm_code, tm_names, subject_code, "
+            "created_at, run_at, tm_code, tm_names, subject_code, "
             "subject_article, subject_names) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (price_id, task.kind.value, task.subject.value, task.status.value,
-             task.description, task.result, task.created_at, task.done_at,
-             task.run_at,
+             task.description, task.result, task.created_at, task.run_at,
              addr.tm.code, _dump(addr.tm.names), addr.subject.code,
              addr.subject.article, _dump(addr.subject.names)))
         task.id = cur.lastrowid
@@ -364,7 +368,7 @@ class ModelStore:
 def _task_from_row(row) -> PriceTask:
     """Собрать задачу обратно из строки. Имена уже нормализованы при записи."""
     (task_id, _price_id, kind, subject, status, description, result,
-     created_at, done_at, run_at, tm_code, tm_names, subj_code, subj_article,
+     created_at, run_at, tm_code, tm_names, subj_code, subj_article,
      subj_names) = row
 
     address = TaskAddress(
@@ -374,5 +378,5 @@ def _task_from_row(row) -> PriceTask:
 
     task = PriceTask(kind=TaskKind(kind), address=address, description=description,
                      status=TaskStatus(status), result=result, id=task_id,
-                     created_at=created_at, done_at=done_at, run_at=run_at)
+                     created_at=created_at, run_at=run_at)
     return task

@@ -102,18 +102,17 @@ class AddressTest(unittest.TestCase):
 
 class TaskTest(unittest.TestCase):
 
-    def test_complete_sets_date_only_when_closed(self):
+    def test_complete_marks_the_run(self):
         t = task()
         t.complete(TaskStatus.DONE, "записано 12 позиций")
         self.assertTrue(t.closed)
-        self.assertIsNotNone(t.done_at)
+        self.assertIsNotNone(t.run_at)
 
-    def test_nothing_worked_returns_to_todo_without_date(self):
+    def test_nothing_worked_returns_to_todo(self):
         """«Не получилось ничего» — это возврат в очередь, а не отдельный статус."""
         t = task()
         t.complete(TaskStatus.DONE, "ок")
         t.complete(TaskStatus.TODO, "1С не ответила")
-        self.assertIsNone(t.done_at)
         self.assertFalse(t.closed)
 
     def test_partial_is_closed_for_readiness(self):
@@ -122,12 +121,11 @@ class TaskTest(unittest.TestCase):
         t.complete(TaskStatus.PARTIAL, "из 12 записано 9, три без размера")
         self.assertTrue(t.closed)
 
-    def test_reopen_clears_the_date(self):
+    def test_reopen_resets_the_status_only(self):
         t = task()
         t.complete(TaskStatus.DONE)
         t.reopen()
         self.assertEqual(t.status, TaskStatus.TODO)
-        self.assertIsNone(t.done_at)
 
     def test_run_mark_is_set_whatever_the_outcome(self):
         """Прогон был — значит отметка есть, даже если задача вернулась в очередь."""
@@ -135,7 +133,6 @@ class TaskTest(unittest.TestCase):
         self.assertIsNone(t.run_at)
         t.complete(TaskStatus.TODO, "1С не ответила")
         self.assertIsNotNone(t.run_at)
-        self.assertIsNone(t.done_at)
 
     def test_run_mark_survives_reopen(self):
         """Иначе «не брались» и «пробовали трижды» снова стали бы неразличимы."""

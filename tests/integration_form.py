@@ -43,7 +43,7 @@ def task(tid, kind, order, address, status="к обработке", description=
          result="", subject="коллекция"):
     return {"id": tid, "kind": kind, "order": order, "subject": subject,
             "address": address, "status": status, "description": description,
-            "result": result, "done_at": None}
+            "result": result, "run_at": None}
 
 
 def fresh_snapshot():
@@ -157,7 +157,7 @@ class Stand:
                 return False, "задача №%d не найдена" % task_id
             item["status"] = "выполнена"
             item["result"] = "ЗАГЛУШКА стенда: в 1С ничего не записано."
-            item["done_at"] = moment()
+            item["run_at"] = moment()
             price["ready"] = all(t["status"] in ("выполнена", "частично обработана")
                                  for t in price["tasks"])
             return True, ""
@@ -169,7 +169,7 @@ class Stand:
             if not status:
                 return False, "в команде нет статуса"
             item["status"] = status
-            item["done_at"] = moment() if status != "к обработке" else None
+            item["run_at"] = moment() if status != "к обработке" else None
             price["ready"] = all(t["status"] in ("выполнена", "частично обработана")
                                  for t in price["tasks"])
             return True, ""

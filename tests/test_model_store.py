@@ -116,7 +116,7 @@ class RoundTripTest(Base):
         loaded = (await self.store.load_all())[0].tasks[0]
         self.assertEqual(loaded.status, TaskStatus.PARTIAL)
         self.assertEqual(loaded.result, "из 12 записано 9")
-        self.assertIsNotNone(loaded.done_at)
+        self.assertIsNotNone(loaded.run_at)
         self.assertTrue(loaded.closed)
 
     async def test_run_mark_survives_a_failed_attempt(self):
@@ -130,8 +130,31 @@ class RoundTripTest(Base):
 
         loaded = (await self.store.load_all())[0].tasks[0]
         self.assertEqual(loaded.status, TaskStatus.TODO)
-        self.assertIsNone(loaded.done_at)
         self.assertEqual(loaded.run_at, t.run_at)
+
+    async def test_old_done_at_moves_into_the_run_mark(self):
+        """База с прежней колонкой поднимается без потери дат: у закрытой задачи закрывший
+        её прогон — тот же самый, и выбрасывать его значило бы обнулить всю историю."""
+        import aiosqlite
+
+        p = price()
+        t = p.add_task(task())
+        await self.store.add_price(p)
+
+        path = self.store._db_path
+        async with aiosqlite.connect(path) as db:      # вернули базу к старому виду
+            await db.execute("ALTER TABLE price_task ADD COLUMN done_at TEXT")
+            await db.execute("UPDATE price_task SET run_at = NULL, "
+                             "done_at = '2026-09-14T13:05:00' WHERE id = ?", (t.id,))
+            await db.commit()
+
+        await self.store.init()
+        loaded = (await self.store.load_all())[0].tasks[0]
+        self.assertEqual(loaded.run_at, "2026-09-14T13:05:00")
+
+        async with aiosqlite.connect(path) as db:      # и сама колонка убрана
+            cur = await db.execute("PRAGMA table_info(price_task)")
+            self.assertNotIn("done_at", {row[1] for row in await cur.fetchall()})
 
     async def test_item_subject_survives(self):
         p = price()

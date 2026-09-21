@@ -41,10 +41,10 @@ SNAP = {"prices": [
          {"id": 9011, "kind": "изменение цен", "order": 5, "subject": "коллекция",
           "address": "ПРОВЕРКА Монарх / Vintage", "status": "к обработке",
           "description": "проверочная задача, в 1С ничего не пишет",
-          "result": "", "done_at": None},
+          "result": "", "run_at": None},
          {"id": 9012, "kind": "добавление новых", "order": 4, "subject": "коллекция",
           "address": "ПРОВЕРКА Монарх / Adventure", "status": "к обработке",
-          "description": "вторая проверочная", "result": "", "done_at": None}]},
+          "description": "вторая проверочная", "result": "", "run_at": None}]},
     {"id": 902, "file": "ПРОВЕРКА Most Floor.xlsx", "supplier": "ПРОВЕРКА Most Floor",
      "status": "частично обработан", "ready": False, "has_newer": True, "newer_id": 901,
      "locked_by": "Петров", "locked_until": "2026-09-14T12:10:00",
@@ -132,7 +132,7 @@ class Probe:
         task = snap3["prices"][0]["tasks"][0]
         task["status"] = "выполнена"
         task["result"] = "цены записаны"
-        task["done_at"] = "2026-09-14T13:05:00"
+        task["run_at"] = "2026-09-14T13:05:00"
         code, r3 = self.call("/get-products/set-model-state", snap3)
         self.check("changed = 1", r3.get("changed") == 1, str(r3)[:200])
         self.check("версия выросла на 1", r3.get("version") == (r2.get("version") or 0) + 1,
