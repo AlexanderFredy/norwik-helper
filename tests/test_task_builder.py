@@ -34,6 +34,21 @@ def workbook() -> bytes:
     return buf.getvalue()
 
 
+def price_workbook() -> bytes:
+    """Лист с ценовыми колонками: шапка поставщика сверху, как в боевых прайсах."""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    sheet = wb.active
+    sheet.title = "Ламинат"
+    sheet.append(["Прайс ООО «Поставщик»", "", "", ""])
+    sheet.append(["Артикул", "Наименование", "Дилерская, м²", "РРЦ, м²"])
+    sheet.append(["3309", "Дуб Авила", "1 560,00", "2 370"])
+    sheet.append(["3310", "Дуб Прато", 1560, 2370])
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 class FakeOnec:
     def selling_tm(self, all_marks=False):
         from src.onec.client import TradeMark
@@ -319,20 +334,22 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         return Fake()
 
     def nom(self, ref, article, site="Бах", collection="Vintage", props=(),
-            not_exported=False):
+            not_exported=False, purchase=None, rrc=None):
         from src.onec.client import ItemProperty, NomItem
         return NomItem(
             ref=ref, id="", name=f"Ламинат Egger {collection} {site}", article=article,
             unit="м2", size="", product_type="Ламинат", collection=collection,
             parent=collection, collection_ref="F1", alt_units={},
-            purchase=None, retail=None, rrc=None, site_name=site,
+            purchase=purchase, retail=None, rrc=rrc, site_name=site,
             product_type_ref="000000003", not_exported=not_exported,
             properties=tuple(ItemProperty(property=p, code="", value=v, value_code="")
                              for p, v in props))
 
-    async def compare(self, tools, articles, collection="Vintage"):
-        out = await tools.execute("compare_with_1c", {
-            "tm_code": "T1", "collection": collection, "articles": articles})
+    async def compare(self, tools, articles, collection="Vintage", columns=None):
+        inp = {"tm_code": "T1", "collection": collection, "articles": articles}
+        if columns:
+            inp["price_columns"] = columns
+        out = await tools.execute("compare_with_1c", inp)
         return json.loads(out)
 
     async def test_cyrillic_price_name_matches_latin_1c_name(self):
@@ -352,6 +369,57 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(got["missing_in_1c"], [])
         # и агент узнаёт, как коллекция называется в справочнике
         self.assertEqual(got["collection_в_1С"], ["Millenium Pro"])
+
+    async def test_prices_matching_the_file_report_nothing_to_do(self):
+        """СЛУЧАЙ С БОЯ (21.09.2026). По Millenium Pro агент завёл задачу «обновить цены
+        по 8 позициям», а закупка и РРЦ в 1С уже совпадали с прайсом: задача заводилась по
+        факту наличия ценовых колонок. Теперь сравнение делает код, и агенту прямо
+        сказано, что заводить нечего."""
+        from src.onec.client import Price
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", purchase=Price(1560, None), rrc=Price(2370, None)),
+            self.nom("R2", "3310", purchase=Price(1560, None), rrc=Price(2370, None)),
+        ]))
+        await tools.execute("read_price", {})
+        got = await self.compare(tools, ["3309", "3310"], columns={
+            "article": "Артикул", "purchase": "Дилерская", "rrc": "РРЦ"})
+
+        self.assertEqual(got["цены"]["совпадают"], 2)
+        self.assertEqual(got["цены"]["расходятся"], [])
+        self.assertIn("НЕ заводи", got["цены"]["вывод"])
+
+    async def test_price_difference_comes_back_with_numbers(self):
+        from src.onec.client import Price
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", purchase=Price(1200, None), rrc=Price(2370, None)),
+        ]))
+        await tools.execute("read_price", {})
+        got = await self.compare(tools, ["3309"], columns={
+            "article": "Артикул", "purchase": "Дилерская", "rrc": "РРЦ"})
+
+        self.assertEqual(len(got["цены"]["расходятся"]), 1)
+        self.assertIn("1 200", got["цены"]["расходятся"][0])
+
+    async def test_columns_are_named_once_per_sheet(self):
+        """Повторять их на каждой коллекции — лишние выходные токены на ровном месте."""
+        from src.onec.client import Price
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", purchase=Price(1560, None), rrc=Price(2370, None)),
+        ]))
+        await tools.execute("read_price", {})
+        await self.compare(tools, ["3309"], columns={
+            "article": "Артикул", "purchase": "Дилерская", "rrc": "РРЦ"})
+
+        again = await self.compare(tools, ["3309"])
+        self.assertEqual(again["цены"]["совпадают"], 1)
+
+    async def test_without_columns_the_answer_says_so(self):
+        """Молчаливое «совпадают: 0» агент прочёл бы как «менять нечего»."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx",
+                                 onec=self.onec([self.nom("R1", "3309")]))
+        got = await self.compare(tools, ["3309"])
+        self.assertIsInstance(got["цены"], str)
+        self.assertIn("price_columns", got["цены"])
 
     async def test_truly_new_collection_says_so_with_a_caveat(self):
         """Ни один артикул не нашёлся — либо коллекция правда новая, либо колонка

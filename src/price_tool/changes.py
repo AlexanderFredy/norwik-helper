@@ -117,7 +117,12 @@ def _num(value: Decimal) -> str:
 SAME_PRICE_PCT = Decimal("2")     # «уже стоит столько же» — в пределах порога значимости
 
 
-def _near(a: Decimal, b: Decimal, pct: Decimal = SAME_PRICE_PCT) -> bool:
+def same_price(a: Decimal, b: Decimal, pct: Decimal = SAME_PRICE_PCT) -> bool:
+    """«Уже стоит столько же» — в пределах порога значимости.
+
+    Публичная намеренно: тем же порогом сверяет цены прайса с 1С сборщик задач
+    (`src/model/price_check.py`). Второй набор правил разошёлся бы с этим молча.
+    """
     return b > 0 and abs(a - b) / b * Decimal("100") <= pct
 
 
@@ -157,7 +162,7 @@ def unit_warnings(group: GroupResult) -> list[str]:
             continue
 
         label = _LABEL.get(kind, kind)
-        at_new = [p for p, c in known if _near(c, new)]
+        at_new = [p for p, c in known if same_price(c, new)]
         values = sorted(c for _, c in known)
         head = f"⚠️ {group.collection}: {label} → {_num(new)}"
 

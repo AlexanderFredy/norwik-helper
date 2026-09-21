@@ -13,8 +13,12 @@
 возвращает несколько строк. Иначе тысячи токенов поехали бы в КАЖДЫЙ следующий запрос:
 цикл ручной, история целиком (§9.6.3 content-manager.md).
 
-Чего сверка не даёт даже так: самих наименований 1С и цен. Поэтому агент по-прежнему не
-судит о соответствии имён шаблону — это делает код при выполнении.
+Чего сверка не даёт даже так: самих наименований 1С. Поэтому агент по-прежнему не судит о
+соответствии имён шаблону — это делает код при выполнении.
+
+Цены сверяются, но тоже КОДОМ (`src/model/price_check.py`): агент называет колонки листа,
+а числа сравнивает модуль. Ни одной цены 1С в контекст при этом не уезжает, зато задача
+«изменение цен» перестала заводиться там, где менять нечего.
 
 **Инструменты возвращают текст, а состояние меняет код.** Задачи копятся в `collected` и
 попадают в модель одним куском после хода: так неудачный ход не оставляет половину списка.
@@ -30,6 +34,7 @@ from src.model.enums import TaskKind, TaskSubject
 from src.model.normalize import collection_of
 from src.model.refs import Ref, TaskAddress, norm_article
 from src.model.task import PriceTask
+from src.model import price_check
 from src.price_tool.items import build_name
 from src.price_tool.parser import parse_price_table, render_preview
 from src.price_tool.scope import normalize
@@ -124,13 +129,30 @@ TOOLS = [
             "в 1С «Millenium Pro». Адресуй задачу именем из 1С.\n"
             "ЗОВИ ЭТО ПЕРЕД add_task по каждой коллекции. Без сверки ты можешь написать "
             "только «проверить», а со сверкой — «завести 3 недостающих: …». Выгрузка "
-            "номенклатуры при этом в ответ НЕ попадает: сравнение делает код."),
+            "номенклатуры при этом в ответ НЕ попадает: сравнение делает код.\n"
+            "ЦЕНЫ: передай `price_columns` — где артикул, где закупка, где РРЦ (номер "
+            "колонки с единицы либо кусок заголовка). Достаточно одного раза на лист, "
+            "дальше можно не повторять. Код сам вычитает цены из прайса, сравнит их с 1С "
+            "и ответит полем `цены`: что расходится и сколько позиций уже стоят как в "
+            "прайсе. Сами цены 1С в ответ не попадают."),
         "input_schema": {
             "type": "object",
             "properties": {
                 "tm_code": {"type": "string"},
                 "collection": {"type": "string"},
                 "articles": {"type": "array", "items": {"type": "string"}},
+                "price_columns": {
+                    "type": "object",
+                    "description": ("где в листе артикул и цены: номер колонки с единицы "
+                                    "либо кусок её заголовка"),
+                    "properties": {
+                        "article": {"type": ["string", "integer"]},
+                        "purchase": {"type": ["string", "integer"]},
+                        "rrc": {"type": ["string", "integer"]},
+                        "sheet": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
             },
             "required": ["tm_code", "collection"],
             "additionalProperties": False,
@@ -186,6 +208,8 @@ class TaskBuilderTools:
         self._items_cache: dict[str, list] = {}
         self._tm_names: dict[str, str] = {}     # код марки → её имя В 1С
         self._touched: dict[str, set] = {}      # код марки → коллекции 1С, закрытые сверкой
+        self._last_sheet: str = ""              # лист, который агент читал последним
+        self._price_cols: dict[str, dict] = {}  # имя листа → названные колонки цен
 
     def handles(self, name: str) -> bool:
         return name in {t["name"] for t in TOOLS}
@@ -226,6 +250,7 @@ class TaskBuilderTools:
             or self.sheets[0]
         start = max(1, int(inp.get("from_row") or 1))
 
+        self._last_sheet = sheet.name
         head = (f"Листы: {', '.join(s.name for s in self.sheets)}\n"
                 f"=== Лист: {sheet.name} === (со строки {start})\n")
         return head + render_preview(sheet, max_rows=MAX_SHEET_ROWS, start=start)
@@ -356,6 +381,7 @@ class TaskBuilderTools:
             "прислано_из_прайса": len(from_price),
             "missing_in_1c": missing_in_1c[:40],
             "missing_in_price": missing_in_price[:40],
+            "цены": self._price_diff(found, inp),
             "empty_properties": self._empty_properties(
                 [i for i in live if collection_of(i) in where]),
             # СВОЙСТВО «Коллекция» СЧИТАЕТСЯ ОТДЕЛЬНО, и вот почему. `empty_properties`
@@ -396,6 +422,40 @@ class TaskBuilderTools:
                 if prop.value:
                     filled.add(prop.property)
         return sorted(known - filled)
+
+    def _price_diff(self, found: list, inp: dict):
+        """Сверить цены найденных позиций с прайсом (§6.1, `src/model/price_check.py`).
+
+        Колонки называет модель — сама она их и так читает, а код по листу гадать не
+        должен: у одного поставщика «дилерская», у другого «закуп», у третьего цена лежит
+        третьей колонкой без заголовка вовсе. Названо один раз на лист и запоминается:
+        повторять на каждой коллекции — лишние выходные токены на ровном месте.
+        """
+        spec = dict(inp.get("price_columns") or {})
+        sheet_name = str(spec.pop("sheet", "") or "").strip() or self._last_sheet
+        if spec:
+            self._price_cols[sheet_name] = spec
+        spec = self._price_cols.get(sheet_name)
+        if not spec:
+            return ("колонки цен не названы — передай price_columns, иначе сверить цены "
+                    "не с чем и задачу на их изменение заводить не по чему")
+        if not found:
+            return "в 1С не нашлось ни одной позиции этой коллекции — сверять нечего"
+
+        sheet = next((s for s in self.sheets if s.name == sheet_name), None) \
+            or (self.sheets[0] if self.sheets else None)
+        if sheet is None:
+            return "файл не разобрался — цены сверить не с чем"
+
+        cols = price_check.resolve_columns(sheet.rows, spec)
+        if isinstance(cols, str):
+            self._price_cols.pop(sheet_name, None)   # не запоминаем то, что не разрешилось
+            return cols
+        from_price = price_check.prices_from_rows(sheet.rows, cols)
+        if not from_price:
+            return ("в названных колонках цен не нашлось ни одного числа — проверь, те ли "
+                    "это колонки")
+        return price_check.report(price_check.compare(found, from_price))
 
     def _nomenclature(self, tm_code: str) -> list:
         """Выгрузка марки с кешем на прогон: за составление задач она не меняется."""
@@ -531,8 +591,10 @@ PROMPT = """Ты — контент-менеджер интернет-магаз
 их не показывает вовсе. Задач по ним не заводи и в ответе о них не упоминай: их судьба
 решена, переносом в папки снятых займутся отдельно.
 
-ЧЕГО У ТЕБЯ НЕТ ДАЖЕ СО СВЕРКОЙ: самих наименований 1С и цен. `compare_with_1c` отвечает
-на три вопроса — чего нет в 1С, чего нет в прайсе, какие свойства пусты, — и только на них.
+ЧЕГО У ТЕБЯ НЕТ ДАЖЕ СО СВЕРКОЙ: самих наименований 1С. `compare_with_1c` отвечает на
+четыре вопроса — чего нет в 1С, чего нет в прайсе, какие свойства пусты и какие цены
+разошлись, — и только на них. Цен 1С ты не видишь и тут: их сравнил код, тебе досталась
+разница.
 
 — НЕ рассуждай о том, соответствуют ли наименования 1С шаблону: ты их не видел. Шаблон
   задан §19.5 и живёт в коде — он единственный судья, и сверку делает он.
@@ -559,7 +621,11 @@ PROMPT = """Ты — контент-менеджер интернет-магаз
 — «перенос в снятые» — сверка нашла позиции 1С, которых в прайсе не встретилось. Назови
   сколько и какие, и напиши, что это кандидаты: прайс мог быть частичным;
 — «добавление новых» — сверка нашла артикулы прайса, которых нет в 1С. Перечисли их;
-— «изменение цен» — в прайсе есть колонки цен.
+— «изменение цен» — ТОЛЬКО если сверка показала расхождение. Передай в `compare_with_1c`
+  `price_columns` (где артикул, где закупка, где РРЦ — один раз на лист), и в ответе
+  придёт `цены`. Пусто в `расходятся` — задачи НЕТ: цены в 1С уже такие, прогон по ней
+  кончился бы словами «менять нечего». Есть расхождения — перечисли их в описании
+  артикулами и числами, они уже посчитаны за тебя.
 
 ОДИН ПРАЙС — НЕ ОДНА МАРКА. Поставщик присылает файл со своим именем на обложке, но
 коллекции внутри могут принадлежать РАЗНЫМ маркам 1С: у Most Flooring часть коллекций
