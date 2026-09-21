@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 
+from src.price_tool.naming import collection_from_folder
 from src.price_tool.scope import normalize as _norm
 
 logger = logging.getLogger(__name__)
@@ -44,10 +45,26 @@ class Skipped:
     NO_COLLECTION = "не заполнена коллекция — имя собрать не из чего"
 
 
+def collection_of(item) -> str:
+    """Имя коллекции ДЛЯ НАИМЕНОВАНИЯ ТОВАРА, а не для показа.
+
+    Свойство «Коллекция» заполнено — берём его. Пустое (у A+ Floor такими оказались все
+    двадцать позиций) — остаётся имя папки, и вот тут ловушка: у восьми напольных
+    категорий в имени папки СТОИТ РАЗМЕР по §19.5. Подставив его как коллекцию, мы
+    получаем «Ламинат A+ Floor Ле Паркет 600x600x14 Авила» — размер в середине
+    наименования, где его быть не должно: в имя товара он идёт только у керамики.
+
+    Поэтому хвост-размер снимается точной обратной операцией к `folder_name`.
+    """
+    own = (item.collection or "").strip()
+    if own:
+        return own
+    return collection_from_folder(item.parent, item.size)
+
+
 def group_key(item) -> tuple[str, str]:
     """По чему бьём на вызовы `plan_collection`: она работает на одну коллекцию и вид."""
-    return ((item.collection or item.parent or "").strip(),
-            (item.product_type or "").strip())
+    return (collection_of(item), (item.product_type or "").strip())
 
 
 def contaminated(item, tm_name: str, collection: str) -> bool:

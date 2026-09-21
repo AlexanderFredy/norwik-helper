@@ -26,6 +26,7 @@ import logging
 from datetime import date
 from decimal import Decimal
 
+from src.model import normalize as nz
 from src.model.enums import TaskKind, TaskStatus, TaskSubject
 from src.price_tool import items as item_rules
 # `plan_collection` есть И в `changes` (цены), И в `items` (справочник) — разные функции
@@ -363,9 +364,14 @@ class TaskTools:
         влияют ни на одно решение о цене. Ровно та же развилка сделана в прайсовом потоке
         (`PricingTools._item_fields`) и по той же причине.
         """
+        # КОЛЛЕКЦИЯ ОТДАЁТСЯ ГОТОВОЙ К ПОДСТАНОВКЕ В ИМЯ. Свойство «Коллекция» бывает
+        # пустым (у A+ Floor — у всех позиций), и тогда остаётся имя папки, а в нём по
+        # §19.5 стоит РАЗМЕР. Отдай мы его как есть — модель подставит его в `collection`
+        # и получит «Ламинат A+ Floor Ле Паркет 600x600x14 Авила»: размер в середине
+        # наименования, где ему не место. Ровно это и случилось при нормализации.
         row = {
             "ref": i.ref, "name": i.name, "article": i.article, "size": i.size,
-            "collection": i.collection, "collection_ref": i.collection_ref,
+            "collection": nz.collection_of(i), "collection_ref": i.collection_ref,
             "product_type": i.product_type, "unit": i.unit, "alt_units": i.alt_units,
             "purchase": i.purchase.value if i.purchase else None,
             "retail": i.retail.value if i.retail else None,

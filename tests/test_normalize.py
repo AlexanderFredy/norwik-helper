@@ -218,6 +218,64 @@ class ProductTypeTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(names["A2"].startswith("Керамогранит"), names["A2"])
 
 
+class FolderSizeTest(unittest.IsolatedAsyncioTestCase):
+    """Размер из имени ПАПКИ не должен протекать в наименование ТОВАРА.
+
+    СЛУЧАЙ С БОЯ (21.09.2026, A+ Floor). Свойство «Коллекция» у всех двадцати позиций
+    пустое, папка называется «Ле Паркет 600x600x14» — по §19.5 так и надо, у восьми
+    напольных категорий размер пишется в имя папки. Подставив имя папки как коллекцию,
+    нормализация выдала «Ламинат A+ Floor Ле Паркет 600x600x14 Авила»: размер оказался в
+    СЕРЕДИНЕ наименования, хотя в имя товара он идёт только у керамики.
+    """
+
+    def real(self, site="Авила", name=None):
+        """Позиция ровно в том виде, в каком её отдала боевая 1С."""
+        return item(ref="A1", article="", site=site, collection="",
+                    product_type="Ламинат", product_type_ref="000000003",
+                    size="600x600x14",
+                    name=name or f"Ламинат A+ Floor Ле Паркет {site}")
+
+    def setUp(self):
+        self.items = [self.real()]
+        # Поле `parent` у помощника равно коллекции, а здесь нужна ИМЕННО папка с размером.
+        object.__setattr__(self.items[0], "parent", "Ле Паркет 600x600x14")
+
+    def test_collection_loses_the_folder_size(self):
+        from src.model.normalize import collection_of
+        self.assertEqual(collection_of(self.items[0]), "Ле Паркет")
+
+    def test_filled_property_wins_over_the_folder(self):
+        """Свойство заполнено — берём его, без всякой реконструкции."""
+        from src.model.normalize import collection_of
+        good = item(collection="Vintage", size="1290x190x8")
+        object.__setattr__(good, "parent", "Vintage 1290x190x8")
+        self.assertEqual(collection_of(good), "Vintage")
+
+    async def test_size_does_not_leak_into_the_name(self):
+        onec = FakeOnec(self.items, tm="A+ Floor")
+        await run_normalization(onec, mark_task(), allow)
+
+        names = [op.get("name") for pack in onec.writes for op in pack if op.get("name")]
+        for written in names:
+            self.assertNotIn("600x600x14", written,
+                             "размер папки протёк в наименование товара")
+
+    async def test_already_broken_names_are_repaired(self):
+        """Соседи, у которых размер уже вписан в имя, должны ПОЧИНИТЬСЯ, а не задать
+        образец для остальных."""
+        broken = self.real(site="Тироль",
+                           name="Ламинат A+ Floor Ле Паркет 600x600x14 Тироль")
+        object.__setattr__(broken, "parent", "Ле Паркет 600x600x14")
+        object.__setattr__(broken, "ref", "A2")
+
+        onec = FakeOnec(self.items + [broken], tm="A+ Floor")
+        await run_normalization(onec, mark_task(), allow)
+
+        written = {op["ref"]: op["name"]
+                   for pack in onec.writes for op in pack if op.get("name")}
+        self.assertEqual(written.get("A2"), "Ламинат A+ Floor Ле Паркет Тироль")
+
+
 class ReportTest(unittest.TestCase):
 
     def test_silent_work_is_one_line(self):
