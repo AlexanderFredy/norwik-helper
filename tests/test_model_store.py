@@ -70,10 +70,10 @@ class RoundTripTest(Base):
         got = loaded.tasks[0].address
 
         self.assertEqual(got.tm.code, "T1")
-        self.assertIn("egger", got.tm.names)
+        self.assertIn("Egger", got.tm.names)
         self.assertEqual(got.subject.code, "YO-77")
         self.assertEqual(got.subject.article, "a001")
-        self.assertIn("adventure", got.subject.names)
+        self.assertIn("Adventure", got.subject.names)
 
     async def test_all_names_survive_not_just_the_first(self):
         """Их несколько намеренно: совпадение ищется по любому."""
@@ -84,7 +84,8 @@ class RoundTripTest(Base):
         await self.store.add_price(p)
 
         got = (await self.store.load_all())[0].tasks[0].address.subject.names
-        self.assertEqual(set(got), {"adventure", "эдвенчер"})
+        # Написание сохраняется, а повтор в другом регистре отбрасывается.
+        self.assertEqual(set(got), {"Adventure", "Эдвенчер"})
 
     async def test_loaded_task_still_matches_the_original(self):
         p = price()

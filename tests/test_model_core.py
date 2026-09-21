@@ -64,11 +64,19 @@ class RefTest(unittest.TestCase):
         """Код папки появился после её создания — потеряв его, промахнёмся в следующий раз."""
         merged = ref("Adventure").merged(ref("Эдвенчер", code="YO-77"))
         self.assertEqual(merged.code, "YO-77")
-        self.assertIn("adventure", merged.names)
-        self.assertIn("эдвенчер", merged.names)
+        # Имена хранятся КАК НАПИСАНЫ — их читает админ в подписи задачи; сравнение
+        # идёт по нормализованным `keys`.
+        self.assertIn("Adventure", merged.names)
+        self.assertIn("Эдвенчер", merged.names)
 
     def test_blank_names_are_dropped(self):
-        self.assertEqual(Ref.make(names=["", "  ", "Quartz"]).names, ("quartz",))
+        self.assertEqual(Ref.make(names=["", "  ", "Quartz"]).names, ("Quartz",))
+
+    def test_case_duplicates_collapse_but_spelling_survives(self):
+        """«Ле Паркет» и «ЛЕ ПАРКЕТ» — одно имя; в списке остаётся первое написание."""
+        made = Ref.make(names=["Ле Паркет", "ЛЕ ПАРКЕТ", "ле паркет"])
+        self.assertEqual(made.names, ("Ле Паркет",))
+        self.assertEqual(made.keys, {"ле паркет"})
 
 
 class AddressTest(unittest.TestCase):

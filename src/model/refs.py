@@ -43,21 +43,38 @@ class Ref:
     """
     code: str = ""                          # код 1С (марки, папки коллекции, товара)
     article: str = ""                       # артикул поставщика
-    names: tuple[str, ...] = ()             # нормализованные имена, все известные
+    names: tuple[str, ...] = ()             # имена КАК НАПИСАНЫ; сравнение — через `keys`
 
     @classmethod
     def make(cls, code: str | None = None, article: str | None = None,
              names=()) -> "Ref":
-        """Собрать `Ref`, нормализовав имена и отбросив пустые."""
+        """Собрать `Ref`. Имена хранятся КАК НАПИСАНЫ, сравниваются нормализованными.
+
+        Раньше здесь оседала нормализованная форма, и она же попадала админу на глаза:
+        задача подписывалась «most flooring / ле паркет» вместо «Most Flooring / Ле
+        Паркет». Нормализация нужна для СРАВНЕНИЯ, а не для показа, — и путать эти две
+        роли не стоит: читает подпись человек.
+
+        Повторы отбрасываются по нормализованной форме: «Ле Паркет» и «ЛЕ ПАРКЕТ» — одно
+        имя, и держать оба незачем.
+        """
         if isinstance(names, str):
             names = [names]
         seen: list[str] = []
+        keys: set[str] = set()
         for raw in names:
-            norm = normalize(_clean(raw))
-            if norm and norm not in seen:
-                seen.append(norm)
+            value = _clean(raw)
+            key = normalize(value)
+            if key and key not in keys:
+                keys.add(key)
+                seen.append(value)
         return cls(code=_clean(code), article=norm_article(article),
                    names=tuple(seen))
+
+    @property
+    def keys(self) -> set[str]:
+        """Имена в нормализованной форме — то, по чему идёт сравнение."""
+        return {normalize(name) for name in self.names}
 
     @property
     def empty(self) -> bool:
@@ -75,7 +92,7 @@ class Ref:
             return True
         if self.article and other.article and self.article == other.article:
             return True
-        return bool(set(self.names) & set(other.names))
+        return bool(self.keys & other.keys)
 
     def label(self) -> str:
         """Как называть предмет админу: сперва имя, иначе артикул, иначе код."""
@@ -90,7 +107,10 @@ class Ref:
         не было: код папки появился после её создания. Теряя его, мы потеряли бы совпадение
         в следующий раз.
         """
-        names = list(self.names) + [n for n in other.names if n not in self.names]
+        # Сравнение при слиянии — тоже по нормализованной форме: иначе «Ле Паркет» и
+        # «ЛЕ ПАРКЕТ» осели бы двумя именами одного предмета.
+        mine = self.keys
+        names = list(self.names) + [n for n in other.names if normalize(n) not in mine]
         return Ref(code=self.code or other.code,
                    article=self.article or other.article,
                    names=tuple(names))
@@ -119,6 +139,10 @@ class TaskAddress:
                            subject_kind=self.subject_kind)
 
     def label(self) -> str:
+        # У задачи на марку целиком предмет И ЕСТЬ марка: «Egger / Egger» — бессмыслица,
+        # которую админ прочтёт как ошибку.
+        if self.subject_kind == TaskSubject.MARK:
+            return self.tm.label()
         return f"{self.tm.label()} / {self.subject.label()}"
 
 
