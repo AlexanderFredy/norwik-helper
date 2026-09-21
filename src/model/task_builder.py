@@ -22,6 +22,7 @@ import logging
 from src.model.enums import TaskKind, TaskSubject
 from src.model.refs import Ref, TaskAddress
 from src.model.task import PriceTask
+from src.price_tool.items import build_name
 from src.price_tool.parser import parse_price_table, render_preview
 from src.price_tool.scope import normalize
 
@@ -29,6 +30,30 @@ logger = logging.getLogger(__name__)
 
 MAX_SHEET_ROWS = 200        # строк листа в один ответ инструмента
 MAX_TASKS = 200             # потолок на прогон: защита от разгона, а не рабочий предел
+
+
+def normalize_brief() -> str:
+    """Что написано в описании задачи нормализации. Текст задаёт КОД, а не модель.
+
+    **ЗАЧЕМ ОТБИРАТЬ У НЕЁ ЭТО ОПИСАНИЕ.** Агент дважды выдумывал шаблон и оба раза
+    неверно — последний раз «марка + коллекция + декор + артикул», хотя артикул в
+    наименованиях 1С не используется ВООБЩЕ (§19.5), а вид товара стоит первым. Выгрузки
+    номенклатуры у него в этот момент нет, сверять не с чем, и запрет в промпте помогает
+    ненадёжно: он описывает то, что видит в прайсе, и принимает это за стандарт 1С.
+
+    Записать в 1С выдумку он не может — `run_normalization` описание не читает вовсе, имена
+    собирает `build_name`. Но описание читает АДМИН, и неверный стандарт в нём — это
+    дезинформация человека, который по нему принимает решения.
+
+    **Пример собирается `build_name`, а не переписан руками.** Строка из неё не разойдётся
+    с тем, что код правда делает: поменяется шаблон — поменяется и описание.
+    """
+    sample = build_name("Ламинат", "Egger", "Vintage", "Дуб Медовый")
+    return ("Привести наименования марки к шаблону §19.5: "
+            f"[вид товара] [марка] [коллекция] [название] — «{sample}». "
+            "Артикул в наименованиях НЕ используется, он отдельный реквизит. "
+            "Размер дописывается только у керамики. "
+            "Сверку с шаблоном и запись выполняет код.")
 
 
 TOOLS = [
@@ -185,17 +210,27 @@ class TaskBuilderTools:
             # потому что видит их в прайсе, и помнить исключение для одного вида задач
             # ей неоткуда.
             subject, kind_of = mark, TaskSubject.MARK
+            # Стандарт формулирует КОД (см. `normalize_brief`). Текст агента остаётся
+            # НИЖЕ и подписан как наблюдение по прайсу: в прайсе он правда кое-что видит
+            # — два написания бренда, пометки NEW/АКЦИЯ в заголовках, — и терять это не
+            # надо. Но стандартом 1С это не является, и выдавать одно за другое нельзя.
+            seen = (inp.get("description") or "").strip()
+            description = normalize_brief()
+            if seen:
+                description += f"\n\nЗамечено в прайсе (наблюдение агента): {seen}"
         elif item:
             subject = Ref.make(article=inp.get("article"), names=[item])
             kind_of = TaskSubject.ITEM
+            description = (inp.get("description") or "").strip()
         else:
             subject = Ref.make(names=[collection])
             kind_of = TaskSubject.COLLECTION
+            description = (inp.get("description") or "").strip()
 
         task = PriceTask(
             kind=kind,
             address=TaskAddress(tm=mark, subject=subject, subject_kind=kind_of),
-            description=(inp.get("description") or "").strip())
+            description=description)
 
         # Уникальность пары (адрес, вид) держим здесь же: модель может прийти к той же
         # задаче дважды, и это дополнение описания, а не вторая задача (§3.3).

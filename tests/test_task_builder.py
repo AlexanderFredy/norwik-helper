@@ -118,6 +118,41 @@ class ToolsTest(unittest.IsolatedAsyncioTestCase):
                 "collection": collection, "description": f"по {collection}"})
         self.assertEqual(len(self.tools.collected), 1)
 
+    async def test_normalization_description_is_written_by_code(self):
+        """Стандарт формулирует код, а не модель.
+
+        Агент дважды выдумывал шаблон и оба раза неверно — последний раз «марка +
+        коллекция + декор + артикул», хотя артикул в наименованиях не используется вообще,
+        а вид товара стоит первым. Записать выдумку в 1С он не может (нормализацию делает
+        код и описание не читает), но описание читает АДМИН.
+        """
+        await self.tools.execute("add_task", {
+            "kind": "нормализация наименований", "tm": "Egger", "tm_code": "T1",
+            "description": "шаблон: марка + коллекция + декор + артикул"})
+        text = self.tools.collected[0].description
+        self.assertIn("§19.5", text)
+        self.assertIn("Артикул в наименованиях НЕ используется", text)
+
+    async def test_agent_observation_survives_but_is_labelled(self):
+        """В прайсе он правда кое-что видит — терять это не надо, но и выдавать за
+        стандарт 1С нельзя."""
+        await self.tools.execute("add_task", {
+            "kind": "нормализация наименований", "tm": "Egger", "tm_code": "T1",
+            "description": "в заголовках прайса пометки NEW и АКЦИЯ"})
+        text = self.tools.collected[0].description
+        self.assertIn("Замечено в прайсе", text)
+        self.assertIn("NEW", text)
+        # стандарт стоит ВЫШЕ наблюдения: его читают первым
+        self.assertLess(text.index("§19.5"), text.index("Замечено в прайсе"))
+
+    def test_sample_comes_from_build_name_and_cannot_drift(self):
+        """Пример собирается той же функцией, что и настоящие имена: поменяется шаблон —
+        поменяется и описание, вручную синхронизировать нечего."""
+        from src.price_tool.items import build_name
+        from src.model.task_builder import normalize_brief
+        self.assertIn(build_name("Ламинат", "Egger", "Vintage", "Дуб Медовый"),
+                      normalize_brief())
+
     async def test_prompt_forbids_judging_names_it_has_not_seen(self):
         """Выгрузки 1С у него нет — значит и судить о соответствии шаблону не по чему.
 
