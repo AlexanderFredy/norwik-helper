@@ -55,6 +55,15 @@ class FakeOnec:
         return [TradeMark(name="Egger", code="T1"),
                 TradeMark(name="A+ Floor", code="T9", selling=False)]
 
+    def find_items(self, articles=None, limit=50, **kw):
+        """Поиск по всей номенклатуре ничего не нашёл — это штатный ответ, а не сбой."""
+        from src.onec.client import FoundItems
+        return FoundItems(items=[], total=0)
+
+    def folders(self, product_type=None, tm=None):
+        from src.onec.client import FolderTree
+        return FolderTree(items=[], total=0)
+
 
 class ToolsTest(unittest.IsolatedAsyncioTestCase):
 
@@ -419,6 +428,36 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
                                  onec=self.onec([self.nom("R1", "3309")]))
         got = await self.compare(tools, ["3309"])
         self.assertIn("колонки_не_названы", got["цены"])
+
+    async def test_broken_search_is_not_passed_off_as_an_empty_base(self):
+        """СЛУЧАЙ С БОЯ (22.09.2026). 1С отвечала 500 на любой запрос с артикулом, код
+        ловил исключение и возвращал пустой список — и сверка бодро сообщала «коллекции в
+        1С нет». Сорвавшийся поиск ничего не доказывает, и выдавать его за ответ нельзя."""
+        class Broken(self.onec([self.nom("R1", "9999")]).__class__):
+            def find_items(self, articles=None, limit=50, **kw):
+                raise RuntimeError("Server error '500 Internal server error'")
+
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=Broken())
+        got = await self.compare(tools, ["301"], collection="Классик")
+
+        self.assertIn("НЕ ОТВЕТИЛА", got["note"])
+        self.assertIn("500", got["note"])
+        self.assertNotIn("коллекция и правда", got["note"])
+
+    async def test_error_inside_a_200_answer_counts_as_a_failure(self):
+        """Обработчик 1С отдаёт свои ошибки кодом 200 в поле `errors` — без проверки это
+        снова выглядело бы как «ничего не нашлось»."""
+        from src.onec.client import FoundItems
+
+        class Broken(self.onec([self.nom("R1", "9999")]).__class__):
+            def find_items(self, articles=None, limit=50, **kw):
+                return FoundItems(items=[], total=0,
+                                  errors=[{"code": "handler_failed",
+                                           "message": "Метод объекта не обнаружен"}])
+
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=Broken())
+        got = await self.compare(tools, ["301"], collection="Классик")
+        self.assertIn("Метод объекта не обнаружен", got["note"])
 
     async def test_collection_under_another_mark_is_found(self):
         """СЛУЧАЙ С БОЯ (22.09.2026). «Классик» лежит под маркой A+ Floor, а модель сверяла

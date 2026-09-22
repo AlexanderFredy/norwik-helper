@@ -234,6 +234,10 @@ class TaskBuilderTools:
         self._owners: dict | None = None
         self._seen_trees: set = set()   # марки, чьё дерево папок уже спрашивали
         self._collection_name = ""      # коллекция текущей сверки — для поиска владельца
+        # Последняя ошибка поиска по всей номенклатуре. Молчать о ней нельзя: сорвавшийся
+        # поиск ВЫГЛЯДИТ как «ничего не нашлось», и вывод «коллекция новая» становится
+        # ложью — 22.09.2026 именно так и вышло, когда 1С отдавала 500 на любой артикул.
+        self.search_error = ""
         self.collected: list[PriceTask] = []
         self.marks: list[dict] = []
         self._sheets = None
@@ -466,7 +470,12 @@ class TaskBuilderTools:
             # обложки прайса, а работа лежит под другой.
             out["марка_в_1С"] = {"tm_code": tm_code, "почему": moved}
 
-        if not found:
+        if not found and self.search_error:
+            out["note"] = (f"1С НЕ ОТВЕТИЛА на поиск по всей номенклатуре "
+                           f"({self.search_error}). Вывод «коллекции нет» НЕ подтверждён: "
+                           f"позиции могут лежать под другой маркой. Задачу на заведение "
+                           f"всего заново НЕ заводи, скажи об этом в ответе")
+        elif not found:
             out["note"] = ("ни один артикул не нашёлся у этой марки — коллекция и правда "
                            "новая ЛИБО артикулы в прайсе записаны иначе; проверь колонку "
                            "артикула, прежде чем заводить всё заново")
@@ -538,8 +547,17 @@ class TaskBuilderTools:
             return []
         try:
             found = self._onec.find_items(articles=shown[:100], limit=200)
-        except Exception:                               # noqa: BLE001
+        except Exception as exc:                        # noqa: BLE001
             logger.warning("Поиск по всей номенклатуре не удался", exc_info=True)
+            self.search_error = f"{type(exc).__name__}: {exc}"[:200]
+            return []
+
+        # ОШИБКА В ОТВЕТЕ — ТОЖЕ ОШИБКА. Обработчик 1С возвращает её кодом 200 в поле
+        # `errors`, и без этой проверки сбой выглядел бы как «ничего не нашлось».
+        if getattr(found, "errors", None):
+            first = found.errors[0]
+            self.search_error = str(first.get("message") or first)[:200]
+            logger.warning("1С ответила ошибкой на поиск: %s", self.search_error)
             return []
         return [i for i in found.items if norm_article(i.article) in keys]
 
