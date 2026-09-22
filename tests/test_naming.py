@@ -336,6 +336,34 @@ class DropOwnArticleTest(unittest.TestCase):
         self.assertEqual(drop_own_article(name, ""), name)
 
 
+class BracketsTest(unittest.TestCase):
+    """Приписки в скобках остаются (решение админа 22.09.2026), но набраны они кое-как:
+    «Cappuccino ( английская ёлочка)». Пробелы внутри скобок смысла не несут."""
+
+    def test_space_after_the_opening_bracket_goes(self):
+        self.assertEqual(tidy("Ламинат Westerhof Bellini Cappuccino ( английская ёлочка)"),
+                         "Ламинат Westerhof Bellini Cappuccino (английская ёлочка)")
+
+    def test_space_before_the_closing_bracket_goes(self):
+        self.assertEqual(tidy("Плитка Roma ( 60x60 )"), "Плитка Roma (60x60)")
+
+    def test_glued_bracket_gets_its_space(self):
+        """«Дуб(эффект)» читается хуже, чем «Дуб (эффект)», а смысл тот же."""
+        self.assertEqual(tidy("Дуб Медовый(эффект дерева)"), "Дуб Медовый (эффект дерева)")
+
+    def test_content_is_not_touched(self):
+        """Причёсываем набор, а не текст: внутри скобок всё остаётся как написано."""
+        self.assertEqual(tidy("Дуб (2 шт. в упаковке, 1,5 м²)"),
+                         "Дуб (2 шт. в упаковке, 1,5 м²)")
+
+    def test_nested_brackets_survive(self):
+        self.assertEqual(tidy("Дуб ((двойные))"), "Дуб ((двойные))")
+
+    def test_name_without_brackets_is_untouched(self):
+        self.assertEqual(tidy("Ламинат Egger Vintage Дуб Медовый"),
+                         "Ламинат Egger Vintage Дуб Медовый")
+
+
 class TradeMarkInNameTest(unittest.TestCase):
     """СЛУЧАЙ С БОЯ (22.09.2026). Нормализация Westerhof дала «Ламинат Westerhof /
     Вестерхоф Bellini Cappuccino»: имя марки в справочнике 1С двуязычное, и в наименование
