@@ -59,6 +59,7 @@ class Diff:
     changed: list[str]        # строки для описания задачи, по одной на позицию
     same: int                 # сколько позиций уже стоят как в прайсе
     no_price_in_file: int     # артикул есть в 1С, но в его строке прайса цены не нашлось
+    no_price_in_1c: int = 0   # из них: и в 1С цены тоже нет вовсе
 
     @property
     def anything(self) -> bool:
@@ -140,8 +141,15 @@ def prices_from_rows(rows, cols: Columns) -> dict[str, dict[str, Decimal]]:
     for row in rows:
         if len(row) <= cols.article:
             continue
-        key = norm_article(row[cols.article])
-        if not key or key in out:
+        cell = str(row[cols.article] or "")
+        # Артикул часто слит с названием в одной ячейке: «301 Аристо». Кладём и полный
+        # ключ, и первое слово — лишний ключ безвреден, недостающий срывает сверку.
+        keys = [norm_article(cell)]
+        head = cell.split()[0] if cell.split() else ""
+        if head and norm_article(head) != keys[0]:
+            keys.append(norm_article(head))
+        keys = [k for k in keys if k and k not in out]
+        if not keys:
             continue
         found = {}
         for kind in KINDS:
@@ -151,8 +159,31 @@ def prices_from_rows(rows, cols: Columns) -> dict[str, dict[str, Decimal]]:
                 if value is not None:
                     found[kind] = value
         if found:
-            out[key] = found
+            for key in keys:
+                out[key] = found
     return out
+
+
+def flat_prices(items, purchase=None, rrc=None) -> dict[str, dict[str, Decimal]]:
+    """Одна цена на ВСЮ коллекцию — как её пишут в прайсе Most Floor.
+
+    Там строка коллекции несёт цены («301 Аристо … 1880 … 2980»), а у остальных декоров
+    ячейки пустые: цена общая. Колоночный разбор такую раскладку не берёт в принципе —
+    он идёт по строкам, а строк с ценами всего одна. Поэтому пару чисел называет модель,
+    она их и так видит, а раскладывает по позициям код.
+    """
+    wanted = {}
+    if purchase is not None:
+        value = to_decimal(purchase)
+        if value is not None:
+            wanted["purchase"] = value
+    if rrc is not None:
+        value = to_decimal(rrc)
+        if value is not None:
+            wanted["rrc"] = value
+    if not wanted:
+        return {}
+    return {norm_article(i.article): dict(wanted) for i in items if i.article}
 
 
 def compare(items, from_price: dict[str, dict[str, Decimal]]) -> Diff:
@@ -164,12 +195,17 @@ def compare(items, from_price: dict[str, dict[str, Decimal]]) -> Diff:
     changed: list[str] = []
     same = 0
     no_price = 0
+    nameless = 0
 
     for item in items:
         key = norm_article(item.article)
         wanted = from_price.get(key) if key else None
         if not wanted:
             no_price += 1
+            # Цены нет НИ ТАМ, НИ ТАМ. Это не «сравнить нечем», а работа: позиция стоит
+            # в 1С без цены, и знать об этом надо, даже когда прайс её строку не отдал.
+            if not (item.purchase and item.purchase.value):
+                nameless += 1
             continue
 
         parts = []
@@ -188,7 +224,8 @@ def compare(items, from_price: dict[str, dict[str, Decimal]]) -> Diff:
         else:
             same += 1
 
-    return Diff(changed=changed, same=same, no_price_in_file=no_price)
+    return Diff(changed=changed, same=same, no_price_in_file=no_price,
+                no_price_in_1c=nameless)
 
 
 def _num(value: Decimal) -> str:
@@ -205,7 +242,22 @@ def report(diff: Diff) -> dict:
         out["расходятся_всего"] = len(diff.changed)
     if diff.no_price_in_file:
         out["без_цены_в_прайсе"] = diff.no_price_in_file
-    if not diff.anything:
+    if diff.no_price_in_1c:
+        out["без_цены_в_1С"] = diff.no_price_in_1c
+
+    # ВЫВОД РАЗЛИЧАЕТ ТРИ ИСХОДА, а не два. «Не с чем сравнивать» — не «совпадает»:
+    # на «Классик» (A+ Floor) колонки прайса не сошлись ни с одной позицией, сравнений
+    # вышло ноль, и ответ «цены совпадают, задачу НЕ заводи» был прямой ложью — при том
+    # что цен в 1С не было вовсе.
+    if diff.no_price_in_1c:
+        out["вывод"] = ("у %d позиций в 1С цены НЕТ ВОВСЕ — задачу на изменение цен "
+                        "заводи" % diff.no_price_in_1c)
+    elif diff.anything:
+        pass                        # расхождения перечислены, вывод очевиден
+    elif diff.same:
         out["вывод"] = ("цены совпадают с прайсом в пределах %s%% — задачу на изменение "
                         "цен НЕ заводи" % SAME_PRICE_PCT)
+    else:
+        out["вывод"] = ("сравнить не удалось: ни одна позиция 1С не сошлась со строками "
+                        "прайса — проверь price_columns, особенно колонку артикула")
     return out
