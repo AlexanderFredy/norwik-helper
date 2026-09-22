@@ -96,6 +96,22 @@ class WriteGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(onec.price_writes, "цены обязаны уйти в 1С: %s" % out)
         self.assertEqual(tools.written_prices, 1)
 
+    async def test_rrc_reaches_1c_together_with_the_purchase(self):
+        """СЛУЧАЙ С БОЯ (22.09.2026). По «Классик» агент записал закупку и доложил: «РРЦ
+        2980 отдельным полем не записывалась — инструмент цен принимает только
+        закупочную». Планировщик РРЦ умел всегда, не хватало входа, и круг не закрывался:
+        следующая сверка снова показала бы расхождение, а чинить его было нечем."""
+        onec = FakeOnec()
+        tools = TaskTools(onec, b"", "p.xlsx", allow, kind=TaskKind.CHANGE_PRICES)
+        await tools.execute("write_prices", {
+            "tm_code": "TM1", "collection": "Vintage",
+            "purchase": 1500, "rrc": 2400})
+
+        sent = onec.price_writes[0]
+        prices = sent[0]["prices"] if isinstance(sent, list) else sent["prices"]
+        self.assertEqual(prices.get("purchase"), 1500)
+        self.assertEqual(prices.get("rrc"), 2400)
+
     async def test_prices_are_not_written_when_refused(self):
         onec = FakeOnec()
         tools = TaskTools(onec, b"", "p.xlsx", deny, kind=TaskKind.CHANGE_PRICES)
