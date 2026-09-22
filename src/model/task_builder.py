@@ -230,6 +230,10 @@ class TaskBuilderTools:
         # Коллекция (нормализованно) → позиции, которые в 1С УЖЕ ЕСТЬ, но вне живой папки:
         # чаще всего снятые. Заводить их заново нельзя — это дубль.
         self._revivals: dict[str, list] = {}
+        # Имя коллекции → марки-владельцы по дереву папок 1С. Считается один раз.
+        self._owners: dict | None = None
+        self._seen_trees: set = set()   # марки, чьё дерево папок уже спрашивали
+        self._collection_name = ""      # коллекция текущей сверки — для поиска владельца
         self.collected: list[PriceTask] = []
         self.marks: list[dict] = []
         self._sheets = None
@@ -358,9 +362,6 @@ class TaskBuilderTools:
         if not tm_code or not collection:
             return "Нужны tm_code и collection."
 
-        items = self._nomenclature(tm_code)
-        live = [i for i in items if not i.not_exported]
-
         from_price = []
         seen = set()
         for raw in (inp.get("articles") or []):
@@ -368,6 +369,14 @@ class TaskBuilderTools:
             if key and key not in seen:
                 seen.add(key)
                 from_price.append((key, str(raw).strip()))
+
+        # МАРКУ ОПРЕДЕЛЯЕТ 1С, А НЕ ДОГАДКА МОДЕЛИ.
+        self._collection_name = collection
+        tm_code, moved = self._actual_mark(tm_code, seen,
+                                           [shown for _k, shown in from_price])
+
+        items = self._nomenclature(tm_code)
+        live = [i for i in items if not i.not_exported]
 
         # СОПОСТАВЛЕНИЕ ПО АРТИКУЛУ, А НЕ ПО ИМЕНИ КОЛЛЕКЦИИ.
         #
@@ -452,6 +461,11 @@ class TaskBuilderTools:
             # Пропали из этого прайса, но возит другой поставщик: снимать НЕ надо.
             out["есть_у_другого_поставщика"] = kept[:40]
 
+        if moved:
+            # Марку в адресе задачи надо ставить ЭТУ: иначе задача уедет на марку с
+            # обложки прайса, а работа лежит под другой.
+            out["марка_в_1С"] = {"tm_code": tm_code, "почему": moved}
+
         if not found:
             out["note"] = ("ни один артикул не нашёлся у этой марки — коллекция и правда "
                            "новая ЛИБО артикулы в прайсе записаны иначе; проверь колонку "
@@ -479,6 +493,103 @@ class TaskBuilderTools:
                     filled.add(prop.property)
         return sorted(known - filled)
 
+    def _owner_of(self, collection: str, tm_code: str) -> str:
+        """Код марки, которой принадлежит папка коллекции. Пусто — не определилось.
+
+        **Дерево запрашивается С ФИЛЬТРОМ ПО МАРКЕ.** Без фильтра обработчик отдаёт только
+        верхушку — корни, виды товара и папки снятых, — а папок коллекций в ответе нет
+        вовсе (проверено на бою 22.09.2026: 45 узлов, ни одной коллекции). Именно поэтому
+        сверка марок после хода ничего не находила: карта владельцев строилась по дереву,
+        в котором коллекций нет.
+
+        Дерево каждой марки берётся один раз за прогон: за составление задач оно не
+        меняется, а весит прилично.
+        """
+        if self._onec is None or not (collection or "").strip() or not tm_code:
+            return ""
+        if self._owners is None:
+            self._owners = {}
+        if tm_code not in self._seen_trees:
+            self._seen_trees.add(tm_code)
+            try:
+                tree = self._onec.folders(tm=tm_code)
+                marks = self.marks or [
+                    {"name": m.name, "code": m.code, "selling": m.selling}
+                    for m in self._onec.selling_tm(all_marks=True)]
+                for key, owners in owner_map(tree.items, marks).items():
+                    self._owners.setdefault(key, set()).update(owners)
+            except Exception:                           # noqa: BLE001
+                logger.warning("Дерево папок марки %s не получено", tm_code,
+                               exc_info=True)
+        # Однозначного владельца нет («Классик» бывает у двух марок) — выбирать наугад
+        # хуже, чем не выбирать.
+        owners = self._owners.get(normalize(collection)) or set()
+        return next(iter(owners))[0] if len(owners) == 1 else ""
+
+    def _search_1c(self, shown: list[str], keys: set) -> list:
+        """Поиск по всей номенклатуре — ТОЛЬКО точные совпадения артикула.
+
+        **`find-items` ищет ВХОЖДЕНИЕМ** (§19.11), и это не недосмотр: он написан, чтобы
+        находить товар по куску названия. Но артикулы у ламината короткие, и на запрос
+        «301» 1С честно вернула обои «101489301» и «26909302». Без этого фильтра в
+        описание задачи уезжали чужие коды 1С — по ним её бы и выполнили.
+        """
+        if self._onec is None or not shown:
+            return []
+        try:
+            found = self._onec.find_items(articles=shown[:100], limit=200)
+        except Exception:                               # noqa: BLE001
+            logger.warning("Поиск по всей номенклатуре не удался", exc_info=True)
+            return []
+        return [i for i in found.items if norm_article(i.article) in keys]
+
+    def _actual_mark(self, tm_code: str, keys: set, shown: list[str]) -> tuple[str, str]:
+        """Под какой маркой эти артикулы ЛЕЖАТ В 1С на самом деле.
+
+        **СЛУЧАЙ С БОЯ (22.09.2026).** Прайс Most Flooring, коллекция «Классик»: восемь
+        позиций без единой цены в 1С — работа очевидная, а задача не заводилась. Причина
+        не в ценах: коллекция лежит под маркой A+ Floor, модель же сверяла её с Most
+        Flooring, как написано на обложке прайса. Под той маркой артикулов нет вовсе,
+        сверка отвечала «коллекция новая», сверять цены становилось не с чем — и задачи
+        не возникало ни ценовой, ни какой-либо ещё.
+
+        Догадка модели тут вообще не должна решать: принадлежность знает 1С. Спрашиваем
+        её ТОЛЬКО когда по названной марке не совпал ни один артикул — то есть в том самом
+        случае, который раньше молча объявлялся новой коллекцией. Один запрос из кода,
+        ноль токенов.
+
+        Марку подменяем, лишь когда все найденные живые позиции лежат под ОДНОЙ чужой:
+        разнобой — повод показать, а не выбирать за админа.
+        """
+        if not keys:
+            return tm_code, ""
+        mine = {norm_article(i.article) for i in self._nomenclature(tm_code)
+                if i.article and not i.not_exported}
+        if mine & keys:
+            return tm_code, ""          # хоть один совпал — марка та самая
+
+        # СНАЧАЛА ДЕРЕВО ПАПОК — оно отвечает ТОЧНО. Поиск по артикулам идёт вхождением
+        # (иначе он не нашёл бы товар по куску названия), и на коротких артикулах ламината
+        # «301» выдаёт две сотни обоев «101489301», упираясь в предел ответа раньше, чем
+        # доходит до нужного. По имени папки такой беды нет.
+        owner = self._owner_of(self._collection_name, tm_code)
+        if owner and owner != tm_code:
+            return owner, (f"коллекция лежит в 1С под маркой «{self._tm_name(owner)}» "
+                           f"({owner}), а не под названной — сверка и задача адресованы ей")
+
+        live = [i for i in self._search_1c(shown, keys)
+                if not i.not_exported and i.tm_code]
+        others = {i.tm_code for i in live}
+        if len(others) != 1:
+            return tm_code, ""
+        other = others.pop()
+        if other == tm_code:
+            return tm_code, ""
+        name = next((i.tm for i in live if i.tm_code == other), "") or other
+        logger.info("Коллекция сверена не с той маркой: %s → %s", tm_code, other)
+        return other, (f"артикулы этой коллекции лежат в 1С под маркой «{name}» "
+                       f"({other}), а не под названной — сверка и задача адресованы ей")
+
     def _revival_note(self, missing: list[str], collection: str) -> list[str]:
         """Проверить, не лежат ли «недостающие» артикулы в 1С где-то ещё (§19.11).
 
@@ -493,14 +604,10 @@ class TaskBuilderTools:
         if self._onec is None or not missing:
             return []
         articles = [m.split()[0] for m in missing if m.split()]
-        try:
-            found = self._onec.find_items(articles=articles[:100], limit=200)
-        except Exception:                               # noqa: BLE001
-            logger.warning("Поиск по всей номенклатуре не удался", exc_info=True)
-            return []
+        keys = {norm_article(a) for a in articles}
 
         out, refs = [], []
-        for item in found.items:
+        for item in self._search_1c(articles, keys):
             where = item.parent_name or item.tm or "вне марки"
             out.append(f"{item.article} «{item.name}» → код {item.ref}, лежит в «{where}»")
             refs.append(item)
@@ -520,12 +627,22 @@ class TaskBuilderTools:
         sheet_name = str(spec.pop("sheet", "") or "").strip() or self._last_sheet
         if spec:
             self._price_cols[sheet_name] = spec
-        spec = self._price_cols.get(sheet_name)
-        if not spec:
-            return ("колонки цен не названы — передай price_columns, иначе сверить цены "
-                    "не с чем и задачу на их изменение заводить не по чему")
         if not found:
             return "в 1С не нашлось ни одной позиции этой коллекции — сверять нечего"
+
+        # ПУСТАЯ ЦЕНА В 1С ВИДНА И БЕЗ ПРАЙСА. У коллекции «Классик» (A+ Floor) не было
+        # ни закупки, ни РРЦ ни у одной из восьми позиций — работа очевидная, а ответ
+        # «колонки цен не названы» звучал как «сверить нечем», и задача не заводилась.
+        # Чтобы это увидеть, прайс не нужен вовсе: достаточно посмотреть в 1С.
+        nameless = sum(1 for i in found if not (i.purchase and i.purchase.value))
+
+        spec = self._price_cols.get(sheet_name)
+        if not spec:
+            out = {"колонки_не_названы": "назови price_columns и позови сверку снова"}
+            if nameless:
+                out["без_цены_в_1С"] = nameless
+                out["вывод"] = "цены нет вовсе — задачу заводи, прайс для этого не нужен"
+            return out
 
         sheet = next((s for s in self.sheets if s.name == sheet_name), None) \
             or (self.sheets[0] if self.sheets else None)
@@ -736,6 +853,13 @@ PROMPT = """Ты — контент-менеджер интернет-магаз
   придёт `цены`. Пусто в `расходятся` — задачи НЕТ: цены в 1С уже такие, прогон по ней
   кончился бы словами «менять нечего». Есть расхождения — перечисли их в описании
   артикулами и числами, они уже посчитаны за тебя.
+  Увидел `колонки_не_названы` — назови колонки и позови сверку ещё раз: «нечем сравнить»
+  это не «совпадает». А если рядом стоит `без_цены_в_1С` — задачу заводи сразу, цены там
+  нет вовсе, и прайс для этого вывода не нужен.
+
+МАРКУ В АДРЕСЕ БЕРИ ИЗ СВЕРКИ. Пришло `марка_в_1С` — ставь в `add_task` ИМЕННО её `tm_code`:
+коллекция лежит в 1С под другой маркой, чем написано на обложке прайса, и это нормально
+(у Most Flooring часть коллекций заведена под A+ Floor).
 
 ОДИН ПРАЙС — НЕ ОДНА МАРКА. Поставщик присылает файл со своим именем на обложке, но
 коллекции внутри могут принадлежать РАЗНЫМ маркам 1С: у Most Flooring часть коллекций
@@ -829,7 +953,7 @@ def owner_map(folders, marks) -> dict[str, set]:
     наугад.
     """
     by_ref = {f.ref: f for f in folders}
-    by_name = {normalize(m["name"]): m for m in marks if m.get("name")}
+    known = [(normalize(m["name"]), m) for m in marks if m.get("name")]
 
     owners: dict[str, set] = {}
     for folder in folders:
@@ -844,14 +968,51 @@ def owner_map(folders, marks) -> dict[str, set]:
         if node is None or node.kind != "tm":
             continue
 
-        mark = by_name.get(normalize(node.name))
+        mark = _mark_of_folder(normalize(node.name), known)
         if mark is None:
             continue
 
-        owners.setdefault(normalize(folder.name), set()).add(
-            (mark["code"], mark["name"]))
+        for key in _collection_keys(folder.name):
+            owners.setdefault(key, set()).add((mark["code"], mark["name"]))
 
     return owners
+
+
+# Хвост имени папки вида «600x238x12»: цифры через x, ×, х (латинская и кириллическая).
+_SIZE_TAIL = re.compile(r"\s+\d+(?:[x×х]\d+)+$", re.IGNORECASE)
+
+
+def _collection_keys(name: str) -> set[str]:
+    """Под какими именами искать эту папку. Их два, и оба нужны.
+
+    У восьми напольных категорий размер пишется в имя ПАПКИ (§19.5): «Классик 600x238x12».
+    Коллекция же зовётся «Классик» — и в прайсе, и в свойстве «Коллекция», и в адресе
+    задачи. По полному имени папки такая коллекция не находилась никогда, из-за чего
+    сверка марок (`fix_marks`) молча не срабатывала на всей марке A+ Floor.
+
+    Хвост снимается только СТРОГО ПОХОЖИЙ на размер: цифры, разделённые «x». «Формат 3D»
+    под это не попадает — там нет второго числа.
+    """
+    full = normalize(name)
+    return {full, normalize(_SIZE_TAIL.sub("", " ".join(str(name or "").split())))} - {""}
+
+
+def _mark_of_folder(folder_name: str, known: list) -> dict | None:
+    """Марка по имени её папки. Точное совпадение либо ОКОНЧАНИЕ.
+
+    Папка марки называется «Ламинат A+ Floor» — с видом товара впереди, — а марка в
+    справочнике зовётся «A+ Floor». Точное сравнение имён не совпадало ни разу, и карта
+    владельцев выходила пустой. Из нескольких подходящих берём самую длинную: «Floor» не
+    должен выигрывать у «A+ Floor».
+    """
+    best = None
+    for name, mark in known:
+        if not name:
+            continue
+        if folder_name == name or folder_name.endswith(" " + name):
+            if best is None or len(name) > len(best[0]):
+                best = (name, mark)
+    return best[1] if best else None
 
 
 def fix_marks(tasks: list[PriceTask], owners: dict[str, set]) -> list[str]:

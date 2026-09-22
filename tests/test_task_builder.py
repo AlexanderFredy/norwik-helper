@@ -418,8 +418,47 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx",
                                  onec=self.onec([self.nom("R1", "3309")]))
         got = await self.compare(tools, ["3309"])
-        self.assertIsInstance(got["цены"], str)
-        self.assertIn("price_columns", got["цены"])
+        self.assertIn("колонки_не_названы", got["цены"])
+
+    async def test_collection_under_another_mark_is_found(self):
+        """СЛУЧАЙ С БОЯ (22.09.2026). «Классик» лежит под маркой A+ Floor, а модель сверяла
+        её с Most Flooring — как написано на обложке прайса. Под той маркой артикулов нет,
+        сверка отвечала «коллекция новая», сверять цены становилось не с чем, и задача не
+        заводилась ВООБЩЕ. Принадлежность знает 1С, а не догадка модели."""
+        from src.onec.client import FoundItem, FoundItems, Price
+
+        mine = self.onec([self.nom("R1", "3309", collection="Millenium Pro")])
+
+        class Fake(mine.__class__):
+            def by_tm_all(self, tm_code, **kw):
+                if tm_code == "T9":     # марка, под которой лежит «Классик»
+                    return type(mine.by_tm_all("T1"))([
+                        CompareTest.nom(self, "R9", "301", collection="Классик",
+                                        purchase=None, rrc=None)])
+                return mine.by_tm_all(tm_code, **kw)
+
+            def find_items(self, articles=None, limit=50, **kw):
+                return FoundItems(items=[FoundItem(
+                    ref="YO-9", name="Ламинат A+ Floor Классик Аристо", article="301",
+                    tm="A+ Floor", tm_code="T9", parent_name="Классик 600x238x12")],
+                    total=1)
+
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=Fake())
+        got = await self.compare(tools, ["301"], collection="Классик")
+
+        self.assertEqual(got["марка_в_1С"]["tm_code"], "T9")
+        self.assertEqual(got["нашлось_в_1С"], 1)
+        self.assertEqual(got["цены"]["без_цены_в_1С"], 1)
+
+    async def test_missing_price_in_1c_is_seen_without_the_file(self):
+        """СЛУЧАЙ С БОЯ (22.09.2026): у «Классик» (A+ Floor) не было ни закупки, ни РРЦ ни
+        у одной из восьми позиций. Ответ «колонки цен не названы» звучал как «сверить
+        нечем», и задача не заводилась — хотя для такого вывода прайс не нужен вовсе."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx",
+                                 onec=self.onec([self.nom("R1", "3309")]))
+        got = await self.compare(tools, ["3309"])
+        self.assertEqual(got["цены"]["без_цены_в_1С"], 1)
+        self.assertIn("задачу заводи", got["цены"]["вывод"])
 
     async def test_articles_lying_in_discontinued_are_a_revival(self):
         """Коллекцию однажды унесли в снятые, а поставщик привёз её снова. Выгрузка марки
