@@ -139,6 +139,23 @@ def tidy(text: str | None) -> str:
 _WORD_ONLY = re.compile(r"^[A-Za-zА-ЯЁа-яё]{2,}$")
 
 
+def tm_for_name(value: str | None) -> str:
+    """Марка ДЛЯ НАИМЕНОВАНИЯ: из двуязычного «Westerhof / Вестерхоф» берётся первая часть.
+
+    В справочнике 1С марка часто записана на двух языках через косую черту — это одно
+    поле, и читать его целиком правильно везде, кроме наименования товара. В имени же
+    выходило «Ламинат Westerhof / Вестерхоф Bellini Cappuccino»: обе формы подряд, да ещё
+    с разделителем посередине (бой 22.09.2026, решение админа — брать часть до «/»).
+
+    Пустая левая часть («/ Вестерхоф») — берём правую: пустая марка в имени хуже любой.
+    """
+    text = " ".join(str(value or "").split())
+    if "/" not in text:
+        return text
+    left, _, right = text.partition("/")
+    return left.strip() or right.strip()
+
+
 def collection_case(value: str | None) -> str:
     """Название коллекции в каноническом регистре: `QUARTZ` → `Quartz`."""
     parts = xml_safe(value).split(" ")

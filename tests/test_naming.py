@@ -336,5 +336,32 @@ class DropOwnArticleTest(unittest.TestCase):
         self.assertEqual(drop_own_article(name, ""), name)
 
 
+class TradeMarkInNameTest(unittest.TestCase):
+    """СЛУЧАЙ С БОЯ (22.09.2026). Нормализация Westerhof дала «Ламинат Westerhof /
+    Вестерхоф Bellini Cappuccino»: имя марки в справочнике 1С двуязычное, и в наименование
+    уехали обе формы вместе с косой чертой. В имени нужна первая часть."""
+
+    def test_bilingual_mark_is_cut_at_the_slash(self):
+        from src.price_tool.naming import tm_for_name
+        self.assertEqual(tm_for_name("Westerhof / Вестерхоф"), "Westerhof")
+        self.assertEqual(tm_for_name("Clix Floor /  Кликс Флор"), "Clix Floor")
+
+    def test_plain_mark_survives(self):
+        from src.price_tool.naming import tm_for_name
+        self.assertEqual(tm_for_name("A+ Floor"), "A+ Floor")
+        self.assertEqual(tm_for_name("Most Flooring "), "Most Flooring")
+
+    def test_empty_left_part_falls_back_to_the_right(self):
+        """Пустая марка в наименовании хуже любой."""
+        from src.price_tool.naming import tm_for_name
+        self.assertEqual(tm_for_name("/ Вестерхоф"), "Вестерхоф")
+
+    def test_name_is_built_with_the_short_form(self):
+        from src.price_tool.items import build_name
+        self.assertEqual(
+            build_name("Ламинат", "Westerhof / Вестерхоф", "Bellini", "Cappuccino"),
+            "Ламинат Westerhof Bellini Cappuccino")
+
+
 if __name__ == "__main__":
     unittest.main()
