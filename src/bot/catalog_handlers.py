@@ -13,6 +13,7 @@ from aiogram import Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
+from src.model.events import Event, EventKind
 from src.price_tool import catalog_view as view
 from src.storage.suppliers import SupplierStore
 
@@ -67,7 +68,8 @@ async def cmd_supplier_add(message: Message, command: CommandObject,
 
 @router.message(Command("supplier_rename"))
 async def cmd_supplier_rename(message: Message, command: CommandObject,
-                              supplier_store: SupplierStore, is_admin: bool) -> None:
+                              supplier_store: SupplierStore, is_admin: bool,
+                              model=None) -> None:
     if not is_admin:
         return await _deny(message)
     parts = (command.args or "").strip().split(maxsplit=1)
@@ -84,6 +86,7 @@ async def cmd_supplier_rename(message: Message, command: CommandObject,
 
     await supplier_store.rename_supplier(target.id, parts[1])
     await message.answer(f"«{target.name}» переименован в «{parts[1].strip()}».")
+    await _mirrors_know(model)
 
 
 @router.message(Command("supplier_delete"))
@@ -111,7 +114,8 @@ async def cmd_supplier_delete(message: Message, command: CommandObject,
 
 @router.message(Command("supplier_merge"))
 async def cmd_supplier_merge(message: Message, command: CommandObject,
-                             supplier_store: SupplierStore, is_admin: bool) -> None:
+                             supplier_store: SupplierStore, is_admin: bool,
+                             model=None) -> None:
     if not is_admin:
         return await _deny(message)
     parts = (command.args or "").split()
@@ -132,9 +136,29 @@ async def cmd_supplier_merge(message: Message, command: CommandObject,
         await message.answer(f"Не получилось: {exc}")
         return
     await message.answer(view.render_merge(result, source.name, target.name))
+    await _mirrors_know(model)
 
 
 # -------------------------------------------------------------------- сигнатуры
+
+async def _mirrors_know(model) -> None:
+    """Сказать зеркалам, что имена поставщиков поменялись.
+
+    Форма 1С показывает имя поставщика в таблице прайсов, но снимок уходит туда, ТОЛЬКО
+    когда состояние модели менялось, — а переименование живёт в справочнике и модели
+    невидимо. Без этого админ переименовал поставщика, нажал в форме «Обновить» и увидел
+    прежнее имя (бой 22.09.2026).
+
+    Текст пуст намеренно: Telegram такие события пропускает, и админ не получает второго
+    сообщения о том, что сам только что сделал командой.
+    """
+    if model is None:
+        return
+    try:
+        await model.events.publish(Event(EventKind.SUPPLIER_RENAMED, text=""))
+    except Exception:                                   # noqa: BLE001
+        logger.warning("Зеркала не узнали о правке справочника", exc_info=True)
+
 
 async def _signature_rows(store: SupplierStore, supplier_id: int | None = None):
     """Пары (сквозной номер, сигнатура). Фильтр прячет строки, но не меняет номера."""

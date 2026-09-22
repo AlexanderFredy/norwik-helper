@@ -198,6 +198,9 @@ class OnecProvider(Listener):
 
     async def snapshot(self) -> list[dict]:
         """Полный снимок состояния модели в виде, который принимает `set-model-state`."""
+        # Имена поставщиков перечитываются КАЖДЫЙ снимок: переименование происходит вне
+        # модели, и кеш на весь процесс держал бы в форме имя, которого уже нет.
+        self._names = {}
         out = []
         for price in self._service.prices:
             lock = self._service.lock_of(price.id)
@@ -237,6 +240,14 @@ class OnecProvider(Listener):
         }
 
     async def _supplier_name(self, supplier_id: int) -> str:
+        """Имя поставщика для колонки «Поставщик».
+
+        **Кеш живёт ОДИН СНИМОК, а не весь процесс.** Админ переименовал поставщика
+        командой в Telegram, форма обновилась — и показала старое имя: провайдер помнил
+        его с первого оборота и в справочник больше не заглядывал (бой 22.09.2026).
+        Снимки редки, поставщиков десятки, запрос идёт в локальный SQLite — экономить тут
+        было не на чем.
+        """
         if supplier_id in self._names:
             return self._names[supplier_id]
         name = ""

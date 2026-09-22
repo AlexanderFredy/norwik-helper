@@ -40,6 +40,11 @@ class TelegramListener(Listener):
         self._chats = list(chat_ids)
 
     async def notify(self, event: Event) -> None:
+        # ПУСТОЙ ТЕКСТ — СОБЫТИЕ НЕ ДЛЯ ЧЕЛОВЕКА, а для зеркал: так переименование
+        # поставщика будит снимок в 1С, не присылая админу второе сообщение о том, что
+        # он и так только что сделал командой.
+        if not (event.text or "").strip():
+            return
         for chat in self._chats:
             await self._bot.send_message(chat, event.text)
 

@@ -213,6 +213,32 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         # снимок обязан сериализоваться: Неопределено в нём ломало бы запись в 1С
         json.dumps(snapshot, ensure_ascii=False)
 
+    async def test_renamed_supplier_reaches_the_form(self):
+        """СЛУЧАЙ С БОЯ (22.09.2026). Админ переименовал поставщика командой в Telegram,
+        нажал в форме «Обновить» — и увидел прежнее имя: провайдер запомнил его с первого
+        оборота и в справочник больше не заглядывал."""
+        from src.model.price import Price, SupplierPrice
+
+        class Suppliers:
+            def __init__(self):
+                self.name = "Монарх"
+
+            async def get_supplier(self, supplier_id):
+                return type("S", (), {"name": self.name})()
+
+        suppliers = Suppliers()
+        price = Price(supplier_price=SupplierPrice(supplier_id=1, file_id=1,
+                                                   file_path="p.xlsx",
+                                                   filename="Прайс.xlsx"), id=1)
+        provider = OnecProvider(FakeOnec(), FakeService([price]), suppliers)
+
+        first = await provider.snapshot()
+        self.assertEqual(first[0]["supplier"], "Монарх")
+
+        suppliers.name = "Монарх Логистик"
+        second = await provider.snapshot()
+        self.assertEqual(second[0]["supplier"], "Монарх Логистик")
+
     # ------------------------------------------------------------- судьба команд
 
     async def test_finished_command_is_reported_done(self):
