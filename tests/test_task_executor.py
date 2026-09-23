@@ -155,6 +155,34 @@ class CheapestPriceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["prices"]["purchase"], 1880)
         self.assertIn("collection_ref", sent)      # групповая форма записи сохранилась
 
+    async def test_source_of_the_price_goes_to_1c(self):
+        """В 1С уезжает, ЧЕЙ прайс дал цену: там заводится зеркало справочника
+        поставщиков, и по нему видно, у кого закупаем (§6.4)."""
+        onec = FakeOnec([nom(ref="T1", article="A1", purchase="2000")])
+        tools = TaskTools(onec, b"", "p.xlsx", allow, kind=TaskKind.CHANGE_PRICES,
+                          supplier_id=7, supplier_name="Монарх")
+        await tools.execute("write_prices", {
+            "tm_code": "TM1", "collection": "Vintage", "purchase": 1880})
+
+        source = onec.price_writes[0][0]["source"]
+        self.assertEqual(source["supplier_code"], "7")
+        self.assertEqual(source["supplier"], "Монарх")
+
+    async def test_source_names_the_winner_not_us(self):
+        """Победил чужой прайс — в 1С уедет ЕГО имя, иначе атрибуция соврёт."""
+        onec = FakeOnec([nom(ref="T1", article="A1", purchase="2000")])
+        tools = TaskTools(onec, b"", "p.xlsx", allow, kind=TaskKind.CHANGE_PRICES,
+                          offers=FakeOffers({"a1": [Offer(2, "Паркет-Холл", 1560,
+                                                          price_date="2026-09-15")]}),
+                          supplier_id=1, supplier_name="Монарх",
+                          price_date="2026-09-22")
+        await tools.execute("write_prices", {
+            "tm_code": "TM1", "collection": "Vintage", "purchase": 1880})
+
+        source = onec.price_writes[0][0]["source"]
+        self.assertEqual(source["supplier_code"], "2")
+        self.assertEqual(source["supplier"], "Паркет-Холл")
+
     async def test_our_own_price_wins_when_it_is_lowest(self):
         onec = FakeOnec([nom(ref="T1", article="A1", purchase="2000")])
         tools = self.tools(onec, {"a1": [Offer(2, "Паркет-Холл", 1900,

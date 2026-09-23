@@ -142,12 +142,16 @@ async def main() -> None:
         """
         from src.model.executor import run
         scope = [c["category"] for c in await pricing_store.list_scope()]
+        # Имя поставщика едет в 1С вместе с ценой: там заводится зеркало справочника,
+        # опознаваемое по КОДУ, а имя — для глаз (§6.4).
+        seller = await supplier_store.get_supplier(price.supplier_price.supplier_id)
         # ЖУРНАЛ ПРЕДЛОЖЕНИЙ (§6.4): по нему исполнитель пишет наименьшую АКТУАЛЬНУЮ цену,
         # а не ту, что в обрабатываемом прайсе. Без журнала поведение прежнее.
         return await run(orchestrator, onec, price, task, content, guard, scope=scope,
                          usage_labels={"kind": "model_task",
                                        "price_doc": price.supplier_price.filename},
-                         offers=sightings)
+                         offers=sightings,
+                         supplier_name=seller.name if seller else "")
 
     model = PriceListService(
         model_store, supplier_store,

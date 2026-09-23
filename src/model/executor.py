@@ -278,7 +278,8 @@ class TaskTools:
 
     def __init__(self, onec, content: bytes, filename: str, guard, scope=None,
                  kind: TaskKind = TaskKind.CHANGE_PRICES, offers=None,
-                 supplier_id: int = 0, price_date: str | None = None) -> None:
+                 supplier_id: int = 0, price_date: str | None = None,
+                 supplier_name: str = "") -> None:
         self._onec = onec
         self._content = content
         self._filename = filename
@@ -296,7 +297,12 @@ class TaskTools:
         # Нет журнала — пишем то, что дал прайс, как и раньше.
         self._offers = offers
         self._supplier_id = supplier_id
+        self._supplier_name = supplier_name
         self._price_date = price_date
+        # Код товара → чей прайс дал записываемую цену. Едет в 1С полем `source`, чтобы
+        # там было видно, у кого закупаем (§6.4). Заполняется ТОЛЬКО для тех позиций,
+        # которые пишем мы: чужие записи не трогаем и чужой источник не выдумываем.
+        self._sources: dict[str, dict] = {}
         # Строки для отчёта: у кого дешевле и чья протухшая выгода осталась незамеченной.
         self.price_notes: list[str] = []
 
@@ -371,6 +377,31 @@ class TaskTools:
                 f"=== Лист: {sheet.name} === (со строки {start})\n")
         return head + render_preview(sheet, max_rows=MAX_SHEET_ROWS, start=start)
 
+    def _with_source(self, payload: list) -> list:
+        """Приписать к записи цены, ЧЕЙ прайс её дал (§6.4).
+
+        Реквизит в 1С заполняется только там, где цену ставим мы. Чужие записи остаются
+        нетронутыми: от какого поставщика была та цена, не знает никто, и выдумывать это
+        значило бы портить данные, на которые потом будут опираться.
+        """
+        if not self._supplier_id:
+            return payload
+        свой = {"supplier_code": str(self._supplier_id), "supplier": self._supplier_name}
+
+        # У ГРУППОВОЙ ФОРМЫ ЗАПИСИ НЕТ `ref` — цена пишется на всю папку разом. Источник
+        # для неё берётся из позиций: если победитель у всех один, он и указывается,
+        # а разнобой означает, что групповой формы тут и не будет.
+        общий = свой
+        разные = {(v["supplier_code"], v["supplier"]) for v in self._sources.values()}
+        if len(разные) == 1:
+            код, имя = разные.pop()
+            общий = {"supplier_code": код, "supplier": имя}
+
+        for entry in payload or []:
+            ref = str(entry.get("ref") or "")
+            entry["source"] = self._sources.get(ref, общий)
+        return payload
+
     async def _cheapest(self, in_collection: list, rows: list, inp: dict) -> list:
         """Пересобрать цены по журналу предложений: писать наименьшую из действующих.
 
@@ -416,6 +447,12 @@ class TaskTools:
             choice = best(asking, found.get(key) or [])
             for note in choice.notes:
                 self.price_notes.append(f"{item.article}: {note}")
+
+            self._sources[item.ref] = {
+                "supplier_code": str(choice.offer.supplier_id or ""),
+                "supplier": (choice.offer.supplier if choice.offer is not asking
+                             else self._supplier_name),
+            }
 
             if choice.offer is not asking:
                 changed = True
@@ -794,7 +831,7 @@ class TaskTools:
                                      date.today())
             missing = []
 
-        payload = build_payload([group])
+        payload = self._with_source(build_payload([group]))
         if not payload:
             note = "Изменений нет: цены совпадают с текущими либо разница меньше 2%."
             if missing:
@@ -1104,7 +1141,8 @@ def task_brief(price, task) -> str:
 
 
 async def run(orchestrator, onec, price, task, content: bytes, guard,
-              scope=None, usage_labels: dict | None = None, offers=None):
+              scope=None, usage_labels: dict | None = None, offers=None,
+              supplier_name: str = ""):
     """Выполнить задачу. Возвращает (статус, текст результата).
 
     `guard` — функция без аргументов, бросающая `WriteRefused`, если прогон потерял право
@@ -1129,7 +1167,8 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
     tools = TaskTools(onec, content, price.supplier_price.filename, guard,
                       scope=scope, kind=task.kind, offers=offers,
                       supplier_id=price.supplier_price.supplier_id,
-                      price_date=price.supplier_price.price_date)
+                      price_date=price.supplier_price.price_date,
+                      supplier_name=supplier_name)
 
     answer, _ = await orchestrator.handle_turn(
         [{"role": "user", "content": task_brief(price, task)}],
