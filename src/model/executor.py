@@ -27,6 +27,7 @@ from datetime import date
 from decimal import Decimal
 
 from src.model import normalize as nz
+from src.model.offers import Offer, best
 from src.model.enums import TaskKind, TaskStatus, TaskSubject
 from src.price_tool import items as item_rules
 # `plan_collection` есть И в `changes` (цены), И в `items` (справочник) — разные функции
@@ -34,7 +35,19 @@ from src.price_tool import items as item_rules
 # перепутать их значит собрать не тот payload и записать не то.
 from src.price_tool.changes import build_payload, plan_items
 from src.price_tool.changes import plan_collection as plan_price_group
+from src.model.refs import norm_article
 from src.price_tool.parser import render_preview, parse_price_table
+
+
+def _money(value):
+    """Цена в число. Ноль и мусор — «цены нет»."""
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out > 0 else None
 
 logger = logging.getLogger(__name__)
 
@@ -264,7 +277,8 @@ class TaskTools:
     """Инструменты одной задачи. Состояние — что записано и чем закончилось."""
 
     def __init__(self, onec, content: bytes, filename: str, guard, scope=None,
-                 kind: TaskKind = TaskKind.CHANGE_PRICES) -> None:
+                 kind: TaskKind = TaskKind.CHANGE_PRICES, offers=None,
+                 supplier_id: int = 0, price_date: str | None = None) -> None:
         self._onec = onec
         self._content = content
         self._filename = filename
@@ -278,6 +292,13 @@ class TaskTools:
         self._sheets = None
         self._items_cache: dict[str, list] = {}
         self._tm_names: dict[str, str] = {}     # код марки → её имя В 1С, не в прайсе
+        # ЖУРНАЛ ПРЕДЛОЖЕНИЙ (§6.4): чьи цены сейчас действуют у других поставщиков.
+        # Нет журнала — пишем то, что дал прайс, как и раньше.
+        self._offers = offers
+        self._supplier_id = supplier_id
+        self._price_date = price_date
+        # Строки для отчёта: у кого дешевле и чья протухшая выгода осталась незамеченной.
+        self.price_notes: list[str] = []
 
         self.written_items = 0
         self.written_prices = 0
@@ -349,6 +370,65 @@ class TaskTools:
         head = (f"Листы: {', '.join(s.name for s in self.sheets)}\n"
                 f"=== Лист: {sheet.name} === (со строки {start})\n")
         return head + render_preview(sheet, max_rows=MAX_SHEET_ROWS, start=start)
+
+    async def _cheapest(self, in_collection: list, rows: list, inp: dict) -> list:
+        """Пересобрать цены по журналу предложений: писать наименьшую из действующих.
+
+        Возвращает СТРОКИ ПО ТОВАРАМ. Когда журнала нет или он молчит, строки остаются
+        такими, какими их прислала модель, — и коллекционная форма записи (одна цена на
+        всю папку) работает по-прежнему: групповая запись дешевле поштучной.
+
+        Решение принимается ПО КАЖДОЙ ПОЗИЦИИ, потому что предложения приходят по
+        артикулам: у одного декора конкурент дешевле, у другого его нет вовсе.
+        """
+        if self._offers is None:
+            return rows
+
+        asked: dict[str, dict] = {}
+        for row in rows or []:
+            ref = str(row.get("ref") or "").strip()
+            if ref:
+                asked[ref] = row
+        flat_purchase = inp.get("purchase")
+        flat_rrc = inp.get("rrc")
+        if not asked and flat_purchase is None:
+            return rows
+
+        by_key = {norm_article(i.article): i for i in in_collection if i.article}
+        try:
+            found = await self._offers.offers(list(by_key), self._supplier_id)
+        except Exception:                               # noqa: BLE001
+            logger.warning("Журнал предложений не прочитался", exc_info=True)
+            return rows
+
+        out, changed = [], False
+        for key, item in by_key.items():
+            row = asked.get(item.ref)
+            if row is None and not asked:
+                row = {"ref": item.ref, "purchase": flat_purchase, "rrc": flat_rrc}
+            if row is None:
+                continue                    # эту позицию модель писать не просила
+
+            asking = Offer(supplier_id=self._supplier_id, supplier="этот прайс",
+                           purchase=_money(row.get("purchase")),
+                           rrc=_money(row.get("rrc")),
+                           price_date=self._price_date)
+            choice = best(asking, found.get(key) or [])
+            for note in choice.notes:
+                self.price_notes.append(f"{item.article}: {note}")
+
+            if choice.offer is not asking:
+                changed = True
+                out.append({"ref": item.ref, "purchase": choice.offer.purchase,
+                            "rrc": choice.offer.rrc})
+            else:
+                out.append(dict(row, ref=item.ref))
+
+        if not out:
+            return rows
+        if not changed and not asked:
+            return rows
+        return out
 
     async def _nomenclature(self, tm_code: str) -> list:
         """Выгрузка марки с кешем на прогон: справочник за задачу не меняется до записи."""
@@ -687,6 +767,12 @@ class TaskTools:
         tm_name = (inp.get("tm_name") or "").strip()
         rows = inp.get("items") or []
 
+        # НАИМЕНЬШАЯ АКТУАЛЬНАЯ ЦЕНА (§6.4). До сюда цена приходила из обрабатываемого
+        # прайса — и прайс подороже затирал цену подешевле, записанную неделю назад по
+        # другому поставщику. Решает это КОД по журналу предложений: модель о конкурентах
+        # не знает и знать не должна.
+        rows = await self._cheapest(in_collection, rows, inp)
+
         if rows:
             group, missing = plan_items(in_collection, tm_code, tm_name, rows, date.today())
         else:
@@ -752,6 +838,13 @@ class TaskTools:
         if status == TaskStatus.PARTIAL and len(result) < 20:
             return ("Исход «частично обработана» требует причины и того, что именно "
                     "сделано. Напиши подробнее.")
+
+        # ВЫБОР ПОСТАВЩИКА ДОПИСЫВАЕТ КОД. Агент о конкурентах не знает — решение принято
+        # по журналу предложений уже после его вызова, — а админу эти строки нужны: по ним
+        # видно, чью цену записали и у кого дешевле, но прайс протух (§6.4).
+        if self.price_notes:
+            result += ("\n\nПо ценам других поставщиков:\n— "
+                       + "\n— ".join(self.price_notes[:20]))
 
         # «Выполнена», когда в 1С НИЧЕГО не записано и ошибок не было, — подозрительно,
         # но законно: задача могла оказаться уже сделанной. Пусть скажет это словами.
@@ -1011,7 +1104,7 @@ def task_brief(price, task) -> str:
 
 
 async def run(orchestrator, onec, price, task, content: bytes, guard,
-              scope=None, usage_labels: dict | None = None):
+              scope=None, usage_labels: dict | None = None, offers=None):
     """Выполнить задачу. Возвращает (статус, текст результата).
 
     `guard` — функция без аргументов, бросающая `WriteRefused`, если прогон потерял право
@@ -1034,7 +1127,9 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
         return await run_discontinue(onec, task, guard)
 
     tools = TaskTools(onec, content, price.supplier_price.filename, guard,
-                      scope=scope, kind=task.kind)
+                      scope=scope, kind=task.kind, offers=offers,
+                      supplier_id=price.supplier_price.supplier_id,
+                      price_date=price.supplier_price.price_date)
 
     answer, _ = await orchestrator.handle_turn(
         [{"role": "user", "content": task_brief(price, task)}],

@@ -14,6 +14,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from src.model.enums import TaskKind, TaskStatus
+from src.model.offers import Offer
 from src.model.events import Broadcaster
 from src.model.executor import TaskTools, WriteRefused, run, task_brief
 from src.model.price import Price, SupplierPrice
@@ -83,6 +84,86 @@ def allow():
 
 def deny():
     raise WriteRefused("захват потерян")
+
+
+class FakeOffers:
+    """Журнал предложений: артикул → что просят ДРУГИЕ поставщики."""
+
+    def __init__(self, table=None):
+        self._table = table or {}
+        self.asked = []
+
+    async def offers(self, keys, exclude_supplier_id=0):
+        self.asked.append((list(keys), exclude_supplier_id))
+        return {k: v for k, v in self._table.items() if k in set(keys)}
+
+
+class CheapestPriceTest(unittest.IsolatedAsyncioTestCase):
+    """Наименьшая АКТУАЛЬНАЯ цена (§6.4).
+
+    Вопрос админа 22.09.2026: один товар возят несколько поставщиков, и прайс подороже
+    не должен затирать цену подешевле. Решает КОД — модель о конкурентах не знает.
+    """
+
+    def tools(self, onec, table, price_date="2026-09-22"):
+        return TaskTools(onec, b"", "p.xlsx", allow, kind=TaskKind.CHANGE_PRICES,
+                         offers=FakeOffers(table), supplier_id=1, price_date=price_date)
+
+    async def test_cheaper_fresh_offer_wins(self):
+        onec = FakeOnec([nom(ref="T1", article="A1", purchase="2000")])
+        tools = self.tools(onec, {"a1": [Offer(2, "Паркет-Холл", 1560,
+                                               price_date="2026-09-15")]})
+        await tools.execute("write_prices", {
+            "tm_code": "TM1", "collection": "Vintage", "purchase": 1880})
+
+        written = onec.price_writes[0][0]["prices"]
+        self.assertEqual(written["purchase"], 1560)
+        self.assertIn("Паркет-Холл", " ".join(tools.price_notes))
+
+    async def test_stale_offer_does_not_block_the_write(self):
+        """Цена годовой давности про сегодня не говорит ничего — пишем свежую."""
+        onec = FakeOnec([nom(ref="T1", article="A1", purchase="2000")])
+        tools = self.tools(onec, {"a1": [Offer(2, "Паркет-Холл", 1560,
+                                               price_date="2025-09-15")]})
+        await tools.execute("write_prices", {
+            "tm_code": "TM1", "collection": "Vintage", "purchase": 1880})
+
+        written = onec.price_writes[0][0]["prices"]
+        self.assertEqual(written["purchase"], 1880)
+        # но админу об этом сказано: повод запросить свежий прайс
+        self.assertIn("запросить свежий", " ".join(tools.price_notes))
+
+    async def test_rrc_comes_from_the_winner(self):
+        """Решение админа: пара «закупка + РРЦ» берётся у одного поставщика."""
+        onec = FakeOnec([nom(ref="T1", article="A1", purchase="2000")])
+        tools = self.tools(onec, {"a1": [Offer(2, "Паркет-Холл", 1560, rrc=2870,
+                                               price_date="2026-09-15")]})
+        await tools.execute("write_prices", {
+            "tm_code": "TM1", "collection": "Vintage", "purchase": 1880, "rrc": 2980})
+
+        written = onec.price_writes[0][0]["prices"]
+        self.assertEqual(written["rrc"], 2870)
+
+    async def test_without_the_journal_nothing_changes(self):
+        """Журнала нет — пишем то, что дал прайс, и групповой формой, как раньше."""
+        onec = FakeOnec([nom(ref="T1", article="A1", purchase="2000")])
+        tools = TaskTools(onec, b"", "p.xlsx", allow, kind=TaskKind.CHANGE_PRICES)
+        await tools.execute("write_prices", {
+            "tm_code": "TM1", "collection": "Vintage", "purchase": 1880})
+
+        sent = onec.price_writes[0][0]
+        self.assertEqual(sent["prices"]["purchase"], 1880)
+        self.assertIn("collection_ref", sent)      # групповая форма записи сохранилась
+
+    async def test_our_own_price_wins_when_it_is_lowest(self):
+        onec = FakeOnec([nom(ref="T1", article="A1", purchase="2000")])
+        tools = self.tools(onec, {"a1": [Offer(2, "Паркет-Холл", 1900,
+                                               price_date="2026-09-15")]})
+        await tools.execute("write_prices", {
+            "tm_code": "TM1", "collection": "Vintage", "purchase": 1880})
+
+        self.assertEqual(onec.price_writes[0][0]["prices"]["purchase"], 1880)
+        self.assertEqual(tools.price_notes, [])
 
 
 class WriteGuardTest(unittest.IsolatedAsyncioTestCase):

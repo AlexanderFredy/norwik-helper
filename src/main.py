@@ -116,11 +116,12 @@ async def main() -> None:
         supplier = await supplier_store.get_supplier(supplier_id)
         signature = price.supplier_price.signature or ""
 
-        async def remember(articles):
+        async def remember(articles, prices=None):
             await sightings.remember(
                 supplier_id, signature, articles,
                 supplier=supplier.name if supplier else "",
-                price_date=price.supplier_price.price_date)
+                price_date=price.supplier_price.price_date,
+                prices=prices)
 
         # Ответ агента едет дальше вместе с задачами: когда их ноль, только он и
         # объясняет, почему — «расхождений нет» или «разобрал не тот лист».
@@ -141,9 +142,12 @@ async def main() -> None:
         """
         from src.model.executor import run
         scope = [c["category"] for c in await pricing_store.list_scope()]
+        # ЖУРНАЛ ПРЕДЛОЖЕНИЙ (§6.4): по нему исполнитель пишет наименьшую АКТУАЛЬНУЮ цену,
+        # а не ту, что в обрабатываемом прайсе. Без журнала поведение прежнее.
         return await run(orchestrator, onec, price, task, content, guard, scope=scope,
                          usage_labels={"kind": "model_task",
-                                       "price_doc": price.supplier_price.filename})
+                                       "price_doc": price.supplier_price.filename},
+                         offers=sightings)
 
     model = PriceListService(
         model_store, supplier_store,

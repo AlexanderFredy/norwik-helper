@@ -241,6 +241,9 @@ class TaskBuilderTools:
         # Что этот прайс показал: артикул → коллекция, как она названа В ПРАЙСЕ. Ляжет в
         # тот же журнал после прогона — из него и узнает о коллекции следующий прайс.
         self.seen_articles: dict[str, str] = {}
+        # Что этот поставщик просит: артикул → {purchase, rrc}. Ложится в тот же журнал
+        # и потом решает, чью цену писать в 1С (§6.4): наименьшую среди свежих.
+        self.seen_prices: dict[str, dict] = {}
         # Коллекция (нормализованно) → позиции, которые в 1С УЖЕ ЕСТЬ, но вне живой папки:
         # чаще всего снятые. Заводить их заново нельзя — это дубль.
         self._revivals: dict[str, list] = {}
@@ -675,6 +678,7 @@ class TaskBuilderTools:
             from_flat = price_check.flat_prices(found, flat.get("purchase"),
                                                 flat.get("rrc"))
             if from_flat:
+                self._remember_prices(from_flat)
                 return price_check.report(price_check.compare(found, from_flat))
 
         spec = dict(inp.get("price_columns") or {})
@@ -711,7 +715,22 @@ class TaskBuilderTools:
         if not from_price:
             return ("в названных колонках цен не нашлось ни одного числа — проверь, те ли "
                     "это колонки")
+        self._remember_prices(from_price)
         return price_check.report(price_check.compare(found, from_price))
+
+    def _remember_prices(self, from_price: dict) -> None:
+        """Отложить цены прайса для журнала предложений (§6.4).
+
+        Сюда попадает то, что УЖЕ разобрано ради сверки, — ни одного лишнего действия.
+        Журнал хранит цены приведёнными к базовой ЕИ, как и сравнение.
+        """
+        for key, prices in (from_price or {}).items():
+            if not key:
+                continue
+            self.seen_prices[key] = {
+                "purchase": float(prices["purchase"]) if "purchase" in prices else None,
+                "rrc": float(prices["rrc"]) if "rrc" in prices else None,
+            }
 
     def _nomenclature(self, tm_code: str) -> list:
         """Выгрузка марки с кешем на прогон: за составление задач она не меняется."""
@@ -1158,7 +1177,7 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
     # ход — модель перечисляет их в `compare_with_1c`.
     if remember is not None and tools.seen_articles:
         try:
-            await remember(tools.seen_articles)
+            await remember(tools.seen_articles, tools.seen_prices)
         except Exception:                               # noqa: BLE001
             logger.warning("Не удалось записать журнал встреч", exc_info=True)
 
