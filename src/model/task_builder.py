@@ -249,6 +249,7 @@ class TaskBuilderTools:
         self._revivals: dict[str, list] = {}
         # Имя коллекции → марки-владельцы по дереву папок 1С. Считается один раз.
         self._owners: dict | None = None
+        self._haystack: str | None = None   # весь текст прайса одной строкой
         self._seen_trees: set = set()   # марки, чьё дерево папок уже спрашивали
         self._collection_name = ""      # коллекция текущей сверки — для поиска владельца
         # Последняя ошибка поиска по всей номенклатуре. Молчать о ней нельзя: сорвавшийся
@@ -330,11 +331,70 @@ class TaskBuilderTools:
         out: dict[str, list[str]] = {}
         for tm_code, items in self._items_cache.items():
             covered = self._touched.get(tm_code, set())
-            live = {collection_of(i) for i in items if not i.not_exported}
-            rest = sorted(name for name in live if name and name not in covered)
+            by_collection: dict[str, list[str]] = {}
+            for i in items:
+                if i.not_exported:
+                    continue
+                name = collection_of(i)
+                if name:
+                    by_collection.setdefault(name, []).append(i.article or "")
+
+            rest = []
+            for name, articles in sorted(by_collection.items()):
+                if name in covered:
+                    continue
+                # «АГЕНТ НЕ СВЕРЯЛ» — НЕ «В ПРАЙСЕ НЕТ». Прайс бывает на несколько листов,
+                # агент обошёл не все, и коллекции со второго листа выглядели снятыми:
+                # Westerhof так получил задачи на снятие COSMO, Shine и Aristocrat, живых
+                # и стоящих в файле (бой 24.09.2026). Поэтому спрашиваем САМ ФАЙЛ.
+                if self._in_price(name, articles):
+                    continue
+                rest.append(name)
+
             if rest:
                 out[tm_code] = rest
         return out
+
+    def _in_price(self, collection: str, articles) -> bool:
+        """Встречается ли коллекция в прайсе — по артикулам и по имени.
+
+        Ищем по НОРМАЛИЗОВАННОМУ тексту всего файла: артикул в ячейке слеплен с названием
+        и размером («…Альфа PELI (CO 512) 1290*190*8мм»), и сравнение «ячейка = артикул»
+        не нашло бы ничего. Артикулы короче трёх знаков не проверяем: «12» найдётся в любом
+        размере и объявит живой любую коллекцию.
+
+        Имя коллекции проверяется И БЕЗ РАЗМЕРНОГО ХВОСТА: в 1С папка зовётся «Aristocrat
+        1200х400», а в прайсе — просто «Aristocrat».
+        """
+        haystack = self._price_haystack()
+        if not haystack:
+            return False        # файл не разобрался — решать по нему нечего
+
+        for article in articles or ():
+            key = norm_article(article)
+            if len(key) >= 3 and key in haystack:
+                return True
+
+        for key in _collection_keys(collection):
+            flat = "".join(ch for ch in key if ch.isalnum())
+            if len(flat) >= 4 and flat in haystack:
+                return True
+        return False
+
+    def _price_haystack(self) -> str:
+        """Весь текст прайса одной строкой, без разделителей и регистра. Считается один
+        раз: файл за прогон не меняется, а склейка сотен строк не бесплатна."""
+        if self._haystack is None:
+            parts = []
+            for sheet in self.sheets:
+                for row in sheet.rows:
+                    for cell in row:
+                        text = str(cell or "")
+                        if text.strip():
+                            parts.append("".join(ch for ch in text.lower()
+                                                 if ch.isalnum()))
+            self._haystack = " ".join(parts)
+        return self._haystack
 
     def _normalization_pointless(self, tm_code: str) -> str:
         """Отказ, если нормализовать нечего. Пустая строка — задача нужна.
@@ -436,8 +496,14 @@ class TaskBuilderTools:
         # них сменился поставщик. Решает это код по журналу встреч, а не рассуждение.
         kept, missing_in_price = [], []
         for i in gone:
-            met = self._elsewhere.get(norm_article(i.article))
             line = f"{i.article} {i.site_name or i.name}".strip()
+
+            # ТА ЖЕ ПРОВЕРКА, ЧТО И У КОЛЛЕКЦИЙ: агент перечислил артикулы одного листа,
+            # а позиция стоит на другом. «Он её не назвал» — не «её в прайсе нет».
+            if self._in_price("", [i.article]) or self._in_price(i.site_name or "", []):
+                continue
+
+            met = self._elsewhere.get(norm_article(i.article))
             if met is None:
                 missing_in_price.append(line)
             else:

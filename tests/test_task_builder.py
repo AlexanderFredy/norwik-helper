@@ -592,6 +592,48 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(TaskKind.MOVE_DISCONTINUED, kinds)
         self.assertIn("Паркет-Холл", notes[0])
 
+    async def test_collection_from_another_sheet_is_not_discontinued(self):
+        """СЛУЧАЙ С БОЯ (24.09.2026). Прайс Westerhof на три листа, агент сверил не все,
+        и коллекции со второго листа выглядели снятыми: COSMO, Shine, Aristocrat — живые,
+        стоящие в файле. «Агент не сверял» — это не «в прайсе нет», и решать должен ФАЙЛ."""
+        from src.model.task_builder import _add_discontinued_candidates
+
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", collection="Millenium Pro"),
+            # эта коллекция в прайсе есть — её артикул стоит в листе
+            self.nom("R2", "3310", collection="Дуб Прато"),
+        ]))
+        await self.compare(tools, ["3309"], collection="Миллениум Про")
+        await tools.execute("add_task", {"kind": "изменение цен", "tm": "Egger",
+                                         "tm_code": "T1", "collection": "Millenium Pro",
+                                         "description": "цены"})
+
+        _add_discontinued_candidates(tools)
+        self.assertNotIn(TaskKind.MOVE_DISCONTINUED,
+                         [t.kind for t in tools.collected])
+
+    async def test_collection_absent_from_the_file_is_still_discontinued(self):
+        """Проверка по файлу не должна глушить правило: чего в прайсе нет, то кандидат."""
+        from src.model.task_builder import _add_discontinued_candidates
+
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", collection="Millenium Pro"),
+            self.nom("R2", "ZZ999", collection="Совсем Другая"),
+        ]))
+        await self.compare(tools, ["3309"], collection="Миллениум Про")
+        await tools.execute("add_task", {"kind": "изменение цен", "tm": "Egger",
+                                         "tm_code": "T1", "collection": "Millenium Pro",
+                                         "description": "цены"})
+
+        _add_discontinued_candidates(tools)
+        self.assertIn(TaskKind.MOVE_DISCONTINUED, [t.kind for t in tools.collected])
+
+    async def test_short_article_does_not_pass_for_a_price(self):
+        """Артикул в два знака нашёлся бы в любом размере и объявил бы живой любую
+        коллекцию — такие в проверке не участвуют."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([]))
+        self.assertFalse(tools._in_price("", ["12"]))
+
     async def test_unknown_collection_is_still_discontinued(self):
         """Пока журнал пуст, поведение прежнее: обратного никто не показывал."""
         from src.model.task_builder import _add_discontinued_candidates
