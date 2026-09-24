@@ -15,6 +15,7 @@ from src.bot.catalog_handlers import router as catalog_router
 from src.bot.model_handlers import (TelegramListener, TelegramProvider,
                                     router as model_router)
 from src.bot.model_loop import AgentLoop
+from src.bot.polling import poll_forever
 from src.bot.pricing_handlers import router as pricing_router
 from src.config import load_config
 from src.email_tool.client import MailClient
@@ -201,7 +202,10 @@ async def main() -> None:
     await setup_bot_commands(bot, config.admin_telegram_id)
 
     logger.info("Запуск бота (polling)")
-    await asyncio.gather(dp.start_polling(bot), loop.run())
+    # Поллинг поднимается через `poll_forever`, а не напрямую: моргнувший на старте DNS
+    # ронял процесс насовсем, хотя ждать надо было секунды, — и уносил с собой цикл
+    # модели, которому Telegram вообще не нужен (у формы 1С свой канал).
+    await asyncio.gather(poll_forever(dp, bot), loop.run())
 
 
 if __name__ == "__main__":
