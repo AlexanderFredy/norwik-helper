@@ -469,6 +469,26 @@ class PageSizeTest(unittest.TestCase):
         self.assertEqual(len(seen), 3)
 
 
+class KeepAliveTest(unittest.TestCase):
+    """Соединение не переиспользуется — замер 24.09.2026 на боевой публикации.
+
+    По одному и тому же соединению каждый ТРЕТИЙ запрос уходил в никуда (№3, №6, №9,
+    №12 при норме 0,2 с), новым соединением на запрос проходили 9 из 9 за 0,4–0,5 с.
+    Сервер закрывает keep-alive молча: наш сокет жив, ответа не будет никогда.
+
+    Проверка тупая намеренно: настройка невидима в поведении, и вернуть умолчание
+    обратно можно одним безобидным на вид упрощением конструктора.
+    """
+
+    def test_idle_connections_are_not_kept(self):
+        c = OnecClient("http://example.invalid/api", "token")
+        try:
+            pool = c._client._transport._pool
+            self.assertEqual(pool._max_keepalive_connections, 0)
+        finally:
+            c.close()
+
+
 class BadCardTest(unittest.TestCase):
     """Одна больная карточка не имеет права уносить всю марку (бой 24.09.2026).
 
