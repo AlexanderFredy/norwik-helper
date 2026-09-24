@@ -54,6 +54,23 @@ TITLES = {
 }
 
 
+#: Сколько знаков после запятой РЕАЛЬНО хранит 1С. Больше — теряется при записи, и
+#: сравнение «до» с «после» даёт ВЕЧНУЮ ложную правку: прайс даёт 1,9608, база хранит
+#: 1,961, и каждый следующий прогон снова предлагает «1,961 → 1,9608» (бой 24.09.2026).
+STORED_DECIMALS = {"pack_coefficient": 3}
+
+
+def rounded(field: str, value):
+    """Значение в том виде, в каком его сохранит 1С. Не число — возвращаем как есть."""
+    digits = STORED_DECIMALS.get(field)
+    if digits is None or value is None or isinstance(value, (str, bool)):
+        return value
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return value
+
+
 def significant(before, after) -> bool:
     """Изменение по существу, а не нормализация регистра и пробелов."""
     if isinstance(before, str) or isinstance(after, str):
@@ -109,12 +126,18 @@ class FieldChange:
 
     @property
     def significant(self) -> bool:
-        return significant(self.before, self.after)
+        # СРАВНИВАЕМ ТО, ЧТО 1С СОХРАНИТ. Лишние знаки после запятой она отбросит, и
+        # правка «1,961 → 1,9608» не изменит в базе ничего, зато будет предлагаться
+        # каждый прогон и тонуть в ней настоящие.
+        return significant(rounded(self.field, self.before),
+                           rounded(self.field, self.after))
 
     def render(self) -> str:
         title = TITLES.get(self.field, self.field)
-        before = "(пусто)" if self.before in (None, "") else self.before
-        after = "(пусто)" if self.after in (None, "") else self.after
+        before = rounded(self.field, self.before)
+        after = rounded(self.field, self.after)
+        before = "(пусто)" if before in (None, "") else before
+        after = "(пусто)" if after in (None, "") else after
         return f"{title}: {before} → {after}"
 
 
@@ -345,7 +368,10 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
             "parent_ref": str(raw.get("parent_ref") or "").strip(),
             "article": article,
             "unit": str(raw.get("unit") or "").strip(),
-            "pack_coefficient": _num(raw.get("pack_coefficient")),
+            # Пишем СРАЗУ округлённым: база всё равно отбросит хвост, а так в журнале
+            # правок и в 1С стоит одно и то же число.
+            "pack_coefficient": rounded("pack_coefficient",
+                                        _num(raw.get("pack_coefficient"))),
             "length_from": length_from, "length_to": length_to,
             "width_from": width_from, "width_to": width_to,
             "thickness": _num(raw.get("thickness")),

@@ -69,6 +69,42 @@ class SignificanceTest(unittest.TestCase):
         self.assertFalse(significant(2.23, 2.23))
 
 
+class StoredPrecisionTest(unittest.TestCase):
+    """СЛУЧАЙ С БОЯ (24.09.2026). Агент предлагал «коэффициент упаковки: 1,961 → 1,9608».
+    1С хранит три знака после запятой, запись ничего бы не изменила, а правка возвращалась
+    бы каждый прогон и топила в себе настоящие."""
+
+    def test_extra_decimals_are_not_a_change(self):
+        from src.price_tool.items import FieldChange
+        self.assertFalse(FieldChange("pack_coefficient", 1.961, 1.9608).significant)
+
+    def test_real_change_survives(self):
+        from src.price_tool.items import FieldChange
+        self.assertTrue(FieldChange("pack_coefficient", 1.961, 2.367).significant)
+
+    def test_rounding_at_the_third_digit(self):
+        from src.price_tool.items import FieldChange
+        # 1,9615 округляется до 1,962 — это уже другое число
+        self.assertTrue(FieldChange("pack_coefficient", 1.961, 1.9615).significant)
+
+    def test_report_shows_what_1c_will_store(self):
+        from src.price_tool.items import FieldChange
+        self.assertIn("2.367", FieldChange("pack_coefficient", 1.961, 2.3671).render())
+
+    def test_fields_without_declared_precision_are_untouched(self):
+        """Точность объявляется явно: молча округлять всё подряд — потеря данных."""
+        from src.price_tool.items import FieldChange
+        self.assertTrue(FieldChange("thickness", 12, 12.0004).significant)
+
+    def test_plan_writes_the_rounded_value(self):
+        """В 1С и в журнале правок должно стоять одно и то же число."""
+        current = [_nom(alt_units={"упак": 1.961})]
+        plan = plan_collection(_inp(items=[{"op": "update", "ref": "YO-1",
+                                            "article": "LQ-01", "title": "Адана",
+                                            "pack_coefficient": 2.3671}]), current)
+        self.assertEqual(plan.ops()[0]["pack_coefficient"], 2.367)
+
+
 class PlanTest(unittest.TestCase):
 
     def test_creation_builds_full_operation(self):
