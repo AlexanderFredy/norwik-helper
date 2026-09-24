@@ -440,6 +440,35 @@ class RetryTest(unittest.TestCase):
         self.assertEqual(calls["n"], 1)
 
 
+class PageSizeTest(unittest.TestCase):
+    """Страница выгрузки маленькая НАМЕРЕННО (бой 24.09.2026).
+
+    Обработчик собирает цены по каждой позиции тремя видами цен, и запрос на 200 позиций
+    занимал базу на минуту, упираясь в наш же таймаут и блокируя всё остальное.
+    """
+
+    def test_default_page_is_small(self):
+        from src.onec.client import PAGE_SIZE
+        self.assertLessEqual(PAGE_SIZE, 50)
+
+    def test_pages_are_requested_by_that_size(self):
+        seen = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(dict(request.url.params))
+            return httpx.Response(200, json={"tm": "Egger", "total": 60, "offset": 1,
+                                             "limit": 25, "items": [], "errors": []})
+
+        c = OnecClient("http://example.invalid/api", "token")
+        c._client = httpx.Client(base_url="http://example.invalid/api",
+                                 transport=httpx.MockTransport(handler))
+        c.by_tm_all("T1")
+
+        self.assertEqual(seen[0]["size"], "25")
+        # 60 позиций по 25 — три страницы, а не одна на двести
+        self.assertEqual(len(seen), 3)
+
+
 class RetryPolicyTest(unittest.TestCase):
     """Что повторяем, а что нет (бой 24.09.2026).
 
