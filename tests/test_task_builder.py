@@ -499,6 +499,29 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(got["цены"]["без_цены_в_1С"], 1)
         self.assertIn("задачу заводи", got["цены"]["вывод"])
 
+    async def test_collection_without_articles_is_not_new(self):
+        """СЛУЧАЙ С БОЯ (24.09.2026). Папка COSMO (YO-00052996) на месте, шесть живых
+        позиций, у всех артикул пуст — сверка по артикулу их не видит, и агент предложил
+        завести коллекцию заново, то есть получить девять дублей."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "", site="Дуб Авила", collection="Cosmo"),
+            self.nom("R2", "", site="Дуб Прато", collection="Cosmo"),
+        ]))
+        got = await self.compare(tools, ["CO 512", "CO 520"], collection="Cosmo")
+
+        blind = got["коллекция_есть_в_1С"]
+        self.assertEqual(blind["позиций"], 2)
+        self.assertEqual(blind["без_артикула"], 2)
+        self.assertIn("заводить заново НЕЛЬЗЯ", blind["вывод"])
+        # к каждой позиции приложена строка прайса — по ней и проставят артикул
+        self.assertIn("Дуб Авила", blind["позиции"][0]["строка_прайса"])
+
+    async def test_collection_with_articles_gives_no_such_warning(self):
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", collection="Cosmo")]))
+        got = await self.compare(tools, ["9999"], collection="Cosmo")
+        self.assertNotIn("коллекция_есть_в_1С", got)
+
     async def test_articles_lying_in_discontinued_are_a_revival(self):
         """Коллекцию однажды унесли в снятые, а поставщик привёз её снова. Выгрузка марки
         её не видит, и без поиска по всей базе агент завёл бы всё заново — сто дублей с
