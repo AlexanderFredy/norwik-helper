@@ -150,6 +150,13 @@ class TaskTest(unittest.TestCase):
         self.assertIn("класс износостойкости", first.description)
         self.assertEqual(first.address.subject.code, "YO-77")
 
+    def test_absorb_separates_paragraphs(self):
+        """Описание пишется абзацами: одиночный перенос приклеил бы новый абзац к
+        последней строке прежнего."""
+        first = task(description="Завести коллекцию целиком.")
+        first.absorb(task(description="Внимание: артикулы повторяются."))
+        self.assertIn("целиком.\n\nВнимание", first.description)
+
     def test_absorb_does_not_duplicate_the_same_text(self):
         first = task(description="сверить размеры")
         first.absorb(task(description="сверить размеры"))

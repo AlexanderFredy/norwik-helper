@@ -80,7 +80,9 @@ class PriceTask:
         self.address = self.address.merged(other.address)
         extra = (other.description or "").strip()
         if extra and extra not in self.description:
-            self.description = f"{self.description}\n{extra}".strip()
+            # ПУСТАЯ СТРОКА МЕЖДУ, а не перенос: описание пишется абзацами, и одиночный
+            # перенос приклеил бы новый абзац к последней строке прежнего.
+            self.description = f"{self.description}\n\n{extra}".strip()
 
     # -------------------------------------------------------------- прочее
 
