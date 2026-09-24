@@ -160,8 +160,13 @@ class TaskTest(unittest.TestCase):
                  TaskKind.MOVE_DISCONTINUED, TaskKind.CHANGE_PROPERTIES]
         out = sort_tasks([task(kind=k, address=addr(collection=k.value)) for k in kinds])
         self.assertEqual([t.kind for t in out], [
-            TaskKind.NORMALIZE_NAMES, TaskKind.CHANGE_PROPERTIES,
-            TaskKind.MOVE_DISCONTINUED, TaskKind.ADD_NEW, TaskKind.CHANGE_PRICES])
+            TaskKind.MOVE_DISCONTINUED, TaskKind.NORMALIZE_NAMES,
+            TaskKind.CHANGE_PROPERTIES, TaskKind.ADD_NEW, TaskKind.CHANGE_PRICES])
+
+    def test_discontinued_goes_before_the_rest(self):
+        """Решение админа 24.09.2026: снятое вычищается ПЕРВЫМ. Пока оно лежит в живых
+        папках, нормализация и свойства причёсывают позиции, которые вот-вот уедут."""
+        self.assertEqual(TaskKind.MOVE_DISCONTINUED.order, 0)
 
     def test_discontinued_sorts_before_adding(self):
         """Перед созданием позиции обязательна проверка среди снятых — иначе дубль."""
