@@ -198,6 +198,8 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         row = snapshot[0]
         self.assertEqual(row["id"], 3)
         self.assertEqual(row["file"], "Прайс.xlsx")
+        # код едет рядом с именем: в 1С по нему опознаётся элемент зеркала
+        self.assertEqual(row["supplier_code"], "1")
         self.assertTrue(row["ready"])
         self.assertEqual(row["locked_by"], "")
         item = row["tasks"][0]

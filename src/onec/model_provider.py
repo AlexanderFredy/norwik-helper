@@ -209,6 +209,10 @@ class OnecProvider(Listener):
                 "id": price.id,
                 "file": sp.filename,
                 "supplier": await self._supplier_name(sp.supplier_id),
+                # КОД, а не только имя: в 1С колонка «Поставщик» — ссылка на зеркало
+                # справочника, и элемент там опознаётся по коду. По имени зеркало плодило
+                # бы дубль на каждое переименование, унося с собой привязанные юрлица.
+                "supplier_code": str(sp.supplier_id or ""),
                 "status": price.status.value,
                 "ready": price.ready,
                 "has_newer": price.has_newer,
