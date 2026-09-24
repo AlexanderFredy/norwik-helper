@@ -68,6 +68,19 @@ def main() -> None:
             heavy = series(f"одна позиция марки {tm} (by-tm)",
                            lambda: onec.by_tm(tm, page=1, size=1))
 
+        if tm:
+            print("\n=== лестница размеров страницы (чем крупнее ответ, тем он рискованнее)")
+            for size in (1, 8, 16, 32, 64):
+                started = time.monotonic()
+                try:
+                    got = onec.by_tm(tm, page=1, size=size, timeout=PATIENCE)
+                    print(f"  size={size:<3} {time.monotonic() - started:5.1f} c | "
+                          f"позиций {len(got.items)}")
+                except Exception as exc:                # noqa: BLE001
+                    print(f"  size={size:<3} {time.monotonic() - started:5.1f} c | "
+                          f"ПРОВАЛ {type(exc).__name__}")
+            print("  PAGE_SIZE держим заведомо ниже первого провалившегося размера.")
+
         print("\n--- итог")
         if light or heavy:
             print("  СЕРВИС ТЕРЯЕТ ЗАПРОСЫ. Это не агент и не данные: провалившийся вызов "

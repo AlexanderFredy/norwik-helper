@@ -441,32 +441,37 @@ class RetryTest(unittest.TestCase):
 
 
 class PageSizeTest(unittest.TestCase):
-    """Страница выгрузки маленькая НАМЕРЕННО (бой 24.09.2026).
+    """Размер страницы: маленький И ДЕЛЯЩИЙСЯ ПОПОЛАМ до единицы (замер 24.09.2026).
 
-    Обработчик собирает цены по каждой позиции тремя видами цен, и запрос на 200 позиций
-    занимал базу на минуту, упираясь в наш же таймаут и блокируя всё остальное.
+    Время ответа от размера почти не зависит — 1, 5 и 10 позиций отдаются за те же
+    1,1–1,2 с, потому что платим за запрос по марке. А надёжность зависит: на 25 позициях
+    ответ не пришёл дважды подряд, пока соседние одиночные проходили за секунду. Плюс
+    спасатель делит страницу пополам ТОЙ ЖЕ арифметикой страниц, и на нечётном размере
+    границы разъехались бы, потеряв позицию молча.
     """
 
-    def test_default_page_is_small(self):
+    def test_page_is_small_and_halves_cleanly(self):
         from src.onec.client import PAGE_SIZE
-        self.assertLessEqual(PAGE_SIZE, 50)
+        self.assertLessEqual(PAGE_SIZE, 10, "крупнее проверенно живого размера не берём")
+        self.assertEqual(PAGE_SIZE & (PAGE_SIZE - 1), 0,
+                         "размер обязан делиться пополам до единицы")
 
     def test_pages_are_requested_by_that_size(self):
+        from src.onec.client import PAGE_SIZE
         seen = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             seen.append(dict(request.url.params))
             return httpx.Response(200, json={"tm": "Egger", "total": 60, "offset": 1,
-                                             "limit": 25, "items": [], "errors": []})
+                                             "limit": PAGE_SIZE, "items": [], "errors": []})
 
         c = OnecClient("http://example.invalid/api", "token")
         c._client = httpx.Client(base_url="http://example.invalid/api",
                                  transport=httpx.MockTransport(handler))
         c.by_tm_all("T1")
 
-        self.assertEqual(seen[0]["size"], "25")
-        # 60 позиций по 25 — три страницы, а не одна на двести
-        self.assertEqual(len(seen), 3)
+        self.assertEqual(seen[0]["size"], str(PAGE_SIZE))
+        self.assertEqual(len(seen), -(-60 // PAGE_SIZE), "60 позиций разбиты без остатка")
 
 
 class KeepAliveTest(unittest.TestCase):
@@ -558,6 +563,32 @@ class BadCardTest(unittest.TestCase):
         self.assertEqual(nom.errors, [])
         # три запроса: провалившийся, его повтор и вторая страница — разбора по одной нет
         self.assertEqual(state["n"], 3)
+
+    def test_rescue_halves_instead_of_asking_one_by_one(self):
+        """Сорвавшаяся страница делится ПОПОЛАМ, а не разбирается по позиции.
+
+        Разбор по одной стоил 25 запросов и полминуты на страницу — и этой нагрузкой сам
+        ронял следующую. Провал же случаен, и половины проходят с первой попытки.
+        """
+        self.POISONED = ""                              # больных карточек нет
+        sizes = []
+        state = {"fail": 2}                             # страница и её повтор молчат
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            params = dict(request.url.params)
+            size = int(params["size"])
+            sizes.append(size)
+            if size == 4 and state["fail"]:
+                state["fail"] -= 1
+                raise httpx.ReadTimeout("timed out")
+            return httpx.Response(200, json=self.answer(int(params["page"]), size))
+
+        nom = self.client(handler).by_tm_all("T1", size=4)
+
+        self.assertEqual([i.ref for i in nom.items], self.MARK, "марка доехала целиком")
+        self.assertEqual(nom.errors, [])
+        self.assertEqual(sizes.count(2), 2, "ровно две половины")
+        self.assertNotIn(1, sizes, "спускаться до одной позиции не пришлось")
 
     def test_waiting_is_bounded(self):
         """Ждать больную карточку общие две минуты незачем: ответа не будет вовсе, а
