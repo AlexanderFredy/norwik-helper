@@ -289,7 +289,15 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
     by_ref = {i.ref: i for i in current}
     tm_name = str(inp.get("tm_name") or "").strip()
     type_name = str(inp.get("product_type_name") or "").strip()
-    collection = collection_case(inp.get("collection"))
+    # ИМЯ КОЛЛЕКЦИИ МОГЛО ПРИЕХАТЬ С РАЗМЕРОМ. Модель видит в 1С папки «Ле Паркет
+    # 600x600x14» и повторяет образец, передавая размер внутри имени. В ПАПКЕ ему место
+    # (§19.5), а в наименовании товара и в значении свойства «Коллекция» — нет: на бою
+    # 24.09.2026 так вышло «Ламинат Peli Anatolia Elite 1290x157x12 Белый Дуб» и значение
+    # свойства с размером. Снимаем точной обратной операцией к `folder_name` — ничего
+    # похожего «на глаз» не режем.
+    raw_collection = collection_case(inp.get("collection"))
+    collection = collection_from_folder(
+        raw_collection, _collection_size(inp, current, raw_collection))
     warnings = [str(w) for w in (inp.get("warnings") or []) if str(w).strip()]
 
     if scope and type_name and not _in_scope(type_name, scope):
@@ -530,6 +538,30 @@ def _unfilled_properties(collection: str, current: list) -> list[str]:
               "там есть, проставь его этим же вызовом."]
 
 
+def _collection_size(inp: dict, current: list, collection: str) -> str:
+    """Единый размер коллекции — из предложения и из уже лежащих в 1С позиций.
+
+    Пусто, если размеры разные: тогда ни в имя папки его дописывать нельзя, ни из имени
+    коллекции вычитать.
+    """
+    sizes = []
+    for raw in inp.get("items") or []:
+        length, _ = _span(raw, "length")
+        width, _ = _span(raw, "width")
+        sizes.append(format_size(length, width, _num(raw.get("thickness"))))
+
+    wanted = _form(collection)
+    for item in current:
+        # Сверяем и с полным именем, и без размерного хвоста: у позиций, заведённых до
+        # этой правки, свойство «Коллекция» само несёт размер.
+        names = {_form(item.collection),
+                 _form(collection_from_folder(item.collection, item.size))}
+        if wanted in names and not item.not_exported:
+            sizes.append(format_size(item.length_from, item.width_from, item.thickness))
+
+    return uniform_size(sizes)
+
+
 def _folder_title(name, type_name: str, type_code, inp: dict, current: list,
                   collection: str) -> str:
     """Имя папки коллекции; у восьми напольных категорий — с размером (§19.5).
@@ -545,24 +577,13 @@ def _folder_title(name, type_name: str, type_code, inp: dict, current: list,
     if not size_in_folder(type_name, type_code):
         return collection_case(name)
 
-    sizes = []
-    for raw in inp.get("items") or []:
-        length, _ = _span(raw, "length")
-        width, _ = _span(raw, "width")
-        sizes.append(format_size(length, width, _num(raw.get("thickness"))))
-
-    wanted = _form(collection)
-    for item in current:
-        if _form(item.collection) == wanted and not item.not_exported:
-            sizes.append(format_size(item.length_from, item.width_from, item.thickness))
-
     # ИМЯ МОГЛО УЖЕ НЕСТИ РАЗМЕР. Модель видит в 1С папки вида «Ле Паркет 600x600x14» и
     # честно повторяет образец, передавая `name` вместе с размером. Дописав свой, мы
     # получаем «Классик 600x238x12 600x238x12» — так и вышло на бою 21.09.2026.
     #
     # Снимаем ТОЧНОЙ обратной операцией к `folder_name`: хвост, равный тому самому
     # размеру, который собираемся дописать. Ничего похожего «на глаз» не режем.
-    size = uniform_size(sizes)
+    size = _collection_size(inp, current, collection)
     return folder_name(collection_from_folder(name, size), size)
 
 def _in_scope(product_type: str, scope: list[str]) -> bool:

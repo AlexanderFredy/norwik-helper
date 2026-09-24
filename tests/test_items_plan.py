@@ -69,6 +69,43 @@ class SignificanceTest(unittest.TestCase):
         self.assertFalse(significant(2.23, 2.23))
 
 
+class SizeInCollectionNameTest(unittest.TestCase):
+    """СЛУЧАЙ С БОЯ (24.09.2026). Модель передала коллекцию вместе с размером — как она
+    записана в имени папки, — и размер уехал и в наименование товара, и в значение
+    свойства «Коллекция»: «Ламинат Peli Anatolia Elite 1290x157x12 Белый Дуб»."""
+
+    def plan(self):
+        return plan_collection(_inp(
+            tm_name="Peli", product_type_name="Ламинат",
+            collection="Anatolia Elite 1290x157x12",
+            new_folder={"parent_ref": "YO-1"},
+            items=[{"op": "create", "article": "AN 901", "title": "Белый Дуб",
+                    "length": 1290, "width": 157, "thickness": 12}]), [])
+
+    def test_collection_loses_the_size(self):
+        """По этому имени заводится значение свойства — размеру там не место."""
+        self.assertEqual(self.plan().collection, "Anatolia Elite")
+
+    def test_item_name_has_no_size(self):
+        self.assertEqual(self.plan().created[0].name,
+                         "Ламинат Peli Anatolia Elite Белый Дуб")
+
+    def test_folder_keeps_the_size(self):
+        """А вот в имени ПАПКИ размер по §19.5 обязателен — и он не задваивается."""
+        self.assertEqual(self.plan().new_folder["name"], "Anatolia Elite 1290x157x12")
+
+    def test_mixed_sizes_leave_the_name_alone(self):
+        """Размеры разные — единого нет, вычитать из имени нечего."""
+        plan = plan_collection(_inp(
+            tm_name="Peli", product_type_name="Ламинат",
+            collection="Anatolia Elite 1290x157x12",
+            items=[{"op": "create", "article": "A1", "title": "Белый",
+                    "length": 1290, "width": 157, "thickness": 12},
+                   {"op": "create", "article": "A2", "title": "Серый",
+                    "length": 1290, "width": 190, "thickness": 8}]), [])
+        self.assertEqual(plan.collection, "Anatolia Elite 1290x157x12")
+
+
 class StoredPrecisionTest(unittest.TestCase):
     """СЛУЧАЙ С БОЯ (24.09.2026). Агент предлагал «коэффициент упаковки: 1,961 → 1,9608».
     1С хранит три знака после запятой, запись ничего бы не изменила, а правка возвращалась
