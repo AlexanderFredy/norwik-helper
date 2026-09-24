@@ -635,6 +635,36 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(TaskKind.MOVE_DISCONTINUED,
                          [t.kind for t in tools.collected])
 
+    async def test_normalization_of_a_foreign_mark_is_refused(self):
+        """СЛУЧАЙ С БОЯ (24.09.2026). Агент заказал нормализацию всего каталога AGT —
+        марки, о которой прайс Вестерхофа говорит двумя коллекциями из семи."""
+        many = [self.nom("R1", "3309", collection="Effect")] + [
+            self.nom(f"R{n}", f"X{n}", collection=name)
+            for n, name in enumerate(["Armonia Large", "Armonia Slim", "Concept Neo",
+                                      "Natura Line"], start=2)]
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec(many))
+        await self.compare(tools, ["3309"], collection="Effect")
+
+        out = await tools.execute("add_task", {
+            "kind": "нормализация наименований", "tm": "AGT", "tm_code": "T1",
+            "description": "привести к шаблону"})
+
+        self.assertIn("не его марка", out)
+        self.assertEqual(tools.collected, [])
+
+    async def test_normalization_of_the_own_mark_is_allowed(self):
+        """У своей марки прайс закрывает почти всё — работа законная."""
+        items = [self.nom("R1", "3309", collection="Effect"),
+                 self.nom("R2", "3310", collection="Cosmo")]
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec(items))
+        await self.compare(tools, ["3309"], collection="Effect")
+        await self.compare(tools, ["3310"], collection="Cosmo")
+
+        await tools.execute("add_task", {
+            "kind": "нормализация наименований", "tm": "Egger", "tm_code": "T1",
+            "description": "привести к шаблону"})
+        self.assertEqual(len(tools.collected), 1)
+
     async def test_foreign_mark_is_not_emptied_by_one_match(self):
         """СЛУЧАЙ С БОЯ (24.09.2026). Агент принял заводскую пометку прайса («Завод AGT»)
         за бренд, код нашёл артикулы одной коллекции под маркой AGT — и ВЕСЬ её каталог
