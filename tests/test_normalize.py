@@ -380,6 +380,20 @@ class DiscontinueTest(unittest.IsolatedAsyncioTestCase):
 
         return Fake()
 
+    def price(self, *lines):
+        """Прайс для проверки: что в нём написано, то и считается живым."""
+        import openpyxl
+        from io import BytesIO
+        wb = openpyxl.Workbook()
+        sheet = wb.active
+        sheet.append(["Артикул", "Наименование", "Цена"])
+        rows = lines or (("A999", "Дуб Совсем Другой", 1000),)
+        for row in rows:
+            sheet.append(list(row))
+        buf = BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
     def task_for(self, name="Brilliant", code=""):
         mark = Ref.make(code="000000311", names=["Most Flooring"])
         return PriceTask(kind=TaskKind.MOVE_DISCONTINUED,
@@ -397,25 +411,75 @@ class DiscontinueTest(unittest.IsolatedAsyncioTestCase):
     async def test_one_operation_moves_the_whole_folder(self):
         onec = self.onec([self.item_in("R1"), self.item_in("R2")],
                          [self.Folder("F-BR", "Коллекция Brilliant - 10 декоров")])
-        status, text = await run_discontinue(onec, self.task_for(code="F-BR"), allow)
+        status, text = await run_discontinue(onec, self.task_for(code="F-BR"), allow,
+                                              self.price())
 
         self.assertEqual(onec.ops, [{"op": "update_folder", "ref": "F-BR",
                                      "parent_ref": self.TARGET}])
         self.assertEqual(status, TaskStatus.DONE)
         self.assertIn("2 позиц", text)
 
+    async def test_part_of_the_collection_in_price_keeps_the_folder(self):
+        """СЛУЧАЙ С БОЯ (24.09.2026). Задача была про ОДИН декор «Бета», которого нет в
+        прайсе, а адресована коллекции COSMO — и папка уехала в снятые вместе с пятью
+        живыми позициями. «Целой» коллекция считается только по файлу."""
+        alive = self.item_in("R1")
+        object.__setattr__(alive, "site_name", "Альфа")
+        object.__setattr__(alive, "article", "")
+        gone = self.item_in("R2")
+        object.__setattr__(gone, "site_name", "Бета")
+        object.__setattr__(gone, "article", "")
+
+        onec = self.onec([alive, gone], [self.Folder("F-BR", "COSMO 33 КЛАСС")])
+        status, text = await run_discontinue(
+            onec, self.task_for(code="F-BR"), allow,
+            self.price(("CO 512", "Ламинат COSMO Альфа PELI", 1290)))
+
+        # папка осталась на месте, уехала одна позиция
+        self.assertEqual(onec.ops, [{"op": "update_item", "ref": "R2",
+                                     "parent_ref": self.TARGET}])
+        self.assertEqual(status, TaskStatus.DONE)
+        self.assertIn("папку не трогал", text)
+
+    async def test_whole_collection_in_price_moves_nothing(self):
+        """Прайс подтверждает всю коллекцию — значит задача устарела, и трогать нечего."""
+        alive = self.item_in("R1")
+        object.__setattr__(alive, "site_name", "Альфа")
+        object.__setattr__(alive, "article", "")
+
+        onec = self.onec([alive], [self.Folder("F-BR", "COSMO")])
+        status, text = await run_discontinue(
+            onec, self.task_for(code="F-BR"), allow,
+            self.price(("CO 512", "Ламинат COSMO Альфа PELI", 1290)))
+
+        self.assertIsNone(onec.ops)
+        self.assertEqual(status, TaskStatus.DONE)
+        self.assertIn("снимать нечего", text)
+
+    async def test_unreadable_price_stops_the_move(self):
+        """Необратимая операция не делается вслепую: не прочитав прайс, проверить
+        «ушла ли коллекция» нечем."""
+        onec = self.onec([self.item_in("R1")], [self.Folder("F-BR", "Brilliant")])
+        status, text = await run_discontinue(onec, self.task_for(code="F-BR"), allow,
+                                             b"not a table at all")
+        self.assertIsNone(onec.ops)
+        self.assertEqual(status, TaskStatus.TODO)
+        self.assertIn("не разобрался", text)
+
     async def test_empty_folder_still_moves(self):
         """Позиции могли уехать в снятые поодиночке раньше — папка остаётся живой, и
         убрать её всё равно надо. Ровно это и было с Brilliant."""
         onec = self.onec([self.item_in("R1", dead=True)],
                          [self.Folder("F-BR", "Коллекция Brilliant - 10 декоров")])
-        status, text = await run_discontinue(onec, self.task_for(code="F-BR"), allow)
+        status, text = await run_discontinue(onec, self.task_for(code="F-BR"), allow,
+                                              self.price())
         self.assertIsNotNone(onec.ops)
         self.assertIn("сняты раньше", text)
 
     async def test_already_discontinued_folder_is_left_alone(self):
         onec = self.onec([], [self.Folder("F-BR", "Brilliant", not_exported=True)])
-        status, text = await run_discontinue(onec, self.task_for(code="F-BR"), allow)
+        status, text = await run_discontinue(onec, self.task_for(code="F-BR"), allow,
+                                              self.price())
         self.assertIsNone(onec.ops)
         self.assertEqual(status, TaskStatus.DONE)
 
@@ -423,7 +487,8 @@ class DiscontinueTest(unittest.IsolatedAsyncioTestCase):
         """Перенос утащил бы соседей: позиции без своей папки лежат прямо в папке марки."""
         onec = self.onec([self.item_in("R1"), self.item_in("R2", collection="Accord")],
                          [self.Folder("F-BR", "Общая папка")])
-        status, text = await run_discontinue(onec, self.task_for(code="F-BR"), allow)
+        status, text = await run_discontinue(onec, self.task_for(code="F-BR"), allow,
+                                              self.price())
         self.assertIsNone(onec.ops)
         self.assertEqual(status, TaskStatus.TODO)
         self.assertIn("другие коллекции", text)
@@ -432,14 +497,14 @@ class DiscontinueTest(unittest.IsolatedAsyncioTestCase):
         """Задачи прежней версии кода папки не несут — ищем по имени как по слову."""
         onec = self.onec([self.item_in("R1")],
                          [self.Folder("F-BR", "Коллекция Brilliant - 10 декоров")])
-        status, _ = await run_discontinue(onec, self.task_for(), allow)
+        status, _ = await run_discontinue(onec, self.task_for(), allow, self.price())
         self.assertEqual(onec.ops[0]["ref"], "F-BR")
 
     async def test_ambiguous_name_moves_nothing(self):
         onec = self.onec([self.item_in("R1")],
                          [self.Folder("F1", "Brilliant"),
                           self.Folder("F2", "Brilliant Plus")])
-        status, text = await run_discontinue(onec, self.task_for(), allow)
+        status, text = await run_discontinue(onec, self.task_for(), allow, self.price())
         self.assertIsNone(onec.ops)
         self.assertEqual(status, TaskStatus.TODO)
 
@@ -452,7 +517,8 @@ class DiscontinueTest(unittest.IsolatedAsyncioTestCase):
         onec = self.onec([self.item_in("R1")],
                          [self.Folder("F-BR", "Brilliant")])
         with self.assertRaises(WriteRefused):
-            await run_discontinue(onec, self.task_for(code="F-BR"), deny)
+            await run_discontinue(onec, self.task_for(code="F-BR"), deny,
+                                  self.price())
         self.assertIsNone(onec.ops)
 
 

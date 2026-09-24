@@ -1009,8 +1009,59 @@ async def run_normalization(onec, task, guard, scope=None):
     return status, text
 
 
-async def run_discontinue(onec, task, guard):
+def _price_haystack(content: bytes, filename: str = "price.xlsx") -> str:
+    """Весь текст прайса одной строкой, без разделителей и регистра.
+
+    Артикул в ячейке слеплен с названием и размером («…Альфа PELI (CO 512) 1290*190*8мм»),
+    поэтому сравнение «ячейка = артикул» не находит ничего, а поиск по склеенному тексту —
+    находит.
+    """
+    if not content:
+        return ""
+    try:
+        sheets = parse_price_table(content, filename or "price.xlsx") or []
+    except Exception:                                   # noqa: BLE001
+        logger.warning("Прайс не разобрался при проверке снятия", exc_info=True)
+        return ""
+
+    parts = []
+    for sheet in sheets:
+        for row in sheet.rows:
+            for cell in row:
+                text = str(cell or "")
+                if text.strip():
+                    parts.append("".join(ch for ch in text.lower() if ch.isalnum()))
+    return " ".join(parts)
+
+
+def _seen_in_price(item, haystack: str) -> bool:
+    """Стоит ли позиция в прайсе — по артикулу либо по названию расцветки.
+
+    Артикулы короче трёх знаков не проверяем: «12» найдётся в любом размере. Расцветка —
+    от четырёх букв: короткие слова совпадают случайно.
+    """
+    if not haystack:
+        return False
+
+    key = norm_article(getattr(item, "article", ""))
+    if len(key) >= 3 and key in haystack:
+        return True
+
+    title = getattr(item, "site_name", "") or ""
+    flat = "".join(ch for ch in title.lower() if ch.isalnum())
+    return len(flat) >= 4 and flat in haystack
+
+
+async def run_discontinue(onec, task, guard, content: bytes = b"",
+                          filename: str = "price.xlsx"):
     """Перенос ЦЕЛОЙ коллекции в снятые — кодом, одним вызовом (§6.2).
+
+    **«ЦЕЛОЙ» ПРОВЕРЯЕТСЯ ПО ПРАЙСУ, А НЕ ПРИНИМАЕТСЯ НА ВЕРУ.** Задача приходит с адресом
+    коллекции, но описание может быть про ОДНУ позицию: у Вестерхофа агент завёл снятие
+    COSMO из-за единственного декора «Бета», которого нет в прайсе, — и папка уехала в
+    снятые вместе с пятью живыми (бой 24.09.2026). Поэтому перед переносом код сам смотрит
+    в файл: что в прайсе есть — остаётся, чего нет — уходит поштучно, и только когда нет
+    НИЧЕГО, двигается папка целиком.
 
     **ПЕРЕНОСИМ ПАПКУ, А НЕ ПОЗИЦИИ.** Коллекция ушла из прайса целиком, значит и в снятые
     она уходит целиком: одна операция `update_folder` вместо N штук `update_item`. Агент,
@@ -1059,12 +1110,45 @@ async def run_discontinue(onec, task, guard):
                 f"({', '.join(strangers[:5])}) — перенос утащил бы их следом. "
                 "Разберите папку либо перенесите позиции по одной.")
 
+    # ЧТО ИЗ КОЛЛЕКЦИИ ЕЩЁ СТОИТ В ПРАЙСЕ. Необратимая операция обязана опираться на
+    # файл, а не на формулировку задачи: её писала модель.
+    haystack = _price_haystack(content, filename)
+    if live and not haystack:
+        return (TaskStatus.TODO,
+                "Прайс не разобрался — проверить, ушла ли коллекция из него, нечем. "
+                "Перенос не делал: он необратим, а гадать тут нельзя.")
+
+    staying = [i for i in live if _seen_in_price(i, haystack)]
+    leaving = [i for i in live if i not in staying]
+
+    if live and not leaving:
+        return (TaskStatus.DONE,
+                f"Все {len(live)} позиц. коллекции «{wanted}» стоят в этом прайсе — "
+                "снимать нечего, ничего не трогал.")
+
     # Вид товара берём у позиций коллекции; если их не осталось — у папки.
     type_ref = (mine[0].product_type_ref if mine else folder.product_type_ref)
     target = dc.folder_for(type_ref)
     if not target:
         return (TaskStatus.TODO,
                 dc.refusal(type_ref, mine[0].product_type if mine else ""))
+
+    # ЧАСТЬ КОЛЛЕКЦИИ ОСТАЁТСЯ — двигаем ПОЗИЦИИ, а не папку. Папка с живыми товарами
+    # внутри уехать в снятые не может: это и есть та ошибка, ради которой проверка.
+    if staying:
+        guard()
+        result = await asyncio.to_thread(
+            onec.set_items,
+            [{"op": "update_item", "ref": i.ref, "parent_ref": target} for i in leaving])
+        errors = result.get("errors") or []
+        text = (f"Перенесено в снятые ({target}) поштучно: {len(leaving)} поз. "
+                f"({', '.join((i.site_name or i.name)[:20] for i in leaving[:5])}). "
+                f"Остальные {len(staying)} поз. коллекции «{wanted}» есть в прайсе — "
+                f"папку не трогал.")
+        if errors:
+            return (TaskStatus.PARTIAL, text + "\nОшибки 1С: "
+                    + "; ".join(f"{e.get('code')} {e.get('message')}" for e in errors[:3]))
+        return TaskStatus.DONE, text
 
     guard()
     result = await asyncio.to_thread(
@@ -1162,7 +1246,8 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
     # Задача про ОДИН товар остаётся агенту: там надо понять, что именно снимают.
     if (task.kind == TaskKind.MOVE_DISCONTINUED
             and task.subject == TaskSubject.COLLECTION):
-        return await run_discontinue(onec, task, guard)
+        return await run_discontinue(onec, task, guard, content,
+                                     price.supplier_price.filename)
 
     tools = TaskTools(onec, content, price.supplier_price.filename, guard,
                       scope=scope, kind=task.kind, offers=offers,
