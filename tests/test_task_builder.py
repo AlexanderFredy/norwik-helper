@@ -354,10 +354,13 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
             properties=tuple(ItemProperty(property=p, code="", value=v, value_code="")
                              for p, v in props))
 
-    async def compare(self, tools, articles, collection="Vintage", columns=None):
+    async def compare(self, tools, articles, collection="Vintage", columns=None,
+                      titles=None):
         inp = {"tm_code": "T1", "collection": collection, "articles": articles}
         if columns:
             inp["price_columns"] = columns
+        if titles:
+            inp["titles"] = titles
         out = await tools.execute("compare_with_1c", inp)
         return json.loads(out)
 
@@ -515,6 +518,51 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("заводить заново НЕЛЬЗЯ", blind["вывод"])
         # к каждой позиции приложена строка прайса — по ней и проставят артикул
         self.assertIn("Дуб Авила", blind["позиции"][0]["строка_прайса"])
+
+    async def test_titles_match_inside_the_collection(self):
+        """ВТОРОЙ КЛЮЧ (решение админа 24.09.2026). У «Vivace» артикулов нет вовсе, и
+        сверка по артикулу отвечает «не нашлось ничего» — то есть не отвечает."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "", site="Альфа", collection="Vivace"),
+            self.nom("R2", "", site="Вега", collection="Vivace"),
+        ]))
+        got = await self.compare(tools, [], collection="Vivace",
+                                 titles=["Альфа", "Вега", "Сигма"])
+
+        сводка = got["сверка_по_названиям"]
+        self.assertEqual(сводка["нашлось_по_названию"], 2)
+        self.assertEqual(сводка["нет_в_1С_по_названию"], ["Сигма"])
+
+    async def test_ambiguous_title_counts_as_not_found(self):
+        """Имя подошло к двум карточкам — угадывать нельзя, говорим об этом."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "", site="Альфа", collection="Vivace"),
+            self.nom("R2", "", site="Альфа", collection="Vivace"),
+        ]))
+        got = await self.compare(tools, [], collection="Vivace", titles=["Альфа"])
+
+        сводка = got["сверка_по_названиям"]
+        self.assertEqual(сводка["нашлось_по_названию"], 0)
+        self.assertEqual(сводка["неоднозначные_названия"], ["Альфа"])
+
+    async def test_titles_do_not_leak_into_another_collection(self):
+        """«Дуб Медовый» есть и в Vivace, и в Modern: через марку целиком — никогда."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "", site="Дуб Медовый", collection="Modern"),
+        ]))
+        got = await self.compare(tools, [], collection="Vivace",
+                                 titles=["Дуб Медовый"])
+        self.assertNotIn("сверка_по_названиям", got)
+
+    async def test_articles_win_when_they_exist(self):
+        """Есть артикулы — решают они, имена не участвуют вовсе."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", site="Альфа", collection="Vivace"),
+        ]))
+        got = await self.compare(tools, ["3309"], collection="Vivace",
+                                 titles=["Совсем Другое Имя"])
+        self.assertEqual(got["нашлось_в_1С"], 1)
+        self.assertNotIn("сверка_по_названиям", got)
 
     async def test_collection_with_articles_gives_no_such_warning(self):
         tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
