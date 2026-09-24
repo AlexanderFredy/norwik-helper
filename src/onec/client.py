@@ -276,6 +276,15 @@ PAGE_SIZE = 25
 #: отвечают за полсекунды, так что три секунды — это уже «идёт что-то тяжёлое».
 SLOW_CALL_SECONDS = 3.0
 
+#: Сколько ждать СТРАНИЦУ выгрузки и сколько — ОДНУ позицию. Замер на боевой базе
+#: (24.09.2026): страница из 25 позиций — 3,3 с, одна позиция — 1,2–1,9 с. Больная
+#: карточка не отвечает НИКОГДА, и общий таймаут в две минуты тратился на неё целиком:
+#: шесть таких карточек — двенадцать минут прогона впустую. Пределы здесь заведомо
+#: щедрые (в десятки раз против замера), но конечные: ждать больше нечего — ответа не
+#: будет, а ждущий запрос всё это время держит и нашу очередь, и работу в 1С.
+PAGE_TIMEOUT = 45.0
+ITEM_TIMEOUT = 20.0
+
 
 def _pointless_to_repeat(exc: Exception) -> bool:
     """Ждать дольше бессмысленно: сервер ПРИНЯЛ запрос и не ответил вовремя.
@@ -305,9 +314,15 @@ class OnecClient:
     def close(self) -> None:
         self._client.close()
 
-    def _get(self, path: str, params: dict | None = None) -> httpx.Response:
-        """GET с повторами. Сеть до 1С рвётся по двум разным поводам, и оба штатные."""
-        return self._retry(lambda: self._client.get(path, params=params), path)
+    def _get(self, path: str, params: dict | None = None,
+             timeout: float | None = None) -> httpx.Response:
+        """GET с повторами. Сеть до 1С рвётся по двум разным поводам, и оба штатные.
+
+        `timeout` задаётся там, где известна цена ответа: выгрузка номенклатуры знает,
+        что здоровая страница приходит за секунды, и ждать её две минуты незачем.
+        """
+        kw = {} if timeout is None else {"timeout": timeout}
+        return self._retry(lambda: self._client.get(path, params=params, **kw), path)
 
     def _retry(self, call, label: str = ""):
         """Повторить запрос, если оборвалась СВЯЗЬ. Медленный ответ не повторяется.
@@ -380,7 +395,8 @@ class OnecClient:
 
     def by_tm(self, tm_code: str, page: int = 1, size: int = 200,
               include_not_exported: bool = False,
-              product_type: str | None = None) -> NomenclaturePage:
+              product_type: str | None = None,
+              timeout: float | None = None) -> NomenclaturePage:
         """Номенклатура марки постранично.
 
         `include_not_exported` включает НЕВЫГРУЖАЕМЫЕ позиции — прежде всего снятые с
@@ -393,7 +409,7 @@ class OnecClient:
             params["include_not_exported"] = 1
         if product_type:
             params["product_type"] = product_type
-        r = self._get("/get-products/by-tm", params=params)
+        r = self._get("/get-products/by-tm", params=params, timeout=timeout)
         r.raise_for_status()
         data = _loads_bom(r.content)
         items = []
@@ -675,14 +691,96 @@ class OnecClient:
         24.09.2026 те же три позиции отвечали то за 2 секунды, то за 38. Много коротких
         запросов дешевле одного длинного — для нас и для базы.
         """
-        kw = {"include_not_exported": include_not_exported, "product_type": product_type}
-        first = self.by_tm(tm_code, page=1, size=size, **kw)
-        items = list(first.items)
-        errors = list(first.errors)
-        pages = (first.total + size - 1) // size if size else 1
-        for page in range(2, min(pages, max_pages) + 1):
-            chunk = self.by_tm(tm_code, page=page, size=size, **kw)
-            items.extend(chunk.items)
-            errors.extend(chunk.errors)
-        return Nomenclature(tm=first.tm or tm_code, total=first.total, items=items,
+        kw = {"include_not_exported": include_not_exported, "product_type": product_type,
+              "timeout": PAGE_TIMEOUT}
+        items: list = []
+        errors: list = []
+        tm_name = ""
+        total: int | None = None
+
+        for page in range(1, max_pages + 1):
+            try:
+                chunk = self._page_once_more(tm_code, page, size, kw)
+            except httpx.TimeoutException:
+                # СТРАНИЦУ РАЗБИРАЕМ ПО ОДНОЙ, а не теряем целиком. Бывает карточка, на
+                # которой обработчик 1С встаёт намертво, и одна такая уносила с собой всю
+                # марку: сборщик задач оставался вообще без выгрузки (бой 24.09.2026,
+                # Вестерхоф — три карточки из 83, соседние отвечали за 1,5 с).
+                logger.warning("Страница %d марки %s не отдалась целиком — разбираем "
+                               "по одной позиции", page, tm_code)
+                got, failed, seen = self._page_by_item(tm_code, page, size, kw)
+                items.extend(got)
+                errors.extend(failed)
+                if seen is not None:
+                    total = seen
+            else:
+                tm_name = tm_name or (chunk.tm or "")
+                total = chunk.total
+                items.extend(chunk.items)
+                errors.extend(chunk.errors)
+
+            # Размер марки известен только из ответа: не ответила НИ ОДНА позиция
+            # страницы — продолжать вслепую нечем.
+            if total is None or page * size >= total:
+                break
+
+        return Nomenclature(tm=tm_name or tm_code, total=total or len(items), items=items,
                             errors=errors)
+
+    def _page_once_more(self, tm_code: str, page: int, size: int, kw: dict):
+        """Страница с ОДНОЙ повторной попыткой.
+
+        Замер на боевой базе 24.09.2026: тридцать ОДИНАКОВЫХ запросов подряд по одной и
+        той же позиции — двенадцать отвечают за 1,3 с, тринадцатый не отвечает вовсе, и
+        так по кругу с шагом ровно в тринадцать (споткнулись №13 и №26). Карточка при
+        этом здорова: до и после она отдаётся за ту же секунду. Значит теряется не запрос
+        и не данные, а ритм обслуживания на стороне 1С.
+
+        Отсюда ровно ОДИН повтор. Пять (как было) клали на базу пять тяжёлых выгрузок,
+        потому что 1С не отменяет работу брошенного запроса, — об этом `_pointless_to_repeat`.
+        Ноль повторов терял каждую тринадцатую страницу на ровном месте.
+        """
+        try:
+            return self.by_tm(tm_code, page=page, size=size, **kw)
+        except httpx.TimeoutException:
+            logger.info("Страница %d марки %s не ответила — пробуем ещё раз", page, tm_code)
+            return self.by_tm(tm_code, page=page, size=size, **kw)
+
+    def _page_by_item(self, tm_code: str, page: int, size: int,
+                      kw: dict) -> tuple[list, list, int | None]:
+        """Собрать страницу поштучно. Возвращает (позиции, ошибки, всего у марки).
+
+        Порядок выдачи у обработчика устойчивый (по коду номенклатуры), поэтому страница
+        `page` размера `size` — это ровно позиции с `(page-1)*size + 1` по `page*size`, и
+        каждую можно спросить отдельно запросом размера 1.
+
+        Позиция, не ответившая и в одиночку, становится ОШИБКОЙ в выгрузке — той же, какие
+        обработчик 1С отдаёт по сбойным карточкам сам. Молча пропустить её нельзя: пропажа
+        позиции из выгрузки читается агентом как «товара в 1С нет», а это прямой путь к
+        дублю.
+        """
+        items, errors = [], []
+        total = None
+        first = (page - 1) * size + 1
+
+        one_by_one = dict(kw, timeout=ITEM_TIMEOUT)
+        for index in range(first, first + size):
+            try:
+                # Повтор ОДИН — по той же причине, что и у страницы: теряется каждый
+                # тринадцатый запрос подряд, а не конкретная карточка.
+                one = self._page_once_more(tm_code, index, 1, one_by_one)
+            except httpx.TimeoutException:
+                errors.append({
+                    "ref": "", "code": "item_timeout",
+                    "message": f"позиция №{index} марки не отдаётся: 1С молчит. "
+                               f"Карточка стоит между соседними по коду номенклатуры",
+                })
+                continue
+            total = one.total
+            if not one.items:
+                break                                   # вышли за конец марки
+            items.extend(one.items)
+            if index >= one.total:
+                break
+
+        return items, errors, total

@@ -469,6 +469,108 @@ class PageSizeTest(unittest.TestCase):
         self.assertEqual(len(seen), 3)
 
 
+class BadCardTest(unittest.TestCase):
+    """Одна больная карточка не имеет права уносить всю марку (бой 24.09.2026).
+
+    У Вестерхофа три карточки из 83 не отдаются вовсе: обработчик 1С встаёт на них
+    намертво, соседние отвечают за полторы секунды. Страница с такой карточкой уходила в
+    таймаут целиком, и сборщик задач оставался без выгрузки — то есть марка была
+    недоступна из-за трёх позиций.
+    """
+
+    def client(self, handler):
+        c = OnecClient("http://example.invalid/api", "token", retries=1, backoff=0)
+        c._client = httpx.Client(base_url="http://example.invalid/api",
+                                 transport=httpx.MockTransport(handler))
+        return c
+
+    #: Марка из четырёх позиций, вторая — больная: любой запрос, который её захватывает,
+    #: не отвечает вовсе. Ровно так ведёт себя 1С на бою.
+    MARK = ["YO-1", "YO-2", "YO-3", "YO-4"]
+    POISONED = "YO-2"
+
+    def answer(self, page: int, size: int) -> dict:
+        chunk = self.MARK[(page - 1) * size:page * size]
+        if self.POISONED in chunk:
+            raise httpx.ReadTimeout("timed out")
+        return {"tm": "Westerhof", "total": len(self.MARK), "offset": page, "limit": size,
+                "items": [{"ref": r, "name": f"Ламинат {r}", "article": r, "prices": []}
+                          for r in chunk],
+                "errors": []}
+
+    def test_page_is_split_and_the_bad_card_becomes_an_error(self):
+        seen = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            params = dict(request.url.params)
+            seen.append((params["page"], params["size"]))
+            return httpx.Response(200, json=self.answer(int(params["page"]),
+                                                        int(params["size"])))
+
+        nom = self.client(handler).by_tm_all("T1", size=2)
+
+        # первая и третья позиции доехали, четвёртая тоже: потеряна ровно одна
+        self.assertEqual([i.ref for i in nom.items], ["YO-1", "YO-3", "YO-4"])
+        self.assertEqual([e["code"] for e in nom.errors], ["item_timeout"])
+        self.assertIn("№2", nom.errors[0]["message"])
+        # страница разобрана по одной, и только та, что не отдалась
+        self.assertIn(("1", "1"), seen)
+        self.assertIn(("2", "1"), seen)
+
+    def test_transient_hiccup_is_recovered_by_one_retry(self):
+        """Каждый ТРИНАДЦАТЫЙ запрос 1С не отвечает вовсе (замер 24.09.2026: тридцать
+        одинаковых запросов подряд, споткнулись №13 и №26, карточка здорова и до, и
+        после). Такое лечится одной повторной попыткой — и разбирать страницу по одной
+        из-за этого не нужно."""
+        self.POISONED = ""                              # больных карточек в марке нет
+        state = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            state["n"] += 1
+            if state["n"] == 1:                         # первый запрос попал в провал
+                raise httpx.ReadTimeout("timed out")
+            params = dict(request.url.params)
+            return httpx.Response(200, json=self.answer(int(params["page"]),
+                                                        int(params["size"])))
+
+        nom = self.client(handler).by_tm_all("T1", size=2)
+        self.assertEqual([i.ref for i in nom.items], self.MARK, "марка доехала целиком")
+        self.assertEqual(nom.errors, [])
+        # три запроса: провалившийся, его повтор и вторая страница — разбора по одной нет
+        self.assertEqual(state["n"], 3)
+
+    def test_waiting_is_bounded(self):
+        """Ждать больную карточку общие две минуты незачем: ответа не будет вовсе, а
+        запрос всё это время держит и нашу очередь, и работу в 1С."""
+        from src.onec.client import ITEM_TIMEOUT, PAGE_TIMEOUT
+        waits = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            params = dict(request.url.params)
+            waits.append((int(params["size"]),
+                          request.extensions.get("timeout", {}).get("read")))
+            return httpx.Response(200, json=self.answer(int(params["page"]), int(params["size"])))
+
+        self.client(handler).by_tm_all("T1", size=2)
+        self.assertEqual({w for s, w in waits if s > 1}, {PAGE_TIMEOUT})
+        self.assertEqual({w for s, w in waits if s == 1}, {ITEM_TIMEOUT})
+
+    def test_whole_mark_survives_when_the_first_page_is_poisoned(self):
+        """Размер марки известен только из ответа: если первая страница не отдалась
+        целиком, его приносит первая же уцелевшая позиция."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            params = dict(request.url.params)
+            size, page = int(params["size"]), int(params["page"])
+            if size > 1:                                # страницами не отдаётся вовсе
+                raise httpx.ReadTimeout("timed out")
+            return httpx.Response(200, json=self.answer(page, size))
+
+        nom = self.client(handler).by_tm_all("T1", size=2)
+        self.assertEqual(nom.total, 4)
+        self.assertEqual([i.ref for i in nom.items], ["YO-1", "YO-3", "YO-4"])
+        self.assertEqual(len(nom.errors), 1, "потеряна ровно больная карточка")
+
+
 class RetryPolicyTest(unittest.TestCase):
     """Что повторяем, а что нет (бой 24.09.2026).
 
