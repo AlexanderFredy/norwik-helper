@@ -364,6 +364,48 @@ class BracketsTest(unittest.TestCase):
                          "Ламинат Egger Vintage Дуб Медовый")
 
 
+class TitleCaseTest(unittest.TestCase):
+    """Капс в названии расцветки (решение админа 24.09.2026).
+
+    Агент завёл «Ламинат Westerhof Cosmo PERSEUS» — так свёрстана таблица поставщика, а
+    не назван товар.
+    """
+
+    def test_shouting_latin_word(self):
+        from src.price_tool.naming import title_case
+        self.assertEqual(title_case("PERSEUS"), "Perseus")
+        self.assertEqual(title_case("ORPHEUS"), "Orpheus")
+
+    def test_whole_phrase_in_caps(self):
+        """Кричит вся строка — правятся все слова, даже короткие."""
+        from src.price_tool.naming import title_case
+        self.assertEqual(title_case("ДУБ МЕДОВЫЙ"), "Дуб Медовый")
+        self.assertEqual(title_case("WHITE OAK"), "White Oak")
+
+    def test_authors_case_is_left_alone(self):
+        """«Дуб серый» — авторское написание, переделывать его никто не просил."""
+        from src.price_tool.naming import title_case
+        self.assertEqual(title_case("Дуб серый"), "Дуб серый")
+        self.assertEqual(title_case("адана"), "адана")
+
+    def test_short_abbreviations_survive(self):
+        """«SPC» и «EIR» — сокращения, там регистр значащий."""
+        from src.price_tool.naming import title_case
+        self.assertEqual(title_case("SPC Дуб"), "SPC Дуб")
+        self.assertEqual(title_case("SPC"), "SPC")
+
+    def test_tokens_with_digits_and_signs_survive(self):
+        from src.price_tool.naming import title_case
+        self.assertEqual(title_case("AC5"), "AC5")
+        self.assertEqual(title_case("Onyx&More"), "Onyx&More")
+
+    def test_name_is_built_with_the_fixed_case(self):
+        from src.price_tool.items import build_name
+        self.assertEqual(
+            build_name("Ламинат", "Westerhof / Вестерхоф", "COSMO", "PERSEUS"),
+            "Ламинат Westerhof Cosmo Perseus")
+
+
 class TradeMarkInNameTest(unittest.TestCase):
     """СЛУЧАЙ С БОЯ (22.09.2026). Нормализация Westerhof дала «Ламинат Westerhof /
     Вестерхоф Bellini Cappuccino»: имя марки в справочнике 1С двуязычное, и в наименование

@@ -158,6 +158,43 @@ def _brackets(text: str) -> str:
 _WORD_ONLY = re.compile(r"^[A-Za-zА-ЯЁа-яё]{2,}$")
 
 
+#: Со скольких букв слово, набранное КАПСОМ, считается криком вёрстки, а не сокращением.
+#: Три буквы — это «SPC», «EIR», «AGT», «NEW»: там регистр несёт смысл. Четыре и больше —
+#: «GOLD», «WHITE», «PERSEUS»: так поставщик набрал таблицу, а не назвал товар.
+CAPS_WORD_MIN = 4
+
+
+def title_case(value: str | None) -> str:
+    """Название расцветки: КАПС приводится к «первая заглавная, остальные строчные».
+
+    Решение админа 24.09.2026: агент завёл «Ламинат Westerhof Cosmo PERSEUS», а надо
+    «Perseus». Поставщик пишет декоры прописными просто потому, что так свёрстана таблица.
+
+    ТРОГАЕМ ТОЛЬКО СЛОВА ЦЕЛИКОМ ИЗ ЗАГЛАВНЫХ, и только длинные. Всё остальное остаётся
+    как есть: «Дуб серый» — авторское написание, и переделывать его в «Дуб Серый» никто не
+    просил; «AC5» и «Onyx&More» — не слова вовсе; «SPC» и «EIR» — сокращения, где регистр
+    значащий.
+    """
+    words = str(value or "").split(" ")
+    letters = [w for w in words if w.isalpha()]
+
+    # ВСЁ НАЗВАНИЕ КАПСОМ — кричит вся строка, и тогда правятся ВСЕ слова, даже короткие:
+    # «ДУБ МЕДОВЫЙ» → «Дуб Медовый». Длинное слово в строке обязано быть: заголовок из
+    # одних сокращений («SPC», «EIR») — не крик, а термины.
+    shouting = (bool(letters)
+                and all(w == w.upper() for w in letters)
+                and max(len(w) for w in letters) >= CAPS_WORD_MIN)
+
+    out = []
+    for word in words:
+        capsy = word.isalpha() and word == word.upper()
+        if capsy and (shouting or len(word) >= CAPS_WORD_MIN):
+            out.append(word[0].upper() + word[1:].lower())
+        else:
+            out.append(word)
+    return " ".join(out)
+
+
 def tm_for_name(value: str | None) -> str:
     """Марка ДЛЯ НАИМЕНОВАНИЯ: из двуязычного «Westerhof / Вестерхоф» берётся первая часть.
 

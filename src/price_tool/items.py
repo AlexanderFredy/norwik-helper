@@ -31,7 +31,7 @@ from src.price_tool import discontinued
 from src.price_tool.naming import (collection_case, collection_from_folder,
                                    drop_own_article, ensure_type_prefix, folder_name,
                                    format_size, size_in_folder, size_in_name, tidy,
-                                   tm_for_name, uniform_size, violations)
+                                   title_case, tm_for_name, uniform_size, violations)
 
 # Поля, изменение которых показывается админу и менеджерам поимённо (§19.9).
 WATCHED = ("parent_ref", "collection", "article", "unit", "pack_coefficient",
@@ -101,9 +101,15 @@ def build_name(product_type: str, tm: str, collection: str, title: str,
     бы, а дополнялось.
     """
     coll = collection_case(collection)
+    # НАЗВАНИЕ РАСЦВЕТКИ ПРИВОДИТСЯ К ТОМУ ЖЕ РЕГИСТРУ, ЧТО И КОЛЛЕКЦИЯ (решение админа
+    # 24.09.2026): «PERSEUS» → «Perseus». Поставщик пишет декоры капсом просто потому, что
+    # так свёрстана таблица, и в карточке это выглядит криком. Правило берётся ГОТОВОЕ —
+    # то же `collection_case` с его исключениями: токен с цифрами («AC5», «LQ-01»), токен
+    # со знаком («Onyx&More») и односимвольный не трогаются, иначе испортили бы настоящее
+    # имя.
     # Марка берётся В ФОРМЕ ДЛЯ ИМЕНИ: двуязычное «Westerhof / Вестерхоф» в наименовании
     # даёт обе формы подряд вместе с косой чертой.
-    parts = [tm_for_name(tm), coll, title, tail]
+    parts = [tm_for_name(tm), coll, title_case(title), tail]
     body = " ".join(p for p in (str(x or "").strip() for x in parts) if p)
     return tidy(ensure_type_prefix(body, product_type))
 
@@ -114,7 +120,7 @@ def site_name(title: str, tail: str = "") -> str:
     Ни вида товара, ни марки, ни коллекции: они на сайте и так известны из карточки. Артикул
     сюда тоже не дописывается — на боевой базе он там оказался и был убран как отсебятина.
     """
-    return tidy(" ".join(p for p in (str(title or "").strip(),
+    return tidy(" ".join(p for p in (title_case(str(title or "").strip()),
                                      str(tail or "").strip()) if p))
 
 
