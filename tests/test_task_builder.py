@@ -612,6 +612,28 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(TaskKind.MOVE_DISCONTINUED,
                          [t.kind for t in tools.collected])
 
+    async def test_foreign_mark_is_not_emptied_by_one_match(self):
+        """СЛУЧАЙ С БОЯ (24.09.2026). Агент принял заводскую пометку прайса («Завод AGT»)
+        за бренд, код нашёл артикулы одной коллекции под маркой AGT — и ВЕСЬ её каталог
+        поехал в снятие. Прайс, закрывший одну коллекцию чужой марки, о прочих не говорит
+        ничего."""
+        from src.model.task_builder import _add_discontinued_candidates
+
+        many = [self.nom("R1", "3309", collection="Effect")] + [
+            self.nom(f"R{n}", f"X{n}", collection=name)
+            for n, name in enumerate(["Armonia Large", "Armonia Slim", "Concept Neo",
+                                      "Natura Line"], start=2)]
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec(many))
+        await self.compare(tools, ["3309"], collection="Effect")
+        await tools.execute("add_task", {"kind": "изменение цен", "tm": "AGT",
+                                         "tm_code": "T1", "collection": "Effect",
+                                         "description": "цены"})
+
+        notes = _add_discontinued_candidates(tools)
+        self.assertNotIn(TaskKind.MOVE_DISCONTINUED,
+                         [t.kind for t in tools.collected])
+        self.assertIn("не его марка", " ".join(notes))
+
     async def test_collection_absent_from_the_file_is_still_discontinued(self):
         """Проверка по файлу не должна глушить правило: чего в прайсе нет, то кандидат."""
         from src.model.task_builder import _add_discontinued_candidates
