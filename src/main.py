@@ -24,6 +24,7 @@ from src.storage.pricing import PricingStore
 from src.model.service import PriceListService
 from src.storage.command_queue import CommandQueue
 from src.storage.model_store import ModelStore
+from src.storage.sent_commands import SentCommands
 from src.storage.sightings import SightingStore
 from src.storage.suppliers import SupplierStore
 from src.storage.users import UserStore
@@ -173,7 +174,11 @@ async def main() -> None:
     # зеркало выровняется один раз при подъёме и застынет.
     providers = [TelegramProvider()]
     if onec is not None:
-        onec_provider = OnecProvider(onec, model, supplier_store)
+        # Связки «команда очереди → команда 1С» хранятся в БАЗЕ: перезапуск процесса
+        # между «принята» и исходом иначе запирает форму навсегда (24.09.2026).
+        sent_commands = SentCommands(config.db_path)
+        await sent_commands.init()
+        onec_provider = OnecProvider(onec, model, supplier_store, sent=sent_commands)
         providers.append(onec_provider)
         model.events.subscribe(onec_provider)
         logger.info("Форма 1С подключена как второй визуал")

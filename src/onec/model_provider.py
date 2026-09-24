@@ -85,10 +85,14 @@ class OnecProvider(Listener):
     этом можно только от модели. Признак «менялось» ставит `notify`, снимает `collect`.
     """
 
-    def __init__(self, onec, service, suppliers=None) -> None:
+    def __init__(self, onec, service, suppliers=None, sent=None) -> None:
         self._onec = onec
         self._service = service
         self._suppliers = suppliers
+        # Хранилище связок «команда очереди → команда 1С» (`src/storage/sent_commands.py`).
+        # Без него провайдер работает по-старому, в памяти: это годится для тестов, но не
+        # для боевой работы — перезапуск процесса запирает форму навсегда.
+        self._store = sent
         # Состояние считается изменившимся ИЗНАЧАЛЬНО: после подъёма процесса зеркало в 1С
         # могло остаться от прошлой жизни, и первый же оборот обязан его выровнять.
         self._dirty = True
@@ -97,6 +101,9 @@ class OnecProvider(Listener):
         # в одну строку, и завершать надо обе — иначе на форме навсегда останется гореть
         # колесико ожидания по команде, которой уже нет.
         self._sent: dict[int, list[str]] = {}
+        # Карта поднимается из базы ОДИН раз, на первом обороте: дальше её ведёт сам
+        # провайдер, и лишний SELECT каждые пять секунд ничего бы не добавил.
+        self._restored = False
         # (инициатор, прайс, задача) → причина отказа. Заполняет `notify`, читает `collect`.
         self._refusals: dict[tuple, str] = {}
         # id команды в очереди → тот же ключ: событие отказа идентификатора не несёт, и
@@ -148,7 +155,12 @@ class OnecProvider(Listener):
 
         «Нет в очереди» — единственный надёжный признак завершения: команду удаляет тот, кто
         её обработал, и это происходит и на успехе, и на отказе.
+
+        **Связки поднимаются из базы**, иначе перезапуск процесса запирает форму: команда,
+        взятая до остановки, после подъёма отрабатывается заново — но идентификатора
+        команды 1С агент уже не знает, и колесико ожидания горит вечно (случай 24.09.2026).
         """
+        await self._restore()
         if not self._sent:
             return
 
@@ -162,28 +174,90 @@ class OnecProvider(Listener):
         for qid in finished:
             # Причина считается ОДИН РАЗ на команду очереди, а не на каждый внешний
             # идентификатор: схлопнутые команды — это одна работа с одним исходом, и
-            # второе обращение к `_take_refusal` вернуло бы пустоту, отчего одна из двух
-            # кнопок в форме показала бы «выполнена» вместо отказа.
-            reason = self._take_refusal(qid)
+            # второе обращение вернуло бы пустоту, отчего одна из двух кнопок в форме
+            # показала бы «выполнена» вместо отказа.
+            reason = self._refusal_for(qid)
             state = "отклонена" if reason else "выполнена"
-            for external in self._sent.pop(qid, []):
+            for external in self._sent.get(qid, []):
                 items.append({"id": external, "state": state, "message": reason})
 
         if items:
+            # ЗАБЫВАЕМ ТОЛЬКО ПОСЛЕ УСПЕХА. Раньше карта чистилась до отправки, и
+            # оборванный ответ уносил связку с собой — колесико оставалось гореть по
+            # команде, исход которой мы знали. Исключение выпускает наружу `collect`,
+            # который его ловит; связки остаются, и следующий оборот повторит попытку.
             await asyncio.to_thread(self._onec.agent_commands_state, items)
 
-    def _take_refusal(self, queue_id: int) -> str:
+        for qid in finished:
+            await self._forget(qid)
+
+    async def _remember(self, queue_id: int, external: str) -> None:
+        """Записать связку в базу. Сбой записи команду не роняет — она уже в очереди, и
+        отказаться от неё сейчас значило бы потерять нажатие админа; в худшем случае
+        форма останется запертой, как было до появления хранилища."""
+        if self._store is None:
+            return
+        try:
+            await self._store.remember(queue_id, external)
+        except Exception:                               # noqa: BLE001
+            logger.warning("Связка команды %s → %s не записалась", queue_id, external,
+                           exc_info=True)
+
+    async def _restore(self) -> None:
+        """Поднять связки из базы. Один раз за жизнь процесса."""
+        if self._restored:
+            return
+        self._restored = True
+        if self._store is None:
+            return
+        try:
+            saved = await self._store.all()
+        except Exception:                               # noqa: BLE001
+            logger.warning("Связки команд 1С не поднялись из базы", exc_info=True)
+            self._restored = False                      # попробуем на следующем обороте
+            return
+
+        for qid, externals in saved.items():
+            known = self._sent.setdefault(qid, [])
+            for external in externals:
+                if external not in known:
+                    known.append(external)
+        if saved:
+            logger.info("Поднято связок команд 1С после перезапуска: %d", len(saved))
+
+    async def _forget(self, queue_id: int) -> None:
+        """Снять связку и причину отказа: исход доехал до формы."""
+        self._sent.pop(queue_id, None)
+        key = self._keys.pop(queue_id, None)
+        if key is not None:
+            self._refusals.pop(key, None)
+        if self._store is not None:
+            try:
+                await self._store.forget(queue_id)
+            except Exception:                           # noqa: BLE001
+                logger.warning("Связка команды %s не снялась из базы", queue_id,
+                               exc_info=True)
+
+    def _refusal_for(self, queue_id: int) -> str:
         """Причина отказа по этой команде, если она была.
 
         Сопоставление идёт по (инициатор, прайс, задача), а не по идентификатору команды:
         события модели его не несут. Это ОДНОЗНАЧНО, и вот почему: очередь схлопывает
         команды по объекту, поэтому в работе одновременно не бывает двух команд по одной
         задаче от одного инициатора. Сломай кто-нибудь схлопывание — сломается и это.
+
+        Причина ЧИТАЕТСЯ, а не снимается: снимет её `_forget`, когда исход доедет до
+        формы. Иначе оборванный ответ превратил бы отказ в «выполнена» на повторе.
+
+        У связки, поднятой из базы после перезапуска, причины нет — и это честно: событие
+        отказа жило в памяти умершего процесса, а выдумывать текст нельзя. Команда
+        закроется как выполненная, а что вышло на деле, видно в самой задаче: её результат
+        приезжает снимком.
         """
-        key = self._keys.pop(queue_id, None)
+        key = self._keys.get(queue_id)
         if key is None:
             return ""
-        return self._refusals.pop(key, "")
+        return self._refusals.get(key, "")
 
     # ------------------------------------------------------------------ снимок
 
@@ -300,8 +374,15 @@ class OnecProvider(Listener):
                 continue
 
             stored = await queue.put(parsed, offset or 0.0, agent_now)
-            self._sent.setdefault(stored.id, []).append(external)
+            known = self._sent.setdefault(stored.id, [])
+            if external not in known:
+                known.append(external)
             self._keys[stored.id] = (parsed.actor, parsed.price_id, parsed.task_id)
+            # СВЯЗКА ЛОЖИТСЯ В БАЗУ ДО того, как в 1С уедет «принята»: пока команда там
+            # «ждёт», она приедет снова и схлопнётся с уже лежащей в очереди — окно
+            # самоизлечимо. После «принята» 1С её больше не отдаст, и потерянная связка
+            # заперла бы форму насовсем.
+            await self._remember(stored.id, external)
             taken.append({"id": external, "state": "принята", "message": ""})
 
         if taken or refused:

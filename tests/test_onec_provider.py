@@ -15,6 +15,7 @@ from src.model.events import Event, EventKind
 from src.onec.model_provider import (OnecProvider, actor_label, actor_of,
                                      clock_offset)
 from src.storage.command_queue import CommandQueue
+from src.storage.sent_commands import SentCommands
 
 
 class FakeOnec:
@@ -91,8 +92,14 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self._dir.cleanup()
 
-    def make(self, onec, prices=None):
-        return OnecProvider(onec, FakeService(prices))
+    def make(self, onec, prices=None, sent=None):
+        return OnecProvider(onec, FakeService(prices), sent=sent)
+
+    async def store(self):
+        """Хранилище связок на том же временном каталоге, что и очередь."""
+        sent = SentCommands(Path(self._dir.name) / "q.db")
+        await sent.init()
+        return sent
 
     # ------------------------------------------------------------------ команды
 
@@ -342,6 +349,79 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         provider = self.make(Dead())
         await provider.collect(self.queue)      # не должно бросить
         self.assertTrue(provider._dirty)
+
+    # ------------------------------------------------- связки переживают перезапуск
+
+    async def test_restart_still_closes_the_command(self):
+        """Случай 24.09.2026: бота перезапустили, пока команда была «принята».
+
+        Очередь пережила перезапуск и команду отработала, но карта связок жила в памяти
+        умершего процесса — и форма осталась заперта со статусом «идёт пересборка»
+        навсегда: GET `agent-commands` отдаёт только «ждёт», такой строки агент уже не
+        видит. Связка обязана подняться из базы.
+        """
+        sent = await self.store()
+        first = self.make(FakeOnec([command(kind="пересобрать задачи", task_id=0)]), sent=sent)
+        await first.collect(self.queue)
+
+        taken = await self.queue.take()                 # взяли — и тут процесс умер
+        self.assertEqual(len(taken), 1)
+
+        second = self.make(FakeOnec(), sent=sent)       # новый процесс, память пуста
+        await self.queue.done(taken[0].id)              # он доработал команду
+        await second.collect(self.queue)
+
+        closed = [i for batch in second._onec.states for i in batch]
+        self.assertEqual([(i["id"], i["state"]) for i in closed], [("c1", "выполнена")])
+        self.assertEqual(await sent.all(), {}, "закрытую связку хранить незачем")
+
+    async def test_link_survives_a_failed_ack(self):
+        """Оборванный ответ не имеет права уносить связку: колесико горело бы по команде,
+        исход которой мы знаем."""
+        sent = await self.store()
+        onec = FakeOnec([command()])
+        provider = self.make(onec, sent=sent)
+        await provider.collect(self.queue)
+
+        taken = await self.queue.take()
+        await self.queue.done(taken[0].id)
+
+        def dead(items):
+            raise RuntimeError("сеть моргнула")
+
+        onec.agent_commands_state = dead
+        await provider.collect(self.queue)              # `collect` глотает сбой
+        self.assertNotEqual(await sent.all(), {}, "связка обязана остаться")
+
+        onec.agent_commands_state = lambda items: onec.states.append(list(items))
+        await provider.collect(self.queue)
+        closed = [i for batch in onec.states for i in batch if i["state"] == "выполнена"]
+        self.assertEqual([i["id"] for i in closed], ["c1"])
+        self.assertEqual(await sent.all(), {})
+
+    async def test_refusal_survives_a_failed_ack(self):
+        """Повтор после сбоя обязан донести ПРИЧИНУ, а не превратить отказ в «выполнена»."""
+        sent = await self.store()
+        onec = FakeOnec([command()])
+        provider = self.make(onec, sent=sent)
+        await provider.collect(self.queue)
+
+        pending = await self.queue.pending()
+        await provider.notify(Event(EventKind.COMMAND_REJECTED, actor="1c:Иванов",
+                                    price_id=1, task_id=5, text="прайс занят: Петров"))
+        await self.queue.done(pending[0].id)
+
+        def dead(items):
+            raise RuntimeError("сеть моргнула")
+
+        onec.agent_commands_state = dead
+        await provider.collect(self.queue)
+
+        onec.agent_commands_state = lambda items: onec.states.append(list(items))
+        await provider.collect(self.queue)
+        closed = [i for batch in onec.states for i in batch if i["state"] == "отклонена"]
+        self.assertEqual(len(closed), 1)
+        self.assertIn("занят", closed[0]["message"])
 
     async def test_missing_objects_are_logged_not_swallowed(self):
         onec = FakeOnec()
