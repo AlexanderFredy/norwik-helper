@@ -85,11 +85,69 @@ def allow():
     return None
 
 
+class SharedTailTest(unittest.TestCase):
+    """Повторяющийся хвост в названиях расцветок — шум (случай Westerhof, 24.09.2026).
+
+    Поставщик делает коллекции на двух заводах и дописал это в каждое наименование:
+    «Альфа PELI», «Альпы AGT». Завод — свойство коллекции, а не расцветки.
+    """
+
+    def test_factory_marker_is_noise(self):
+        titles = ["Альфа PELI", "Вега PELI", "Гамма PELI", "Ореон PELI"]
+        noise = nz.shared_tail(titles)
+        self.assertEqual(noise, {"peli"})
+        self.assertEqual([nz.drop_shared(t, noise) for t in titles],
+                         ["Альфа", "Вега", "Гамма", "Ореон"])
+
+    def test_marker_on_half_the_items_still_counts(self):
+        """У «Effect» пометка AGT стоит у семи позиций из четырнадцати: поставщик
+        проставил её не везде, и требование «у всех» обессмыслило бы правило."""
+        titles = ["Альпы AGT", "Тибет AGT", "Логан", "Соларо", "Фудзияма AGT"]
+        noise = nz.shared_tail(titles)
+        self.assertEqual(noise, {"agt"})
+        self.assertEqual(nz.drop_shared("Логан", noise), "Логан")
+        self.assertEqual(nz.drop_shared("Альпы AGT", noise), "Альпы")
+
+    def test_genus_word_in_front_is_never_touched(self):
+        """«Дуб» повторяется у всех, но он ЧАСТЬ названия. Разделяет их положение:
+        род стоит спереди, маркер сзади."""
+        titles = ["Дуб Авила", "Дуб Прато", "Дуб Ява"]
+        self.assertEqual(nz.shared_tail(titles), set())
+
+    def test_unique_titles_give_no_noise(self):
+        self.assertEqual(nz.shared_tail(["Капри", "Наполи", "Гарда"]), set())
+
+    def test_single_word_titles_are_left_alone(self):
+        """Из «Капри» снимать нечего: имя из одного слова — это и есть расцветка."""
+        self.assertEqual(nz.shared_tail(["Капри", "Капри"]), set())
+
+    def test_noise_in_the_middle_survives(self):
+        """Слово внутри имени означает, что строку мы поняли неверно; молча кромсать
+        середину опаснее, чем оставить как есть."""
+        self.assertEqual(nz.drop_shared("Дуб PELI Медовый", {"peli"}),
+                         "Дуб PELI Медовый")
+
+    def test_title_never_becomes_empty(self):
+        self.assertEqual(nz.drop_shared("PELI", {"peli"}), "PELI")
+
+    def test_several_markers_are_stripped_at_once(self):
+        titles = ["Альфа PELI NEW", "Вега PELI NEW", "Гамма PELI NEW"]
+        noise = nz.shared_tail(titles)
+        self.assertEqual(nz.drop_shared("Альфа PELI NEW", noise), "Альфа")
+
+    def test_plan_cleans_titles_of_the_whole_collection(self):
+        """Шум считается по коллекции целиком: одна позиция о повторе не знает ничего."""
+        items = [item(ref="T1", article="CO512", site="Альфа PELI", collection="Cosmo"),
+                 item(ref="T2", article="CO520", site="Вега PELI", collection="Cosmo")]
+        inputs, _skipped, _dropped, _noise = nz.plan(items, "000000005", "Westerhof")
+        self.assertEqual([i["title"] for i in inputs[0]["items"]], ["Альфа", "Вега"])
+
+
 class PlanTest(unittest.TestCase):
     """Что берём в работу, а что выносим админу."""
 
     def test_normal_items_are_planned(self):
-        inputs, skipped, dropped = nz.plan([item(), item(ref="T2", article="1001",
+        inputs, skipped, dropped, _noise = nz.plan([item(), item(ref="T2", article="1001",
                                                         site="Дуб Ява")],
                                            "000000311", "Most Flooring")
         self.assertEqual(len(inputs), 1)
@@ -98,35 +156,35 @@ class PlanTest(unittest.TestCase):
 
     def test_title_comes_from_site_name(self):
         """`site_name` по §19.5 — это РОВНО название расцветки, готовый `title`."""
-        inputs, _, _ = nz.plan([item(site="Дуб Ява")], "000000311", "Most Flooring")
+        inputs, _, _, _ = nz.plan([item(site="Дуб Ява")], "000000311", "Most Flooring")
         self.assertEqual(inputs[0]["items"][0]["title"], "Дуб Ява")
 
     def test_brand_is_the_1c_one(self):
-        inputs, _, _ = nz.plan([item()], "000000311", "Most Flooring")
+        inputs, _, _, _ = nz.plan([item()], "000000311", "Most Flooring")
         self.assertEqual(inputs[0]["tm_name"], "Most Flooring")
 
     def test_item_without_a_title_goes_to_the_admin(self):
         """Название расцветки выводить неоткуда — выдумывать код не будет."""
-        inputs, skipped, _ = nz.plan([item(site="")], "000000311", "Most Flooring")
+        inputs, skipped, _, _ = nz.plan([item(site="")], "000000311", "Most Flooring")
         self.assertEqual(inputs, [])
         self.assertEqual(skipped[0][1], nz.Skipped.NO_TITLE)
 
     def test_contaminated_title_goes_to_the_admin(self):
         """Марка внутри названия расцветки попала бы в имя дважды."""
-        inputs, skipped, _ = nz.plan([item(site="Most Flooring Бах")],
+        inputs, skipped, _, _ = nz.plan([item(site="Most Flooring Бах")],
                                      "000000311", "Most Flooring")
         self.assertEqual(inputs, [])
         self.assertEqual(skipped[0][1], nz.Skipped.DIRTY_TITLE)
 
     def test_collection_inside_the_title_is_caught_too(self):
-        inputs, skipped, _ = nz.plan([item(site="Миллениум Про Бах")],
+        inputs, skipped, _, _ = nz.plan([item(site="Миллениум Про Бах")],
                                      "000000311", "Most Flooring")
         self.assertEqual(skipped[0][1], nz.Skipped.DIRTY_TITLE)
 
     def test_short_words_do_not_block_normalization(self):
         """«Про» или «Ле» встречаются внутри расцветок как обычные слова: запрет по ним
         выключил бы нормализацию целым коллекциям."""
-        inputs, skipped, _ = nz.plan([item(site="Про Бах", collection="Ле")],
+        inputs, skipped, _, _ = nz.plan([item(site="Про Бах", collection="Ле")],
                                      "000000311", "Most Flooring")
         self.assertEqual(skipped, [])
         self.assertEqual(len(inputs), 1)
@@ -134,14 +192,14 @@ class PlanTest(unittest.TestCase):
     def test_discontinued_are_left_alone(self):
         """Снятые лежат в невыгружаемых папках, на сайт не идут — переименование им
         ничего не даёт, а пачку записи раздувает."""
-        inputs, skipped, dropped = nz.plan(
+        inputs, skipped, dropped, _noise = nz.plan(
             [item(), item(ref="T2", not_exported=True)], "000000311", "Most Flooring")
         self.assertEqual(dropped, 1)
         self.assertEqual(len(inputs[0]["items"]), 1)
         self.assertEqual(skipped, [])
 
     def test_only_collection_narrows_the_work(self):
-        inputs, _, _ = nz.plan(
+        inputs, _, _, _ = nz.plan(
             [item(collection="Миллениум Про"), item(ref="T2", collection="Ле Паркет")],
             "000000311", "Most Flooring", only_collection="Ле Паркет")
         self.assertEqual(len(inputs), 1)
@@ -149,7 +207,7 @@ class PlanTest(unittest.TestCase):
 
     def test_groups_split_by_collection_and_type(self):
         """`plan_collection` работает на одну коллекцию и вид — бить обязаны мы."""
-        inputs, _, _ = nz.plan(
+        inputs, _, _, _ = nz.plan(
             [item(collection="A"), item(ref="T2", collection="B"),
              item(ref="T3", collection="A", product_type="Плитка")],
             "000000311", "Most Flooring")
@@ -409,7 +467,7 @@ class CollectionPropertyTest(unittest.TestCase):
 
     def test_normalization_never_writes_properties_at_all(self):
         """У нормализации в правке нет свойств вовсе — ей нечего там менять."""
-        inputs, _, _ = nz.plan([item()], "000000311", "Most Flooring")
+        inputs, _, _, _ = nz.plan([item()], "000000311", "Most Flooring")
         self.assertNotIn("properties", inputs[0])
 
     def test_collection_property_is_stripped_from_a_write(self):

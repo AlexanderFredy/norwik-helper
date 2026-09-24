@@ -970,7 +970,7 @@ async def run_normalization(onec, task, guard, scope=None):
     # первую настоящую запись до проверяемой глазами — правильно по умолчанию.
     only = task.address.subject.label() if task.subject == TaskSubject.COLLECTION else ""
 
-    inputs, skipped, discontinued = nz.plan(nom.items, tm_code, tm_name,
+    inputs, skipped, discontinued, noise = nz.plan(nom.items, tm_code, tm_name,
                                             only_collection=only)
 
     if not inputs and not skipped:
@@ -998,7 +998,7 @@ async def run_normalization(onec, task, guard, scope=None):
             failed.append(f"{err.get('ref') or err.get('index')}: "
                           f"{err.get('code')} {err.get('message')}")
 
-    text = nz.report(written, skipped, discontinued, len(inputs))
+    text = nz.report(written, skipped, discontinued, len(inputs), noise)
     if failed:
         text += ("\n\nНЕ ЗАПИСАНО " + str(len(failed)) + ":\n"
                  + "\n".join(f"— {f}" for f in failed))

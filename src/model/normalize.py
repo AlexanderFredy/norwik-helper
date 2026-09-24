@@ -147,6 +147,52 @@ def contaminated(item, tm_name: str, collection: str) -> bool:
     return False
 
 
+def shared_tail(titles) -> set[str]:
+    """Хвостовые слова, повторяющиеся у РАЗНЫХ расцветок коллекции, — это шум.
+
+    **СЛУЧАЙ С БОЯ (24.09.2026).** Westerhof делает часть коллекций на заводе Peli, часть
+    на AGT, и поставщик дописал это в каждое наименование: «Альфа PELI», «WHITE PELI»,
+    «Альпы AGT». Завод — свойство коллекции, а не расцветки: в имени товара он повторяется
+    у всех и не различает ничего.
+
+    **Почему хвост, а не любое повторение.** Название расцветки внутри коллекции
+    уникально — «Альфа», «Вега», «Гамма», — поэтому повторяющееся слово расцветкой быть не
+    может. Но у многих марок первым словом идёт род: «Дуб Авила», «Дуб Прато». «Дуб» тоже
+    повторяется, и он — часть названия. Разделяет их ПОЛОЖЕНИЕ: род стоит спереди, маркер
+    сзади. Поэтому первое слово не трогаем никогда, а хвост снимаем.
+
+    **Достаточно двух совпадений, а не всех.** У той же коллекции «Effect» пометка AGT
+    стоит лишь у семи позиций из четырнадцати — поставщик проставил её не везде. Требуй мы
+    совпадения у всех, самый очевидный случай и не сработал бы.
+    """
+    rows = [str(t or "").split() for t in titles]
+    rows = [r for r in rows if len(r) > 1]
+    if len(rows) < 2:
+        return set()
+
+    seen: dict[str, int] = {}
+    for row in rows:
+        # Первое слово — вне игры: там живёт род («Дуб»), а не маркер.
+        for word in dict.fromkeys(row[1:]):
+            key = word.casefold()
+            seen[key] = seen.get(key, 0) + 1
+
+    return {key for key, times in seen.items() if times >= 2}
+
+
+def drop_shared(title: str, noise: set[str]) -> str:
+    """Снять шумовые слова с ХВОСТА названия. Середину не трогаем.
+
+    Снимается только то, что стоит с краю: «Альфа PELI» → «Альфа». Слово внутри имени
+    («Дуб PELI Медовый») осталось бы на месте — такое написание означает, что мы поняли
+    строку неверно, и молча кромсать середину опаснее, чем оставить как есть.
+    """
+    words = str(title or "").split()
+    while len(words) > 1 and words[-1].casefold() in noise:
+        words.pop()
+    return " ".join(words)
+
+
 def plan(items, tm_code: str, tm_name: str, only_collection: str = ""):
     """Что нормализуем и о чём докладываем.
 
@@ -188,8 +234,12 @@ def plan(items, tm_code: str, tm_name: str, only_collection: str = ""):
         groups.setdefault((collection, product_type), []).append(item)
 
     inputs = []
+    found_noise: set[str] = set()
     for (collection, product_type), members in groups.items():
         first = members[0]
+        # Шум считается ПО КОЛЛЕКЦИИ целиком: одна позиция о повторе ничего не знает.
+        noise = shared_tail((i.site_name or "").strip() for i in members)
+        found_noise.update(noise)
         inputs.append({
             "tm_code": tm_code,
             # Имя марки — из 1С. Ради этого модуль и не спрашивает никого: как пишется
@@ -204,14 +254,14 @@ def plan(items, tm_code: str, tm_name: str, only_collection: str = ""):
                 "article": i.article,
                 # `site_name` по §19.5 — это РОВНО название расцветки, без размера и без
                 # артикула. То есть готовый `title`, который модель собирала бы вручную.
-                "title": (i.site_name or "").strip(),
+                "title": drop_shared((i.site_name or "").strip(), noise),
                 # Размер отдаём как есть: нужен он в имени или нет, решит
                 # `plan_collection` по виду товара (`size_in_name`), а не мы.
                 "tail": (i.size or "").strip(),
             } for i in members],
         })
 
-    return inputs, skipped, discontinued
+    return inputs, skipped, discontinued, found_noise
 
 
 def pending_work(items, tm_code: str, tm_name: str, scope=None) -> int:
@@ -228,7 +278,7 @@ def pending_work(items, tm_code: str, tm_name: str, scope=None) -> int:
     """
     from src.price_tool import items as item_rules
 
-    inputs, skipped, _ = plan(items, tm_code, tm_name)
+    inputs, skipped, _, _ = plan(items, tm_code, tm_name)
     # Пропущенные — это тоже работа: админу есть что решить, и задача нужна.
     if skipped:
         return len(skipped)
@@ -239,7 +289,8 @@ def pending_work(items, tm_code: str, tm_name: str, scope=None) -> int:
     return total
 
 
-def report(written: int, skipped: list, discontinued: int, groups: int) -> str:
+def report(written: int, skipped: list, discontinued: int, groups: int,
+           noise: set[str] | None = None) -> str:
     """Короткий отчёт админу: сделанное одной строкой, разбирательства — списком."""
     lines = []
     if written:
@@ -250,6 +301,13 @@ def report(written: int, skipped: list, discontinued: int, groups: int) -> str:
 
     if discontinued:
         lines.append(f"Снятые с производства не трогал: {discontinued} поз.")
+
+    # ПОЧЕМУ ИМЕНА СТАЛИ КОРОЧЕ. Без этой строки админ видит переименования и гадает,
+    # куда делось слово. Сами слова называются: решение «шум это или нет» принимал код,
+    # и проверить его должно быть можно с одного взгляда.
+    if noise:
+        lines.append("Сняты повторяющиеся слова в конце названий (маркер коллекции, "
+                     "а не расцветки): " + ", ".join(sorted(noise)) + ".")
 
     if skipped:
         by_reason: dict[str, list] = {}
