@@ -5,6 +5,7 @@
 Синхронный клиент; при использовании из async — вызывать через asyncio.to_thread.
 """
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 
@@ -265,12 +266,32 @@ def _alt_units_to_dict(alt_units: list) -> dict:
     return out
 
 
+logger = logging.getLogger(__name__)
+
+#: Со скольких секунд вызов 1С считается медленным и попадает в журнал. Лёгкие эндпоинты
+#: отвечают за полсекунды, так что три секунды — это уже «идёт что-то тяжёлое».
+SLOW_CALL_SECONDS = 3.0
+
+
+def _pointless_to_repeat(exc: Exception) -> bool:
+    """Ждать дольше бессмысленно: сервер ПРИНЯЛ запрос и не ответил вовремя.
+
+    `ConnectTimeout` сюда не входит: соединение не установилось, сервер о нас не знает,
+    и повтор — ровно то, что нужно (`WinError 10060`).
+    """
+    return (isinstance(exc, httpx.TimeoutException)
+            and not isinstance(exc, httpx.ConnectTimeout))
+
+
 class OnecClient:
     """Синхронный клиент 1С. base_url — до /api_shop/hs/ai-tools (без хвостового /)."""
 
     def __init__(self, base_url: str, token: str, timeout: float = 30.0,
-                 retries: int = 5) -> None:
+                 retries: int = 5, backoff: float = 2.0) -> None:
         self._retries = max(1, retries)
+        # Пауза между повторами растёт линейно. Вынесена параметром ради тестов: ждать
+        # двадцать секунд на каждый случай обрыва — это минута к прогону набора.
+        self._backoff = max(0.0, backoff)
         self._client = httpx.Client(
             base_url=base_url.rstrip("/"),
             headers={"X-API-Token": token},
@@ -282,10 +303,10 @@ class OnecClient:
 
     def _get(self, path: str, params: dict | None = None) -> httpx.Response:
         """GET с повторами. Сеть до 1С рвётся по двум разным поводам, и оба штатные."""
-        return self._retry(lambda: self._client.get(path, params=params))
+        return self._retry(lambda: self._client.get(path, params=params), path)
 
-    def _retry(self, call):
-        """Повторить запрос, если оборвалась сеть. Ошибки самой 1С не трогаются.
+    def _retry(self, call, label: str = ""):
+        """Повторить запрос, если оборвалась СВЯЗЬ. Медленный ответ не повторяется.
 
         **Ловится `TransportError`, а не три отдельных исключения.** Поводов два, и второй
         нашёлся только на длинном прогоне:
@@ -303,14 +324,39 @@ class OnecClient:
 
         `HTTPStatusError` сюда НЕ попадает: 500 от 1С это ответ, а не обрыв, и повторять
         его бессмысленно — приедет тот же самый.
+
+        **ТАЙМАУТ ЧТЕНИЯ НЕ ПОВТОРЯЕТСЯ.** Он значит, что сервер запрос ПРИНЯЛ и думает, а
+        1С не отменяет работу, когда клиент отвалился: брошенная выгрузка продолжает
+        крутиться. Повторяя её пять раз, мы кладём на базу пять тяжёлых запросов вместо
+        одного и сами превращаем медленный ответ в неотвечающий (бой 24.09.2026: агент
+        молчал десять минут, пока `by-tm` не отвечал). Обрыв соединения — другое дело: там
+        сервер ничего не делает, и повтор ровно лечит.
+
+        Каждый вызов, занявший больше `SLOW_CALL_SECONDS`, попадает в журнал: десять минут
+        тишины должны читаться как «идёт `by-tm` по такой-то марке», а не как «всё зависло».
         """
         last: Exception | None = None
         for attempt in range(self._retries):
+            started = time.monotonic()
             try:
-                return call()
+                answer = call()
+                spent = time.monotonic() - started
+                if spent >= SLOW_CALL_SECONDS:
+                    logger.info("1С отвечала %.1f с: %s", spent, label or "запрос")
+                return answer
             except httpx.TransportError as exc:
+                spent = time.monotonic() - started
+                if _pointless_to_repeat(exc):
+                    logger.warning(
+                        "1С не ответила за %.0f с (%s): %s — повтор только добавил бы ей "
+                        "работы, сдаюсь", spent, type(exc).__name__, label or "запрос")
+                    raise
                 last = exc
-                time.sleep(2 * (attempt + 1))
+                logger.warning("Связь с 1С оборвалась (%s) на %s — попытка %d из %d",
+                               type(exc).__name__, label or "запрос",
+                               attempt + 1, self._retries)
+                if self._backoff:
+                    time.sleep(self._backoff * (attempt + 1))
         raise last  # type: ignore[misc]
 
     def selling_tm(self, all_marks: bool = False) -> list[TradeMark]:
@@ -561,7 +607,7 @@ class OnecClient:
         # `agent-commands-state` двигает состояние команды только вперёд и на повторное
         # сообщение отвечает `already_final`.
         r = self._retry(lambda: self._client.post(
-            path, content=body, headers=JSON_UTF8, timeout=timeout))
+            path, content=body, headers=JSON_UTF8, timeout=timeout), path)
         text = r.content.decode("utf-8-sig", errors="replace")
         # Необработанное исключение BSL веб-сервер подменяет своей страницей: текста 1С в
         # ней нет вовсе, и без этой проверки мы бы разбирали HTML как JSON.

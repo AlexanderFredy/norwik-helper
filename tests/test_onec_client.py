@@ -440,5 +440,46 @@ class RetryTest(unittest.TestCase):
         self.assertEqual(calls["n"], 1)
 
 
+class RetryPolicyTest(unittest.TestCase):
+    """Что повторяем, а что нет (бой 24.09.2026).
+
+    1С не отменяет работу, когда клиент отвалился: брошенная выгрузка продолжает
+    крутиться. Повторив таймаут пять раз, мы кладём на базу пять тяжёлых запросов вместо
+    одного — и сами превращаем медленный ответ в неотвечающий.
+    """
+
+    def client(self, boom):
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            raise boom
+
+        c = OnecClient("http://example.invalid/api", "token", retries=5, backoff=0)
+        c._client = httpx.Client(base_url="http://example.invalid/api",
+                                 transport=httpx.MockTransport(handler))
+        return c, calls
+
+    def test_read_timeout_is_not_repeated(self):
+        c, calls = self.client(httpx.ReadTimeout("слишком долго"))
+        with self.assertRaises(httpx.ReadTimeout):
+            c.selling_tm()
+        self.assertEqual(calls["n"], 1)
+
+    def test_dropped_connection_is_repeated(self):
+        """Обрыв keep-alive — штатное поведение IIS, и повтор ровно лечит."""
+        c, calls = self.client(httpx.ReadError("WinError 10054"))
+        with self.assertRaises(httpx.ReadError):
+            c.selling_tm()
+        self.assertEqual(calls["n"], 5)
+
+    def test_connect_timeout_is_repeated(self):
+        """Соединение не установилось — сервер о нас не знает, повтор уместен."""
+        c, calls = self.client(httpx.ConnectTimeout("WinError 10060"))
+        with self.assertRaises(httpx.ConnectTimeout):
+            c.selling_tm()
+        self.assertEqual(calls["n"], 5)
+
+
 if __name__ == "__main__":
     unittest.main()
