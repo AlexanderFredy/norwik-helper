@@ -519,6 +519,129 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         # к каждой позиции приложена строка прайса — по ней и проставят артикул
         self.assertIn("Дуб Авила", blind["позиции"][0]["строка_прайса"])
 
+    async def test_articles_for_a_nameless_collection_are_prepared(self):
+        """Коллекции без артикулов (Spark, Vivace) достаётся готовая работа: пары «код 1С
+        → артикул из названия». Артикул поставщик даёт прямо в имени расцветки, и это
+        доказано Modern той же марки — там он уже лежит в 1С."""
+        import openpyxl
+        wb = openpyxl.Workbook()
+        sheet = wb.active
+        sheet.append(["Наименование", "Цена"])
+        sheet.append(["Ash (6006-4)", 1500])
+        sheet.append(["Fire (6003-14)", 1500])
+        buf = BytesIO()
+        wb.save(buf)
+
+        tools = TaskBuilderTools(buf.getvalue(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "", site="Ash", collection="Spark"),
+            self.nom("R2", "", site="Fire", collection="Spark"),
+        ], tm="Westerhof / Вестерхоф"))
+        got = await self.compare(tools, [], collection="Westerhof Spark")
+
+        blind = got["коллекция_есть_в_1С"]
+        self.assertEqual(blind["артикулов_разобрано"], 2)
+        self.assertEqual([p["артикул_из_названия"] for p in blind["позиции"]],
+                         ["6006-4", "6003-14"])
+        self.assertIn("write_items", blind["вывод"])
+
+    async def test_short_decor_name_is_found_as_a_whole_word(self):
+        """У Spark декоры зовутся Ash, Fire, Glow, Star. Подстрочный поиск по ним ловил
+        бы пол-прайса, поэтому короткие имена ищутся целым словом — а раньше не искались
+        вовсе, и строка прайса не находилась ни для одного из них."""
+        import openpyxl
+        wb = openpyxl.Workbook()
+        sheet = wb.active
+        sheet.append(["Наименование", "Цена"])
+        sheet.append(["Ashley Wood", 1000])          # ловушка для подстроки
+        sheet.append(["Ash (6006-4)", 1500])
+        buf = BytesIO()
+        wb.save(buf)
+
+        tools = TaskBuilderTools(buf.getvalue(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "", site="Ash", collection="Spark"),
+        ], tm="Westerhof / Вестерхоф"))
+        got = await self.compare(tools, [], collection="Westerhof Spark")
+
+        pair = got["коллекция_есть_в_1С"]["позиции"][0]
+        self.assertIn("Ash (6006-4)", pair["строка_прайса"])
+        self.assertEqual(pair["артикул_из_названия"], "6006-4")
+
+    async def test_article_already_taken_is_not_offered(self):
+        """Артикул — межпоставщицкий ключ: предложив занятый, мы свели бы две разные
+        позиции в одну и увели цену не туда."""
+        import openpyxl
+        wb = openpyxl.Workbook()
+        sheet = wb.active
+        sheet.append(["Наименование", "Цена"])
+        sheet.append(["Ash (6006-4)", 1500])
+        buf = BytesIO()
+        wb.save(buf)
+
+        tools = TaskBuilderTools(buf.getvalue(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "", site="Ash", collection="Spark"),
+            self.nom("R9", "6006-4", site="Rumba", collection="Modern"),
+        ], tm="Westerhof / Вестерхоф"))
+        got = await self.compare(tools, [], collection="Westerhof Spark")
+
+        blind = got["коллекция_есть_в_1С"]
+        self.assertNotIn("артикулов_разобрано", blind)
+        self.assertNotIn("артикул_из_названия", blind["позиции"][0])
+
+    async def test_mark_prefix_in_the_price_name_is_stripped(self):
+        """СЛУЧАЙ С БОЯ (25.09.2026). В прайсе Вестерхофа коллекции зовутся «Westerhof
+        Spark» и «Westerhof Vivace», а в 1С свойство «Коллекция» и папка — просто «Spark»
+        и «Vivace». Совпадений не было ни одного, сверка отвечала «коллекции в 1С нет», и
+        агент предлагал завести заново три ЖИВЫЕ коллекции: 8, 8 и 10 позиций."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "", site="Ash", collection="Spark"),
+            self.nom("R2", "", site="Fire", collection="Spark"),
+        ], tm="Westerhof / Вестерхоф"))
+        got = await self.compare(tools, [], collection="Westerhof Spark",
+                                 titles=["Ash", "Fire"])
+
+        self.assertEqual(got["коллекция_есть_в_1С"]["позиций"], 2,
+                         "коллекция нашлась, несмотря на приставку марки")
+        self.assertEqual(got["сверка_по_названиям"]["нашлось_по_названию"], 2)
+
+    async def test_foreign_collection_is_not_pulled_in_by_stripping(self):
+        """Снимается имя ИМЕННО ЭТОЙ марки и только целым словом: чужая коллекция от
+        такого снятия притянуться не должна."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "", site="Ash", collection="Sparkling"),
+        ], tm="Westerhof / Вестерхоф"))
+        got = await self.compare(tools, [], collection="Westerhof Spark",
+                                 titles=["Ash"])
+
+        self.assertNotIn("коллекция_есть_в_1С", got)
+
+    async def test_article_hidden_in_the_title_matches(self):
+        """СЛУЧАЙ С БОЯ (25.09.2026). У коллекции Modern артикулы В 1С ЗАПОЛНЕНЫ —
+        `6006-4`, `65-901`, — а в прайсе те же числа стоят внутри имени расцветки, и
+        колонки артикула нет вовсе. Агент предлагал завести коллекцию заново."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "6006-4", site="Rumba", collection="Modern"),
+            self.nom("R2", "65-901", site="Steel", collection="Modern"),
+        ], tm="Westerhof / Вестерхоф"))
+        got = await self.compare(tools, [], collection="Westerhof Modern",
+                                 titles=["Rumba (6006-4)", "Steel 65-901"])
+
+        сводка = got["сверка_по_названиям"]
+        self.assertEqual(сводка["нашлось_по_артикулу_из_названия"], 2)
+        self.assertNotIn("нет_в_1С_по_названию", сводка)
+
+    def test_size_and_class_are_not_mistaken_for_an_article(self):
+        """Шаблон узкий намеренно: неверный артикул хуже отсутствующего, потому что по
+        нему выбирается наименьшая цена между поставщиками."""
+        from src.model.task_builder import article_from_title
+
+        self.assertEqual(article_from_title("Rumba (6006-4)"), "6006-4")
+        self.assertEqual(article_from_title("Steel 65-901"), "65-901")
+        self.assertEqual(article_from_title("Дуб Медовый 1290x180x4"), "")
+        self.assertEqual(article_from_title("Гамма 33 класс 4мм"), "")
+        self.assertEqual(article_from_title("Сорренто"), "")
+        # два кандидата — значит ни одного: гадать нельзя
+        self.assertEqual(article_from_title("Микс 6006-4 и 6003-14"), "")
+
     async def test_titles_match_inside_the_collection(self):
         """ВТОРОЙ КЛЮЧ (решение админа 24.09.2026). У «Vivace» артикулов нет вовсе, и
         сверка по артикулу отвечает «не нашлось ничего» — то есть не отвечает."""
@@ -532,6 +655,53 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         сводка = got["сверка_по_названиям"]
         self.assertEqual(сводка["нашлось_по_названию"], 2)
         self.assertEqual(сводка["нет_в_1С_по_названию"], ["Сигма"])
+
+    async def test_properties_resolve_an_ambiguous_title(self):
+        """Третий ключ (решение админа 25.09.2026): одно имя на две карточки разбирается
+        ЧИСЛОВЫМИ приметами — толщиной, классом, размером. Их пишут одинаково и в
+        карточке, и в прайсе, тогда как словесные значения расходятся написанием."""
+        import openpyxl
+        wb = openpyxl.Workbook()
+        sheet = wb.active
+        sheet.append(["Наименование", "Толщина"])
+        sheet.append(["Дуб Авила", "12"])
+        buf = BytesIO()
+        wb.save(buf)
+
+        tools = TaskBuilderTools(buf.getvalue(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "", site="Дуб Авила", collection="Vivace",
+                     props=(("Толщина", "8"),)),
+            self.nom("R2", "", site="Дуб Авила", collection="Vivace",
+                     props=(("Толщина", "12"),)),
+        ]))
+        got = await self.compare(tools, [], collection="Vivace", titles=["Дуб Авила"])
+
+        сводка = got["сверка_по_названиям"]
+        self.assertEqual(сводка["нашлось_по_названию"], 1)
+        self.assertNotIn("неоднозначные_названия", сводка)
+
+    async def test_properties_that_fit_both_keep_the_title_unclear(self):
+        """Ключ разбирает неоднозначность, а не заменяет её другой: подошли оба — значит
+        по-прежнему не совпало."""
+        import openpyxl
+        wb = openpyxl.Workbook()
+        sheet = wb.active
+        sheet.append(["Наименование", "Толщина"])
+        sheet.append(["Дуб Авила", "12"])
+        buf = BytesIO()
+        wb.save(buf)
+
+        tools = TaskBuilderTools(buf.getvalue(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "", site="Дуб Авила", collection="Vivace",
+                     props=(("Толщина", "12"),)),
+            self.nom("R2", "", site="Дуб Авила", collection="Vivace",
+                     props=(("Толщина", "12"),)),
+        ]))
+        got = await self.compare(tools, [], collection="Vivace", titles=["Дуб Авила"])
+
+        сводка = got["сверка_по_названиям"]
+        self.assertEqual(сводка["нашлось_по_названию"], 0)
+        self.assertEqual(сводка["неоднозначные_названия"], ["Дуб Авила"])
 
     async def test_ambiguous_title_counts_as_not_found(self):
         """Имя подошло к двум карточкам — угадывать нельзя, говорим об этом."""

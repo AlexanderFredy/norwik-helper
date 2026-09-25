@@ -365,7 +365,7 @@ class TaskBuilderTools:
                 out[tm_code] = rest
         return out
 
-    def _by_title(self, collection: str, live: list, titles) -> dict | None:
+    def _by_title(self, collection: str, live: list, titles, tm: str = "") -> dict | None:
         """ВТОРОЙ КЛЮЧ: сопоставление по названию расцветки. Строго в границах.
 
         Нужен там, где первого ключа нет вовсе: у коллекции «Westerhof Vivace» (лист SPC)
@@ -384,8 +384,8 @@ class TaskBuilderTools:
         * в журнал предложений и в выбор наименьшей цены имена НЕ попадают — он остаётся
           артикульным, потому что артикул это единственный межпоставщицкий ключ.
         """
-        keys = _collection_keys(collection)
-        members = [i for i in live if _collection_keys(collection_of(i)) & keys]
+        keys = _collection_keys(collection, tm)
+        members = [i for i in live if _collection_keys(collection_of(i), tm) & keys]
         wanted = [str(t).strip() for t in (titles or []) if str(t).strip()]
         if not members or not wanted:
             return None
@@ -396,35 +396,64 @@ class TaskBuilderTools:
             if key:
                 index.setdefault(key, []).append(item)
 
+        # АРТИКУЛ ИЗ НАЗВАНИЯ — ключ первой очереди, потому что это всё-таки артикул.
+        # В прайсе Вестерхофа он спрятан в имени расцветки («Rumba (6006-4)»), а в 1С у
+        # коллекции Modern той же марки лежит ровно он. Пробуем его раньше имени: имя
+        # расходится между прайсами, артикул нет.
+        by_code: dict[str, list] = {}
+        for item in members:
+            key = norm_article(item.article or "")
+            if key:
+                by_code.setdefault(key, []).append(item)
+
         matched, missing, unclear = [], [], []
+        by_article = 0
         for title in wanted:
+            code = norm_article(article_from_title(title))
+            hits = by_code.get(code) or [] if code else []
+            if len(hits) == 1:
+                matched.append(hits[0])
+                by_article += 1
+                continue
+
             hits = index.get(_flat(title)) or []
             if len(hits) == 1:
                 matched.append(hits[0])
             elif hits:
-                unclear.append(title)
+                # Неоднозначность снимаем СВОЙСТВАМИ, а не выбором наугад: у карточек в
+                # 1С есть толщина, класс, размер, и строка прайса про этот же декор их
+                # обычно называет. Решает только ОДИН уцелевший кандидат.
+                single = self._only_one_fits(hits, self._price_line(title))
+                if single is not None:
+                    matched.append(single)
+                else:
+                    unclear.append(title)
             else:
                 missing.append(title)
 
-        out = {"нашлось_по_названию": len(matched), "позиций_в_1С": len(members)}
+        out = {"нашлось_по_названию": len(matched) - by_article,
+               "позиций_в_1С": len(members)}
+        if by_article:
+            out["нашлось_по_артикулу_из_названия"] = by_article
         if missing:
             out["нет_в_1С_по_названию"] = missing[:40]
         if unclear:
             out["неоднозначные_названия"] = unclear[:20]
-        out["как"] = ("артикулов нет — сверка шла ПО НАЗВАНИЯМ расцветок внутри этой "
-                      "коллекции. Ключ слабее артикула: другое написание декора в "
-                      "следующем прайсе не совпадёт")
+        out["как"] = ("колонки артикулов нет: сначала пробовали артикул, спрятанный В "
+                      "НАЗВАНИИ расцветки, потом — само название внутри этой коллекции. "
+                      "Имя слабее артикула: другое написание декора в следующем прайсе "
+                      "не совпадёт")
         return {"сводка": out, "позиции": matched}
 
-    def _nameless_twin(self, collection: str, live: list) -> dict | None:
+    def _nameless_twin(self, collection: str, live: list, tm: str = "") -> dict | None:
         """Коллекция 1С с ТЕМ ЖЕ именем, чьи позиции не имеют артикулов.
 
         Возвращает сводку с доказательствами: сколько позиций, у скольких пуст артикул и
         в какой строке прайса встречается название расцветки. По этим строкам артикул
         проставляется — это и есть настоящая работа, а не заведение коллекции заново.
         """
-        keys = _collection_keys(collection)
-        members = [i for i in live if _collection_keys(collection_of(i)) & keys]
+        keys = _collection_keys(collection, tm)
+        members = [i for i in live if _collection_keys(collection_of(i), tm) & keys]
         if not members:
             return None
 
@@ -432,33 +461,100 @@ class TaskBuilderTools:
         if not nameless:
             return None
 
-        pairs = []
-        for item in nameless[:10]:
-            line = self._price_line(item.site_name or item.name)
-            pairs.append({"ref": item.ref,
-                          "расцветка": item.site_name or item.name,
-                          "строка_прайса": line or "не нашлась"})
+        # АРТИКУЛ ИЗ СТРОКИ ПРАЙСА — готовая работа, а не намёк на неё. Поставщик даёт
+        # его прямо в названии («Rumba (6006-4)»), и это доказано той же маркой: у
+        # коллекции Modern артикулы В 1С уже заполнены ровно такими значениями.
+        taken = {norm_article(i.article) for i in live if (i.article or "").strip()}
+        pairs, ready = [], 0
+        for item in nameless[:40]:
+            title = item.site_name or item.name
+            line = self._price_line(title)
+            code = article_from_title(line) or article_from_title(title)
+            pair = {"ref": item.ref, "расцветка": title,
+                    "строка_прайса": line or "не нашлась"}
+            # ЗАНЯТЫЙ АРТИКУЛ НЕ ПРЕДЛАГАЕМ. Он межпоставщицкий ключ: записав чужой, мы
+            # свели бы две разные позиции в одну и увели цену не туда.
+            if code and norm_article(code) not in taken:
+                pair["артикул_из_названия"] = code
+                taken.add(norm_article(code))
+                ready += 1
+            pairs.append(pair)
 
-        return {
+        out = {
             "коллекция": collection_of(members[0]),
             "папка": members[0].collection_ref,
             "позиций": len(members),
             "без_артикула": len(nameless),
-            "вывод": ("коллекция В 1С ЕСТЬ, заводить заново НЕЛЬЗЯ — будут дубли. "
-                      "Сверить по артикулу её нельзя, пока он пуст: заведи задачу "
-                      "«изменение свойств» на простановку артикулов по строкам ниже"),
             "позиции": pairs,
         }
+        if ready:
+            out["артикулов_разобрано"] = ready
+            out["вывод"] = (
+                "коллекция В 1С ЕСТЬ, заводить заново НЕЛЬЗЯ — будут дубли. Артикулы "
+                f"разобраны из названий прайса у {ready} поз. из {len(nameless)}: заведи "
+                "задачу «изменение свойств» и перечисли в описании пары «код 1С → "
+                "артикул» из списка ниже. Выполнение проставит их через write_items")
+        else:
+            out["вывод"] = (
+                "коллекция В 1С ЕСТЬ, заводить заново НЕЛЬЗЯ — будут дубли. Сверить по "
+                "артикулу её нельзя, пока он пуст: заведи задачу «изменение свойств» на "
+                "простановку артикулов по строкам ниже")
+        return out
+
+    @staticmethod
+    def _only_one_fits(hits: list, line: str) -> object | None:
+        """Кандидат, чьи свойства названы в строке прайса, — если он ровно один.
+
+        Третий ключ и самый слабый, поэтому границы жёстче прежних. Сравниваются только
+        ЧИСЛОВЫЕ приметы (толщина, класс, размер): их пишут одинаково и в карточке, и в
+        прайсе, тогда как словесные значения расходятся написанием, и «совпадение» по ним
+        было бы выдумкой.
+
+        Решение принимается, ТОЛЬКО если уцелел один кандидат. Ноль или два — по-прежнему
+        «не совпало»: этот ключ создан, чтобы разобрать неоднозначность, а не чтобы
+        заменить её другой.
+        """
+        digits = set(re.findall(r"\d+(?:[.,]\d+)?", line or ""))
+        if not digits:
+            return None
+
+        fits = []
+        for item in hits:
+            marks = set()
+            for prop in getattr(item, "properties", ()) or ():
+                marks.update(re.findall(r"\d+(?:[.,]\d+)?", str(prop.value or "")))
+            for field in ("size",):
+                marks.update(re.findall(r"\d+(?:[.,]\d+)?", str(getattr(item, field, "") or "")))
+            for field in ("thickness", "length_from", "width_from"):
+                value = getattr(item, field, None)
+                if value:
+                    marks.add(str(int(value)) if float(value).is_integer() else str(value))
+            if marks & digits:
+                fits.append(item)
+
+        return fits[0] if len(fits) == 1 else None
 
     def _price_line(self, title: str) -> str:
-        """Первая строка прайса, где встречается название расцветки. Пусто — не нашлась."""
-        flat = "".join(ch for ch in str(title or "").lower() if ch.isalnum())
-        if len(flat) < 4:
+        """Первая строка прайса, где встречается название расцветки. Пусто — не нашлась.
+
+        **Короткие названия ищутся ЦЕЛЫМ СЛОВОМ, а не подстрокой.** У коллекции Spark
+        декоры зовутся Ash, Fire, Glow, Star — три-четыре буквы, — и подстрочный поиск по
+        ним ловил бы пол-прайса («ash» внутри «Ashley», «star» внутри «Restart»). Раньше
+        такие имена просто не искались вовсе, и строка прайса для них не находилась
+        никогда: у Spark это семь позиций из восьми.
+        """
+        name = " ".join(str(title or "").split())
+        flat = "".join(ch for ch in name.lower() if ch.isalnum())
+        if len(flat) < 2:
             return ""
+
+        word = re.compile(rf"(?<!\w){re.escape(name)}(?!\w)", re.IGNORECASE)
         for sheet in self.sheets:
             for row in sheet.rows:
                 text = " ".join(str(c) for c in row if str(c or "").strip())
-                if flat in "".join(ch for ch in text.lower() if ch.isalnum()):
+                hit = (flat in "".join(ch for ch in text.lower() if ch.isalnum())
+                       if len(flat) >= 4 else bool(word.search(text)))
+                if hit:
                     return " ".join(text.split())[:120]
         return ""
 
@@ -679,13 +775,14 @@ class TaskBuilderTools:
         # всех артикул пуст, и агент предложил завести коллекцию заново — то есть получить
         # девять дублей (бой 24.09.2026). Ищем такую коллекцию ПО ИМЕНИ и говорим прямо.
         if not found:
-            blind = self._nameless_twin(collection, live)
+            tm_name = self._tm_name(tm_code)
+            blind = self._nameless_twin(collection, live, tm_name)
             if blind:
                 out["коллекция_есть_в_1С"] = blind
 
             # ВТОРОЙ КЛЮЧ включается ТОЛЬКО здесь: когда по артикулу не нашлось ничего.
             # Есть артикулы — решают они, имена не участвуют.
-            by_title = self._by_title(collection, live, inp.get("titles"))
+            by_title = self._by_title(collection, live, inp.get("titles"), tm_name)
             if by_title:
                 out["сверка_по_названиям"] = by_title["сводка"]
                 found = by_title["позиции"]
@@ -1176,8 +1273,11 @@ PROMPT = """Ты — контент-менеджер интернет-магаз
   **ПРИШЛО `коллекция_есть_в_1С` — КОЛЛЕКЦИЮ НЕ ЗАВОДИ.** Она в справочнике есть, просто
   у её позиций пуст артикул, и сверка по артикулу их не видит. Завести заново значит
   получить дубли. Вместо этого заведи «изменение свойств» на ЭТУ коллекцию: проставить
-  артикулы. Строки прайса с артикулами код уже приложил — перенеси их в описание, по ним
-  задачу и выполнят.
+  артикулы. Строки прайса код уже приложил, а где смог — и **готовый `артикул_из_названия`**:
+  поставщик пишет артикул прямо в имени расцветки («Rumba (6006-4)»). Перенеси пары
+  «`ref` → `артикул_из_названия`» в описание СПИСКОМ — по ним задачу и выполнят, проставив
+  артикулы через `write_items`. Позиции без разобранного артикула перечисли отдельно, с их
+  строками прайса: там артикул проставит человек.
   Если в ответе есть `уже_есть_в_1С_вне_коллекции` — это ВОЗВРАТ ранее снятого, а не
   заведение: позиции в 1С есть, их надо вернуть из снятых. Коды 1С и список допишет код,
   тебе перечислять их не нужно — просто заведи задачу на эту коллекцию;
@@ -1347,9 +1447,32 @@ def _flat(value: str) -> str:
 # Хвост имени папки вида «600x238x12»: цифры через x, ×, х (латинская и кириллическая).
 _SIZE_TAIL = re.compile(r"\s+\d+(?:[x×х]\d+)+$", re.IGNORECASE)
 
+#: Артикул, спрятанный В НАЗВАНИИ расцветки: «Rumba (6006-4)», «Steel 65-901».
+#:
+#: Что это вообще такое и почему мы верим, что это артикул, — доказала сама 1С: у
+#: коллекции Modern той же марки артикулы УЖЕ заполнены ровно такими значениями
+#: (`6006-4`, `6003-14`, `1002-32`, `65-901`), а в прайсе те же числа стоят в именах. То
+#: есть поставщик даёт артикул, просто не колонкой.
+#:
+#: Шаблон нарочно узкий — цифры, дефис, цифры. Под него не попадают ни размер
+#: («1290x180x4» — там «x»), ни класс («33 класс»), ни толщина («4мм»).
+_CODE_IN_TITLE = re.compile(r"(?<![\w-])(\d{2,6}-\d{1,4})(?![\w-])")
 
-def _collection_keys(name: str) -> set[str]:
-    """Под какими именами искать эту папку. Их два, и оба нужны.
+
+def article_from_title(title: str) -> str:
+    """Артикул из названия расцветки. Пусто, если его там нет ИЛИ он неоднозначен.
+
+    **Два кандидата — значит ни одного.** Это та же граница, что у второго ключа: гадать
+    нельзя, а неверный артикул хуже отсутствующего. Артикул — единственный
+    межпоставщицкий ключ, по нему выбирается наименьшая цена, и промах увёл бы цену
+    чужому товару.
+    """
+    found = {m.group(1) for m in _CODE_IN_TITLE.finditer(str(title or ""))}
+    return found.pop() if len(found) == 1 else ""
+
+
+def _collection_keys(name: str, tm: str = "") -> set[str]:
+    """Под какими именами искать эту папку. Вариантов три, и все нужны.
 
     У восьми напольных категорий размер пишется в имя ПАПКИ (§19.5): «Классик 600x238x12».
     Коллекция же зовётся «Классик» — и в прайсе, и в свойстве «Коллекция», и в адресе
@@ -1358,9 +1481,46 @@ def _collection_keys(name: str) -> set[str]:
 
     Хвост снимается только СТРОГО ПОХОЖИЙ на размер: цифры, разделённые «x». «Формат 3D»
     под это не попадает — там нет второго числа.
+
+    **Третий вариант — БЕЗ ПРИСТАВКИ МАРКИ**, и он из боя 25.09.2026. В прайсе Вестерхофа
+    коллекции зовутся «Westerhof Spark», «Westerhof Vivace», а в 1С свойство «Коллекция»
+    и папка — просто «Spark», «Vivace». Совпадения не было ни одного, сверка отвечала
+    «коллекции в 1С нет», и агент предлагал завести заново три ЖИВЫЕ коллекции: 8, 8 и 10
+    позиций. Приставка снимается только ЦЕЛЫМ СЛОВОМ и только с начала: «Spark» внутри
+    «Sparkling» не тронется, а «Modern» у другой марки не притянется, потому что снимаем
+    имя ИМЕННО ЭТОЙ марки. Двуязычное «Westerhof / Вестерхоф» даёт оба слова.
     """
-    full = normalize(name)
-    return {full, normalize(_SIZE_TAIL.sub("", " ".join(str(name or "").split())))} - {""}
+    text = " ".join(str(name or "").split())
+    variants = [text, _SIZE_TAIL.sub("", text)]
+
+    for word in _tm_words(tm):
+        for variant in list(variants):
+            flat = variant.strip()
+            low = flat.lower()
+            if low.startswith(word) and len(flat) > len(word):
+                tail = flat[len(word):].strip(" -–—/")
+                if tail:
+                    variants.append(tail)
+
+    return {normalize(v) for v in variants} - {""}
+
+
+def _tm_words(tm: str) -> list[str]:
+    """Слова, которыми марка может начинать имя коллекции: «Westerhof / Вестерхоф» → оба.
+
+    Только ПЕРВОЕ слово каждой половины: марки вроде «A+ Floor» состоят из двух, но в
+    приставке прайса стоит обычно одно. Лишнее слово тут безвреднее недостающего —
+    снятие приставки проверяется по началу строки и по длине остатка.
+    """
+    out = []
+    for half in str(tm or "").split("/"):
+        word = half.strip().lower()
+        if word:
+            out.append(word)
+            first = word.split()[0]
+            if first != word:
+                out.append(first)
+    return out
 
 
 def _mark_of_folder(folder_name: str, known: list) -> dict | None:
