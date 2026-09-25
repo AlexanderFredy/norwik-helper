@@ -144,6 +144,26 @@ class CheapestPriceTest(unittest.IsolatedAsyncioTestCase):
         written = onec.price_writes[0][0]["prices"]
         self.assertEqual(written["rrc"], 2870)
 
+    async def test_article_shared_by_two_items_skips_the_competition(self):
+        """ВОПРОС АДМИНА 25.09.2026. Один код декора бывает у двух товаров марки в разных
+        толщинах: «6006-4» это и Spark (4 мм), и Modern (3,6 мм). Журнал предложений
+        ключуется артикулом — другого межпоставщицкого ключа нет, — и чужая цена по
+        такому коду неизвестно про какую толщину. Приняв её, мы увезли бы цену 3,6 мм на
+        4 мм. Свою цену из прайса при этом пишем как обычно."""
+        onec = FakeOnec([nom(ref="T1", article="6006-4", purchase="2000"),
+                         nom(ref="T2", article="6006-4", collection="Modern",
+                             purchase="960")])
+        tools = self.tools(onec, {"60064": [Offer(2, "Паркет-Холл", 900,
+                                                  price_date="2026-09-15")]})
+        await tools.execute("write_prices", {
+            "tm_code": "TM1", "collection": "Vintage", "purchase": 1880})
+
+        written = onec.price_writes[0][0]["prices"]
+        self.assertEqual(written["purchase"], 1880, "чужое предложение не принято")
+        notes = " ".join(tools.price_notes)
+        self.assertIn("нескольких товаров марки", notes)
+        self.assertNotIn("Паркет-Холл", notes)
+
     async def test_without_the_journal_nothing_changes(self):
         """Журнала нет — пишем то, что дал прайс, и групповой формой, как раньше."""
         onec = FakeOnec([nom(ref="T1", article="A1", purchase="2000")])

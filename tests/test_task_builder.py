@@ -543,6 +543,19 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         # и цены чужой коллекции сверка больше не трогает
         self.assertNotIn("расход", str(got["цены"]))
 
+    async def test_one_article_on_two_cards_of_the_same_collection_is_reported(self):
+        """Уже не омоним, а ошибка справочника: выбрать наугад значит увезти цену не
+        туда. Молчать нельзя — по такому коду цена уедет случайной карточке."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("S1", "6006-4", site="Ash", collection="Spark"),
+            self.nom("S2", "6006-4", site="Fire", collection="Spark"),
+        ], tm="Westerhof / Вестерхоф"))
+        got = await self.compare(tools, ["6006-4"], collection="Westerhof SPARK")
+
+        self.assertEqual(got["нашлось_в_1С"], 0)
+        self.assertEqual(got["артикул_не_различает_позиции"],
+                         ["6006-4 → 2 карточки в этой коллекции"])
+
     async def test_article_match_stands_when_the_collection_is_named_otherwise(self):
         """Most Flooring: в 1С «Millenium Pro», в прайсе «Миллениум Про». Коллекции с
         таким именем в 1С НЕТ, и там артикул остаётся единственным ключом — правило про

@@ -425,7 +425,32 @@ class TaskTools:
         if not asked and flat_purchase is None:
             return rows
 
-        by_key = {norm_article(i.article): i for i in in_collection if i.article}
+        # НЕУНИКАЛЬНЫЙ АРТИКУЛ В КОНКУРЕНЦИИ НЕ УЧАСТВУЕТ.
+        #
+        # Журнал предложений ключуется артикулом — другого межпоставщицкого ключа не
+        # существует. Но один код декора бывает у двух товаров марки в разных толщинах:
+        # у Вестерхофа «6006-4» это и Spark (4 мм), и Modern (3,6 мм). Чужое предложение
+        # по такому коду неизвестно про какую толщину, и приняв его, мы увезли бы цену
+        # 3,6 мм на 4 мм. Свои цены из прайса при этом пишутся как обычно — отказ
+        # касается ТОЛЬКО выбора между поставщиками.
+        counts: dict[str, int] = {}
+        for i in self._items_cache.get(str(inp.get("tm_code") or "").strip(), []):
+            key = norm_article(i.article)
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+        twins = {key for key, n in counts.items() if n > 1}
+
+        by_key = {}
+        for i in in_collection:
+            key = norm_article(i.article)
+            if not key:
+                continue
+            if key in twins:
+                self.price_notes.append(
+                    f"{i.article}: артикул есть у нескольких товаров марки (разные "
+                    f"толщины) — наименьшую цену по нему не выбирал, записал цену прайса")
+                continue
+            by_key[key] = i
         try:
             found = await self._offers.offers(list(by_key), self._supplier_id)
         except Exception:                               # noqa: BLE001

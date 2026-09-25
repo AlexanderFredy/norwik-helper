@@ -686,9 +686,16 @@ class TaskBuilderTools:
         # Артикул же одинаков в обоих источниках — 3309 и в прайсе 3309, и в 1С. По нему
         # и сопоставляем, а имя коллекции 1С ВОЗВРАЩАЕМ агенту: пусть адресует задачу так,
         # как она называется в справочнике.
-        by_article = {norm_article(i.article): i for i in live if i.article}
-        found = [by_article[key] for key, _ in from_price if key in by_article]
-        missing_in_1c = [shown for key, shown in from_price if key not in by_article]
+        # СПИСОК, А НЕ ОДНА КАРТОЧКА НА АРТИКУЛ. Артикул уникален не всегда: один код
+        # декора бывает у двух коллекций марки в разных толщинах, и у Вестерхофа так и
+        # есть. Словарь «артикул → карточка» такую пару схлопывал молча — вторая карточка
+        # не находилась по артикулу НИКОГДА, а какая из двух уцелеет, решал порядок
+        # выгрузки. Проставь мы артикулы второй коллекции, она бы просто исчезла из сверки.
+        by_article: dict[str, list] = {}
+        for item in live:
+            key = norm_article(item.article)
+            if key:
+                by_article.setdefault(key, []).append(item)
 
         # …НО СВОЯ КОЛЛЕКЦИЯ ПЕРЕВЕШИВАЕТ АРТИКУЛ, если она в 1С есть.
         #
@@ -708,11 +715,22 @@ class TaskBuilderTools:
         tm_name = self._tm_name(tm_code)
         keys = _collection_keys(collection, tm_name)
         own = {i.ref for i in live if _collection_keys(collection_of(i), tm_name) & keys}
-        strangers = [i for i in found if i.ref not in own] if own else []
-        if strangers:
-            found = [i for i in found if i.ref in own]
-            missing_in_1c = [shown for key, shown in from_price
-                             if key not in by_article or by_article[key].ref not in own]
+
+        found, missing_in_1c, strangers, unclear_codes = [], [], [], []
+        for key, shown in from_price:
+            hits = by_article.get(key) or []
+            mine = [i for i in hits if i.ref in own] if own else hits
+
+            if len(mine) == 1:
+                found.append(mine[0])
+            elif mine:
+                # Два товара СВОЕЙ коллекции под одним артикулом — это уже не омоним, а
+                # ошибка в справочнике: выбрать наугад значит увезти цену не туда.
+                unclear_codes.append(f"{shown} → {len(mine)} карточки в этой коллекции")
+                missing_in_1c.append(shown)
+            else:
+                missing_in_1c.append(shown)
+            strangers.extend(i for i in hits if i not in mine)
 
         # ЧТО ЭТОТ ПРАЙС ВИДЕЛ — в журнал встреч (`storage/sightings.py`). Артикулы уже
         # перечислены моделью, коллекция названа ею же: запись стоит ноль токенов и ноль
@@ -765,6 +783,10 @@ class TaskBuilderTools:
             **({"артикулы_заняты_другой_коллекцией": [
                 f"{i.article} → {collection_of(i)} / {i.site_name or i.name}"
                 for i in strangers[:20]]} if strangers else {}),
+            # Один артикул на две карточки ОДНОЙ коллекции — ошибка справочника, и
+            # молчать о ней нельзя: цена по такому коду уедет наугад.
+            **({"артикул_не_различает_позиции": unclear_codes[:20]}
+               if unclear_codes else {}),
             "цены": self._price_diff(found, inp),
             "empty_properties": self._empty_properties(
                 [i for i in live if collection_of(i) in where]),
