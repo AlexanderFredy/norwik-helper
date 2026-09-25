@@ -164,6 +164,42 @@ class CheapestPriceTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("нескольких товаров марки", notes)
         self.assertNotIn("Паркет-Холл", notes)
 
+    async def test_item_out_of_competition_still_gets_its_price(self):
+        """Из КОНКУРЕНЦИИ такая позиция выбывает, а из ЗАПИСИ — нет: иначе товар остался
+        бы вообще без цены, а это хуже того, от чего защищаемся."""
+        onec = FakeOnec([nom(ref="T1", article="6006-4", purchase="2000"),
+                         nom(ref="T2", article="6006-4", collection="Modern",
+                             purchase="960"),
+                         nom(ref="T3", article="UNIQ", purchase="2000")])
+        tools = self.tools(onec, {"uniq": [Offer(2, "Паркет-Холл", 1500,
+                                                 price_date="2026-09-15")]})
+        await tools.execute("write_prices", {
+            "tm_code": "TM1", "collection": "Vintage", "purchase": 1880})
+
+        written = {p["ref"]: p["prices"]["purchase"]
+                   for p in onec.price_writes[0] if "ref" in p}
+        self.assertEqual(written.get("T3"), 1500, "по уникальному коду конкурент выиграл")
+        self.assertEqual(written.get("T1"), 1880, "а эта позиция получила цену прайса")
+
+    async def test_skipped_price_kind_is_named_in_the_report(self):
+        """СЛУЧАЙ С БОЯ (25.09.2026). У Spark в карточках стояла РРЦ 1850, в прайсе
+        пришла 1870 — отличие 1,1%, меньше порога 2%, и код её законно пропустил. Закупка
+        и розница изменились, админ увидел «цены записаны» и решил, что РРЦ потерялась.
+        Правило верное, отчёт был неполным."""
+        from src.onec.client import Price as OnecPrice
+
+        item = nom(ref="T1", article="A1", purchase="1500")
+        item = item.__class__(**{**item.__dict__,
+                                 "rrc": OnecPrice(value=1850.0, date=None)})
+        onec = FakeOnec([item])
+        tools = TaskTools(onec, b"", "p.xlsx", allow, kind=TaskKind.CHANGE_PRICES)
+        out = await tools.execute("write_prices", {
+            "tm_code": "TM1", "collection": "Vintage", "purchase": 1150, "rrc": 1870})
+
+        self.assertIn("Пропущено", out)
+        self.assertIn("РРЦ", out)
+        self.assertIn("1850", out)
+
     async def test_without_the_journal_nothing_changes(self):
         """Журнала нет — пишем то, что дал прайс, и групповой формой, как раньше."""
         onec = FakeOnec([nom(ref="T1", article="A1", purchase="2000")])

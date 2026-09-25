@@ -39,6 +39,35 @@ from src.model.refs import norm_article
 from src.price_tool.parser import render_preview, parse_price_table
 
 
+def _skipped_kinds(group) -> str:
+    """Какие виды цен НЕ записаны и почему. Пусто — записалось всё, что прислали.
+
+    **Молчание тут читается как поломка.** Случай 25.09.2026: у Spark в карточках стояла
+    РРЦ 1850, в прайсе пришла 1870 — отличие 1,1%, меньше порога значимости в 2%, и код
+    её законно пропустил. Закупка и розница при этом изменились, админ увидел «цены
+    записаны» и решил, что РРЦ потерялась. Правило верное, а отчёт был неполным: теперь
+    пропуск называется вместе с причиной и цифрами.
+    """
+    reasons: dict[str, tuple[str, object, object]] = {}
+    for plan in getattr(group, "plans", []) or []:
+        for kind, why in (plan.skipped or {}).items():
+            if kind not in reasons:
+                reasons[kind] = (why, plan.before.get(kind), plan.prices.get(kind))
+
+    label = {"purchase": "закупка", "rrc": "РРЦ", "retail": "розница"}
+    out = []
+    for kind, (why, current, _new) in reasons.items():
+        name = label.get(kind, kind)
+        if why == "below_threshold":
+            out.append(f"{name} не записана: отличие от текущей ({current}) меньше "
+                       f"порога 2% — это «та же цена»")
+        elif why == "same":
+            out.append(f"{name} уже такая ({current})")
+        else:
+            out.append(f"{name} не записана: {why}")
+    return ("Пропущено: " + "; ".join(out) + ".") if out else ""
+
+
 def _money(value):
     """Цена в число. Ноль и мусор — «цены нет»."""
     if value is None:
@@ -440,7 +469,10 @@ class TaskTools:
                 counts[key] = counts.get(key, 0) + 1
         twins = {key for key, n in counts.items() if n > 1}
 
-        by_key = {}
+        # Из КОНКУРЕНЦИИ такие позиции выбывают, а из ЗАПИСИ — нет: их цена приходит из
+        # обрабатываемого прайса, как и раньше. Выбросив их совсем, мы оставили бы товар
+        # вообще без цены — это было бы хуже того, от чего защищаемся.
+        by_key, own_only = {}, []
         for i in in_collection:
             key = norm_article(i.article)
             if not key:
@@ -449,6 +481,7 @@ class TaskTools:
                 self.price_notes.append(
                     f"{i.article}: артикул есть у нескольких товаров марки (разные "
                     f"толщины) — наименьшую цену по нему не выбирал, записал цену прайса")
+                own_only.append(i)
                 continue
             by_key[key] = i
         try:
@@ -484,6 +517,14 @@ class TaskTools:
                 out.append({"ref": item.ref, "purchase": choice.offer.purchase,
                             "rrc": choice.offer.rrc})
             else:
+                out.append(dict(row, ref=item.ref))
+
+        # Позиции, выбывшие из конкуренции, возвращаются в запись со своей ценой.
+        for item in own_only:
+            row = asked.get(item.ref)
+            if row is None and not asked:
+                row = {"ref": item.ref, "purchase": flat_purchase, "rrc": flat_rrc}
+            if row is not None:
                 out.append(dict(row, ref=item.ref))
 
         if not out:
@@ -876,6 +917,9 @@ class TaskTools:
             self.errors.append(f"{err.get('ref')}: {err.get('code')} {err.get('message')}")
 
         report = f"Цены записаны: обновлено {updated}, без изменений {unchanged}."
+        skipped = _skipped_kinds(group)
+        if skipped:
+            report += " " + skipped
         if missing:
             report += f" Не нашлось в 1С: {', '.join(missing)}."
         if errors:
