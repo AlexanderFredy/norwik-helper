@@ -450,11 +450,19 @@ class PageSizeTest(unittest.TestCase):
     границы разъехались бы, потеряв позицию молча.
     """
 
-    def test_page_is_small_and_halves_cleanly(self):
+    def test_page_size_halves_cleanly(self):
+        """Степень двойки — условие точности спасателя, а не эстетика: половины
+        адресуются той же арифметикой страниц, и на нечётном размере границы разъедутся,
+        потеряв позицию молча."""
         from src.onec.client import PAGE_SIZE
-        self.assertLessEqual(PAGE_SIZE, 10, "крупнее проверенно живого размера не берём")
         self.assertEqual(PAGE_SIZE & (PAGE_SIZE - 1), 0,
                          "размер обязан делиться пополам до единицы")
+
+    def test_page_size_fits_the_waiting_limit(self):
+        """Стартовый размер обязан укладываться в предел ожидания на здоровом канале:
+        по журналу IIS двести позиций считаются 6,8 с, то есть ~34 мс на позицию."""
+        from src.onec.client import PAGE_SIZE, PAGE_TIMEOUT
+        self.assertLess(1.2 + PAGE_SIZE * 0.034, PAGE_TIMEOUT)
 
     def test_pages_are_requested_by_that_size(self):
         from src.onec.client import PAGE_SIZE
@@ -472,6 +480,97 @@ class PageSizeTest(unittest.TestCase):
 
         self.assertEqual(seen[0]["size"], str(PAGE_SIZE))
         self.assertEqual(len(seen), -(-60 // PAGE_SIZE), "60 позиций разбиты без остатка")
+
+
+class AdaptivePageTest(unittest.TestCase):
+    """Размер страницы подбирается ПОД КАНАЛ (25.09.2026).
+
+    Константа хороша ровно для одного пути: через VPN не проходило и восемь позиций,
+    напрямую сервер отдаёт двести за 6,8 с. Поэтому клиент начинает с `PAGE_SIZE` и
+    ужимается вдвое там, где крупная страница не доходит.
+    """
+
+    def client(self, handler):
+        c = OnecClient("http://example.invalid/api", "token", retries=1, backoff=0)
+        c._client = httpx.Client(base_url="http://example.invalid/api",
+                                 transport=httpx.MockTransport(handler))
+        return c
+
+    def answer(self, page, size, total=64):
+        first = (page - 1) * size + 1
+        refs = [f"YO-{i}" for i in range(first, min(first + size, total + 1))]
+        return {"tm": "Egger", "total": total, "offset": page, "limit": size,
+                "items": [{"ref": r, "name": r, "article": r, "prices": []} for r in refs],
+                "errors": []}
+
+    def test_healthy_channel_keeps_the_big_page(self):
+        sizes = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            params = dict(request.url.params)
+            sizes.append(int(params["size"]))
+            return httpx.Response(200, json=self.answer(int(params["page"]),
+                                                        int(params["size"])))
+
+        c = self.client(handler)
+        nom = c.by_tm_all("T1", size=16)
+        self.assertEqual(len(nom.items), 64)
+        self.assertEqual(sizes, [16, 16, 16, 16], "ужиматься было не на чем")
+        self.assertEqual(c._page_size, 16)
+
+    def test_one_failure_does_not_shrink_the_page(self):
+        """Одиночный провал случаен, и ужиматься из-за него значит остаться на мелкой
+        странице до конца прогона на ровном месте."""
+        state = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            params = dict(request.url.params)
+            state["n"] += 1
+            if state["n"] == 1:
+                raise httpx.ReadTimeout("timed out")
+            return httpx.Response(200, json=self.answer(int(params["page"]),
+                                                        int(params["size"])))
+
+        c = self.client(handler)
+        c.by_tm_all("T1", size=16)
+        self.assertEqual(c._page_size, 16)
+
+    def test_channel_that_drops_big_pages_shrinks_it(self):
+        """Две сорвавшиеся страницы подряд — это уже канал, а не случайность."""
+        seen = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            params = dict(request.url.params)
+            size, page = int(params["size"]), int(params["page"])
+            seen.append(size)
+            if size >= 16:                              # крупное по этому каналу не ходит
+                raise httpx.ReadTimeout("timed out")
+            return httpx.Response(200, json=self.answer(page, size))
+
+        c = self.client(handler)
+        nom = c.by_tm_all("T1", size=16)
+
+        self.assertEqual(c._page_size, 8, "размер ужался вдвое")
+        self.assertEqual(len(nom.items), 64, "и марка всё равно доехала целиком")
+        self.assertEqual(nom.errors, [])
+        self.assertNotIn(16, seen[-2:], "последние запросы уже мелкие")
+
+    def test_shrunk_size_survives_to_the_next_mark(self):
+        """Подобранный размер живёт на клиенте: платить за подбор на каждой марке
+        незачем, канал за прогон не меняется."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            params = dict(request.url.params)
+            size = int(params["size"])
+            if size >= 16:
+                raise httpx.ReadTimeout("timed out")
+            return httpx.Response(200, json=self.answer(int(params["page"]), size))
+
+        c = self.client(handler)
+        c.by_tm_all("T1", size=16)
+        self.assertEqual(c._page_size, 8)
+
+        c.by_tm_all("T2")                               # без size — берётся подобранный
+        self.assertEqual(c._page_size, 8)
 
 
 class KeepAliveTest(unittest.TestCase):
