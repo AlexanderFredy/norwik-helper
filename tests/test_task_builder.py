@@ -519,6 +519,42 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         # к каждой позиции приложена строка прайса — по ней и проставят артикул
         self.assertIn("Дуб Авила", blind["позиции"][0]["строка_прайса"])
 
+    async def test_same_article_in_another_collection_is_a_homonym(self):
+        """СЛУЧАЙ С БОЯ (25.09.2026). Раздел «Westerhof SPARK» (4 мм) и коллекция Modern
+        (3,6 мм) — один и тот же декор в двух толщинах, артикулы общие. Три кода прайса
+        Spark нашлись в карточках Modern, и рушилось всё сразу: раз «нашлось», поиск
+        коллекции по имени не запускался, агент предлагал завести восемь живых позиций
+        заново, а сверка цен сравнивала закупку Spark с ценой Modern.
+        """
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("S1", "", site="Ash", collection="Spark"),
+            self.nom("S2", "", site="Fire", collection="Spark"),
+            self.nom("M1", "1002-32", site="Organic", collection="Modern",
+                     purchase=960.0),
+        ], tm="Westerhof / Вестерхоф"))
+        got = await self.compare(tools, ["1002-32", "6025-7"],
+                                 collection="Westerhof SPARK")
+
+        self.assertEqual(got["нашлось_в_1С"], 0, "чужая коллекция — не совпадение")
+        self.assertEqual(got["артикулы_заняты_другой_коллекцией"],
+                         ["1002-32 → Modern / Organic"])
+        self.assertEqual(got["коллекция_есть_в_1С"]["позиций"], 2,
+                         "а своя коллекция в 1С есть, заводить нечего")
+        # и цены чужой коллекции сверка больше не трогает
+        self.assertNotIn("расход", str(got["цены"]))
+
+    async def test_article_match_stands_when_the_collection_is_named_otherwise(self):
+        """Most Flooring: в 1С «Millenium Pro», в прайсе «Миллениум Про». Коллекции с
+        таким именем в 1С НЕТ, и там артикул остаётся единственным ключом — правило про
+        омонимы не должно этот случай задевать."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", collection="Millenium Pro"),
+        ]))
+        got = await self.compare(tools, ["3309"], collection="Миллениум Про")
+
+        self.assertEqual(got["нашлось_в_1С"], 1)
+        self.assertNotIn("артикулы_заняты_другой_коллекцией", got)
+
     async def test_articles_for_a_nameless_collection_are_prepared(self):
         """Коллекции без артикулов (Spark, Vivace) достаётся готовая работа: пары «код 1С
         → артикул из названия». Артикул поставщик даёт прямо в имени расцветки, и это
