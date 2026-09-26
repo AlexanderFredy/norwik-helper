@@ -11,7 +11,7 @@ from pathlib import Path
 from src.bot.model_loop import AgentLoop
 from src.model.commands import Command, CommandKind
 from src.model.enums import PriceStatus, TaskKind, TaskStatus
-from src.model.events import Broadcaster, Listener
+from src.model.events import Broadcaster, EventKind, Listener
 from src.model.service import PriceListService
 from src.price_tool import model_view as view
 from src.storage import price_files
@@ -292,6 +292,71 @@ class CommandFlowTest(Base):
                         task_id=self.task.id)
         self.assertEqual(await self.queue.pending(), [])
         self.assertEqual(await self.queue.taken(), [])
+
+
+class RenameSupplierTest(Base):
+    """Переименование поставщика ИЗ 1С (решение админа 26.09.2026).
+
+    Имя видно в таблице прайсов формы, карточка зеркала правится руками. Останься правка
+    в 1С — справочники разойдутся: в форме «Монарх Логистик», в Telegram «Монарх», и на
+    вопрос «чей это прайс» визуалы ответят по-разному.
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        await self.submit()
+        code = self.model.prices[0].supplier_price.supplier_id
+        self.supplier = await self.suppliers.get_supplier(code)
+        self.seen.events.clear()
+
+    async def rename(self, code, name, actor="1c:Саша"):
+        await self.queue.put(Command(kind=CommandKind.RENAME_SUPPLIER, source="1c",
+                                     actor=actor,
+                                     payload={"code": str(code), "name": name}))
+        return await self.loop.tick()
+
+    async def test_new_name_reaches_the_model(self):
+        await self.rename(self.supplier.id, "Монарх Логистик")
+
+        again = await self.suppliers.get_supplier(self.supplier.id)
+        self.assertEqual(again.name, "Монарх Логистик")
+        # событие с ПУСТЫМ текстом: Telegram такие не показывает (админ сам это и сделал),
+        # а провайдер 1С от него увозит снимок с новым именем
+        kinds = [(e.kind, e.text) for e in self.seen.events]
+        self.assertIn((EventKind.SUPPLIER_RENAMED, ""), kinds)
+
+    async def test_empty_name_is_refused(self):
+        await self.rename(self.supplier.id, "   ")
+
+        again = await self.suppliers.get_supplier(self.supplier.id)
+        self.assertEqual(again.name, self.supplier.name, "имя не тронуто")
+        self.assertTrue(any(e.kind == EventKind.COMMAND_REJECTED
+                            for e in self.seen.events))
+
+    async def test_unknown_code_is_refused_not_ignored(self):
+        await self.rename(9999, "Кто-то")
+        self.assertTrue(any(e.kind == EventKind.COMMAND_REJECTED
+                            for e in self.seen.events))
+
+    async def test_two_suppliers_renamed_at_once_both_survive(self):
+        """Схлопывание по объекту такую команду поймать не должно: у неё нет ни прайса, ни
+        задачи, и две правки разных поставщиков слились бы в одну."""
+        other = await self.suppliers.add_supplier("Паркет-Холл")
+        await self.queue.put(Command(kind=CommandKind.RENAME_SUPPLIER, source="1c",
+                                     actor="1c:Саша",
+                                     payload={"code": str(self.supplier.id),
+                                              "name": "Монарх Логистик"}))
+        await self.queue.put(Command(kind=CommandKind.RENAME_SUPPLIER, source="1c",
+                                     actor="1c:Саша",
+                                     payload={"code": str(other.id),
+                                              "name": "Паркет-Холл Москва"}))
+        self.assertEqual(len(await self.queue.pending()), 2, "команды не схлопнулись")
+
+        await self.loop.tick()
+        first = await self.suppliers.get_supplier(self.supplier.id)
+        second = await self.suppliers.get_supplier(other.id)
+        self.assertEqual(first.name, "Монарх Логистик")
+        self.assertEqual(second.name, "Паркет-Холл Москва")
 
 
 class ViewTest(Base):

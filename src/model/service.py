@@ -162,6 +162,8 @@ class PriceListService:
             return await self._destroy(command)
         if kind == CommandKind.RELEASE_LOCK:
             return await self._release(command)
+        if kind == CommandKind.RENAME_SUPPLIER:
+            return await self._rename_supplier(command)
 
         logger.warning("Неизвестная команда: %s", kind)
 
@@ -432,6 +434,49 @@ class PriceListService:
         if lock.actor != command.actor:
             return await self._reject(command, "захват принадлежит другому администратору")
         await self._drop_lock(command.price_id, "снят досрочно")
+
+    # ------------------------------------------------------------- поставщики
+
+    async def _rename_supplier(self, command: Command) -> None:
+        """Принять новое имя поставщика из 1С (решение админа 26.09.2026).
+
+        **Зачем вообще обратный ход.** Имя поставщика видно в таблице прайсов формы, а
+        карточка зеркала открывается по двойному щелчку и правится. Если правка остаётся
+        в 1С, дальше расходятся два справочника: в форме «Монарх Логистик», в Telegram
+        «Монарх», и на вопрос «чей это прайс» два визуала отвечают по-разному.
+
+        **Почему командой, а не чтением при снимке.** Снимок уезжает ТОЛЬКО когда
+        состояние менялось, и правка в 1С его не разбудит — пришлось бы опрашивать
+        справочник каждый оборот. Команда же живёт в очереди, переживает перезапуск и
+        закрывается с исходом, как всякая другая.
+
+        Код поставщика — тот же, что уезжает в снимке (`supplier_code`), то есть `id`
+        модели. Пустое имя отклоняется: «без имени» это не переименование.
+        """
+        payload = command.payload or {}
+        code = str(payload.get("code") or "").strip()
+        name = str(payload.get("name") or "").strip()
+
+        if not code.isdigit():
+            return await self._reject(command, f"непонятный код поставщика: «{code}»")
+        if not name:
+            return await self._reject(command, "пустое имя поставщика")
+
+        supplier = await self._suppliers.get_supplier(int(code))
+        if supplier is None:
+            return await self._reject(command, f"поставщика с кодом {code} в модели нет")
+        if supplier.name == name:
+            return                                      # уже так зовётся, работы нет
+
+        was = supplier.name
+        if not await self._suppliers.rename_supplier(int(code), name):
+            return await self._reject(command, "переименование не применилось")
+
+        # Событие с ПУСТЫМ текстом: слушатель Telegram такие пропускает, а провайдер 1С
+        # от него поднимает признак «менялось» и увозит снимок с новым именем. Сообщать
+        # админу о правке, которую он сам только что сделал, незачем.
+        await self.events.publish(Event(EventKind.SUPPLIER_RENAMED, text=""))
+        logger.info("Поставщик %s переименован из 1С: «%s» → «%s»", code, was, name)
 
     # ------------------------------------------------------------------ захват
 
