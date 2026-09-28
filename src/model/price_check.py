@@ -171,6 +171,13 @@ def flat_prices(items, purchase=None, rrc=None) -> dict[str, dict[str, Decimal]]
     ячейки пустые: цена общая. Колоночный разбор такую раскладку не берёт в принципе —
     он идёт по строкам, а строк с ценами всего одна. Поэтому пару чисел называет модель,
     она их и так видит, а раскладывает по позициям код.
+
+    **АРТИКУЛ ЗДЕСЬ НИ ПРИ ЧЁМ, и это не мелочь.** Ключом был он — и позиции с пустым
+    артикулом выпадали из сверки целиком. У Classen так вышло со всей коллекцией
+    «Adventure WR»: девять карточек, артикул пуст у всех, номер стоит в наименовании. Пять
+    из девяти держали цену 1098/1280 при прайсовой 1795/2510, а сверка молчала — сравнивать
+    ей было нечего (бой 28.09.2026). Цена на коллекцию потому и «на коллекцию», что
+    относится к КАЖДОЙ её позиции: ключом идёт код 1С, он есть всегда.
     """
     wanted = {}
     if purchase is not None:
@@ -183,7 +190,7 @@ def flat_prices(items, purchase=None, rrc=None) -> dict[str, dict[str, Decimal]]
             wanted["rrc"] = value
     if not wanted:
         return {}
-    return {norm_article(i.article): dict(wanted) for i in items if i.article}
+    return {i.ref: dict(wanted) for i in items if i.ref}
 
 
 def compare(items, from_price: dict[str, dict[str, Decimal]]) -> Diff:
@@ -198,8 +205,14 @@ def compare(items, from_price: dict[str, dict[str, Decimal]]) -> Diff:
     nameless = 0
 
     for item in items:
+        # ДВА КЛЮЧА, и оба законные. Колоночный разбор кладёт цены по АРТИКУЛУ — он
+        # единственное, что связывает строку файла с карточкой. Цена на коллекцию кладётся
+        # по КОДУ 1С: она относится к каждой позиции папки, и артикула у позиции может не
+        # быть вовсе (у Classen его нет у всей коллекции). Порядок важен: артикул точнее,
+        # код — запасной путь.
         key = norm_article(item.article)
-        wanted = from_price.get(key) if key else None
+        ref = getattr(item, "ref", "") or ""
+        wanted = (from_price.get(key) if key else None) or from_price.get(ref)
         if not wanted:
             no_price += 1
             # Цены нет НИ ТАМ, НИ ТАМ. Это не «сравнить нечем», а работа: позиция стоит
@@ -220,7 +233,11 @@ def compare(items, from_price: dict[str, dict[str, Decimal]]) -> Diff:
             elif not same_price(now, new):
                 parts.append(f"{LABEL[kind]} {_num(now)} → {_num(new)}")
         if parts:
-            changed.append(f"{item.article}: " + ", ".join(parts))
+            # Называем позицию тем, что у неё есть: артикулом, а без него — кодом 1С и
+            # расцветкой. «: закупка 1098 → 1795» без имени админ не прочтёт.
+            who = (item.article or "").strip() or \
+                f"{item.ref} {(item.site_name or item.name or '').strip()}".strip()
+            changed.append(f"{who}: " + ", ".join(parts))
         else:
             same += 1
 

@@ -20,10 +20,14 @@ class Price:
 class Item:
     """Урезанная запись выгрузки: сверке нужны только артикул и две цены."""
 
-    def __init__(self, article, purchase=None, rrc=None):
+    def __init__(self, article, purchase=None, rrc=None, ref="", site_name=""):
         self.article = article
         self.purchase = Price(purchase) if purchase is not None else None
         self.rrc = Price(rrc) if rrc is not None else None
+        # Код 1С и расцветка — второй ключ сверки: цена на коллекцию кладётся по коду,
+        # потому что артикула у позиции может не быть вовсе.
+        self.ref = ref
+        self.site_name = site_name
 
 
 ROWS = [
@@ -153,3 +157,41 @@ class CompareTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FlatPriceWithoutArticlesTest(unittest.TestCase):
+    """СЛУЧАЙ С БОЯ (28.09.2026). У Classen вся коллекция «Adventure WR» заведена с ПУСТЫМ
+    артикулом — номер стоит в наименовании. Пять карточек из девяти держали 1098/1280 при
+    прайсовой 1795/2510, а сверка молчала: и раскладка цены, и сравнение ключевались
+    артикулом, которого нет.
+
+    Цена на коллекцию потому и «на коллекцию», что относится к КАЖДОЙ её позиции.
+    """
+
+    def items(self):
+        return [Item("", 1795, 2510, ref="YO-74816", site_name="Дуб Авола"),
+                Item("", 1098, 1280, ref="YO-74818", site_name="Дуб Андерсон"),
+                Item("", 1098, 1280, ref="YO-74819", site_name="Дуб Донкастер")]
+
+    def test_collection_price_reaches_items_without_articles(self):
+        items = self.items()
+        wanted = pc.flat_prices(items, purchase=1795, rrc=2510)
+        diff = pc.compare(items, wanted)
+
+        self.assertEqual(len(diff.changed), 2, "две позиции держат чужую цену")
+        self.assertEqual(diff.same, 1)
+        self.assertEqual(diff.no_price_in_file, 0, "цена на коллекцию есть у всех")
+
+    def test_position_without_an_article_is_named_by_code_and_colour(self):
+        """«: закупка 1098 → 1795» без имени админ не прочтёт."""
+        items = self.items()
+        diff = pc.compare(items, pc.flat_prices(items, purchase=1795))
+        self.assertIn("YO-74818 Дуб Андерсон", diff.changed[0])
+
+    def test_article_still_wins_when_it_is_there(self):
+        """Артикул точнее кода: колоночный разбор кладёт цены по нему, и подменять его
+        кодом нельзя."""
+        items = [Item("3309", 1000, ref="R1")]
+        diff = pc.compare(items, {"3309": {"purchase": Decimal("2000")},
+                                  "R1": {"purchase": Decimal("9999")}})
+        self.assertIn("1 000 → 2 000", diff.changed[0])
