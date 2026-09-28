@@ -519,6 +519,48 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         # к каждой позиции приложена строка прайса — по ней и проставят артикул
         self.assertIn("Дуб Авила", blind["позиции"][0]["строка_прайса"])
 
+    async def test_article_number_inside_the_1c_name_is_found(self):
+        """СЛУЧАЙ С БОЯ (28.09.2026). У Classen три позиции лежат в папке «Adventure» с
+        ПУСТЫМ полем «Артикул», а номер стоит в наименовании: «Classen Adventure WR Дуб
+        Авола 62593». Сверка по артикулу дала ложное «не нашлось», агент предложил
+        завести коллекцию целиком, и только выполнение показало, что всё на месте.
+
+        Прежние защиты не помогли: `_nameless_twin` ищет коллекцию ПО ИМЕНИ, а в 1С она
+        зовётся «Adventure» против «ADVENTURE WR» в прайсе.
+        """
+        # Номер стоит в НАИМЕНОВАНИИ карточки — ровно как в 1С у Classen.
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("YO-74816", "", site="Дуб Авола 62593", collection="Adventure"),
+            self.nom("YO-74817", "", site="Дуб Пасадена", collection="Adventure"),
+        ], tm="Classen / Классен"))
+
+        got = await self.compare(tools, ["62593", "62594"],
+                                 collection="ADVENTURE WR")
+
+        self.assertEqual(len(got["нашлись_по_номеру_в_наименовании"]), 1)
+        self.assertIn("YO-74816", got["нашлись_по_номеру_в_наименовании"][0])
+        self.assertEqual(got["missing_in_1c"], ["62594"], "остальное честно не нашлось")
+
+    def test_short_numbers_and_ambiguity_are_not_matched(self):
+        """Класс «32» и толщина «8» из имени под правило не попадают, а совпадение у двух
+        карточек считается НЕ найденным: гадать нельзя."""
+        from src.onec.client import NomItem
+
+        def card(ref, name):
+            return NomItem(ref=ref, id="", name=name, article="", unit="м2", size="",
+                           product_type="Ламинат", collection="Adventure",
+                           parent="Adventure", collection_ref="F1", alt_units={},
+                           purchase=None, retail=None, rrc=None, site_name="")
+
+        live = [card("A", "Ламинат 32 класс 8 мм 62593"),
+                card("B", "Ламинат другой 62593")]
+        pairs, still = TaskBuilderTools._by_number_in_name(["62593"], live)
+        self.assertEqual(pairs, [], "две карточки — значит ни одной")
+        self.assertEqual(still, ["62593"])
+
+        pairs, still = TaskBuilderTools._by_number_in_name(["32"], live[:1])
+        self.assertEqual(pairs, [], "короткий номер не ключ")
+
     async def test_article_differing_by_a_short_tail_is_reported(self):
         """СЛУЧАЙ С БОЯ (28.09.2026). Linderwood пишет один декор тремя способами: в 1С
         «LE-266», в прайсе «LE-266-32», в остатках «LE 266-V». Ключи не совпадают, сверка
