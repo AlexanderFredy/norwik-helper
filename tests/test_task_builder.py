@@ -519,6 +519,48 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         # к каждой позиции приложена строка прайса — по ней и проставят артикул
         self.assertIn("Дуб Авила", blind["позиции"][0]["строка_прайса"])
 
+    async def test_remembered_columns_come_with_the_sheet(self):
+        """ВОПРОС АДМИНА 28.09.2026. У Линдервуда две колонки закупки — самовывоз и с
+        доставкой, — и по файлу не видно, какая наша: это договорённость с поставщиком.
+        Раз выбранное напоминается вместе с листом, а не спрашивается заново."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([]),
+                                 known_columns={"": {"article": "A",
+                                                     "purchase": "D",
+                                                     "rrc": "F"}})
+        out = await tools.execute("read_price", {})
+
+        self.assertIn("ЗАПОМНЕННЫЕ КОЛОНКИ", out)
+        self.assertIn("purchase=D", out)
+        self.assertIn("не выбирай заново", out)
+
+    async def test_columns_used_in_the_run_are_collected_for_memory(self):
+        """То, чем агент воспользовался, уходит в память формата — по сигнатуре, а не по
+        файлу: следующий прайс того же поставщика придёт с той же раскладкой."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309")]))
+        await tools.execute("read_price", {})
+        await self.compare(tools, ["3309"],
+                           columns={"article": "Артикул", "purchase": "Дилерская",
+                                    "rrc": "РРЦ"})
+
+        self.assertEqual(list(tools._price_cols.values()),
+                         [{"article": "Артикул", "purchase": "Дилерская", "rrc": "РРЦ"}])
+
+    async def test_columns_that_did_not_resolve_are_not_remembered(self):
+        """Запоминать то, что не сработало, — значит подсовывать это следующему прогону."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309")]))
+        await tools.execute("read_price", {})
+        await self.compare(tools, ["3309"],
+                           columns={"article": "такой колонки нет", "purchase": "и такой"})
+
+        self.assertEqual(tools._price_cols, {})
+
+    async def test_without_memory_the_sheet_looks_as_before(self):
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([]))
+        out = await tools.execute("read_price", {})
+        self.assertNotIn("ЗАПОМНЕННЫЕ КОЛОНКИ", out)
+
     async def test_task_for_a_product_type_out_of_scope_is_refused(self):
         """СЛУЧАЙ С БОЯ (28.09.2026). Прайс Linderwood кончается разделом «ПОДЛОЖКА
         ЛИСТОВАЯ 3 мм», и агент завёл задачу завести две позиции — при том, что подложки

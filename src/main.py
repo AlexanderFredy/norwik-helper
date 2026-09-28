@@ -125,6 +125,17 @@ async def main() -> None:
                 price_date=price.supplier_price.price_date,
                 prices=prices)
 
+        # ТРАКТОВКА КОЛОНОК ЖИВЁТ ПО СИГНАТУРЕ формата, а не по файлу: выбор между
+        # двумя колонками закупки («самовывоз» и «с доставкой») — договорённость с
+        # поставщиком, и переспрашивать её на каждом прайсе незачем.
+        known_columns = {row.get("sheet", ""): (row.get("mapping") or {})
+                         for row in await pricing_store.get_mappings(signature)}
+
+        async def remember_columns(by_sheet):
+            for sheet, spec in (by_sheet or {}).items():
+                await pricing_store.save_mapping(
+                    signature, supplier.name if supplier else "", spec, sheet)
+
         # Ответ агента едет дальше вместе с задачами: когда их ноль, только он и
         # объясняет, почему — «расхождений нет» или «разобрал не тот лист».
         # КАТЕГОРИИ (`/categories`) нужны и ЗДЕСЬ, не только исполнителю: раздел чужого
@@ -133,7 +144,9 @@ async def main() -> None:
                            usage_labels={"kind": "pricing", "price_doc": filename},
                            elsewhere=await sightings.elsewhere(supplier_id),
                            remember=remember,
-                           scope=[c["category"] for c in await pricing_store.list_scope()])
+                           scope=[c["category"] for c in await pricing_store.list_scope()],
+                           known_columns=known_columns,
+                           remember_columns=remember_columns)
 
     async def run_task(price, task, content, guard):
         """Выполнение задачи агентом (§6.2) — С НАСТОЯЩЕЙ ЗАПИСЬЮ в 1С.

@@ -250,7 +250,8 @@ class TaskBuilderTools:
     """Исполнитель инструментов одного прогона формирования задач."""
 
     def __init__(self, content: bytes, filename: str, onec=None,
-                 elsewhere: dict | None = None, scope=None) -> None:
+                 elsewhere: dict | None = None, scope=None,
+                 known_columns: dict | None = None) -> None:
         self._content = content
         self._filename = filename
         self._onec = onec
@@ -259,6 +260,12 @@ class TaskBuilderTools:
         # нет, и это стоило задачи «завести подложку» по прайсу Linderwood: вид товара в
         # список не входит, работы по нему нет вовсе (бой 28.09.2026).
         self._scope = [str(c).strip() for c in (scope or ()) if str(c).strip()]
+        # ЗАПОМНЕННАЯ ТРАКТОВКА КОЛОНОК: лист → {article, purchase, rrc}. Ключ у памяти —
+        # СИГНАТУРА формата, а не файл, поэтому выбор, сделанный админом однажды, держится
+        # и на следующем прайсе того же поставщика. Модельный поток её раньше не читал
+        # вовсе, и у Линдервуда с двумя колонками закупки (самовывоз и с доставкой) агент
+        # выбирал заново каждую пересборку (вопрос админа 28.09.2026).
+        self._known_columns = {str(k): dict(v) for k, v in (known_columns or {}).items()}
         # Артикул → где его видели у ДРУГИХ поставщиков (`storage/sightings.py`). Снимок
         # берётся один раз перед ходом: спрашивать базу из синхронного кода инструментов
         # неоткуда, а таблица мала.
@@ -332,7 +339,28 @@ class TaskBuilderTools:
         self._last_sheet = sheet.name
         head = (f"Листы: {', '.join(s.name for s in self.sheets)}\n"
                 f"=== Лист: {sheet.name} === (со строки {start})\n")
-        return head + render_preview(sheet, max_rows=MAX_SHEET_ROWS, start=start)
+        return head + self._remembered(sheet.name) \
+            + render_preview(sheet, max_rows=MAX_SHEET_ROWS, start=start)
+
+    def _remembered(self, sheet: str) -> str:
+        """Напоминание о том, какие колонки уже выбраны для этого формата.
+
+        **Выбор колонки — решение АДМИНА, а не наблюдение.** У Линдервуда две колонки
+        закупки, самовывоз и с доставкой, и по файлу не видно, какая из них наша: это
+        договорённость с поставщиком. Раз выбранное держится по СИГНАТУРЕ формата, значит
+        переживает и следующий прайс, и пересборку задач.
+
+        Напоминание идёт вместе с листом, а не отдельным вызовом: лишний круг ручного
+        цикла стоит $0.097, а места тут три строки.
+        """
+        spec = self._known_columns.get(sheet) or self._known_columns.get("")
+        if not spec:
+            return ""
+        parts = ", ".join(f"{k}={v}" for k, v in spec.items() if v)
+        return ("ЗАПОМНЕННЫЕ КОЛОНКИ по этому формату: " + parts
+                + ". Их и передавай в `compare_with_1c`, не выбирай заново. Колонки в "
+                  "файле изменились или админ прямо просит другую — передай новые, и "
+                  "запомнится уже твой выбор.\n")
 
     def _tm(self) -> str:
         if self._onec is None:
@@ -1705,7 +1733,8 @@ def fix_marks(tasks: list[PriceTask], owners: dict[str, set]) -> list[str]:
 async def build(orchestrator, content: bytes, filename: str, onec=None,
                 usage_labels: dict | None = None,
                 elsewhere: dict | None = None,
-                remember=None, scope=None) -> tuple[list[PriceTask], str]:
+                remember=None, scope=None, known_columns=None,
+                remember_columns=None) -> tuple[list[PriceTask], str]:
     """Прогон формирования задач. Возвращает (задачи, короткий ответ агента).
 
     Пустой список — не ошибка: агент мог не найти, за что зацепиться. Вызывающий решает,
@@ -1716,7 +1745,7 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
     без них поведение прежнее, то есть «нет в прайсе — кандидат в снятые».
     """
     tools = TaskBuilderTools(content, filename, onec=onec, elsewhere=elsewhere,
-                             scope=scope)
+                             scope=scope, known_columns=known_columns)
     task = f"Прайс «{filename}». Составь список задач по нему."
 
     answer, _ = await orchestrator.handle_turn(
@@ -1748,6 +1777,16 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
             await remember(tools.seen_articles, tools.seen_prices)
         except Exception:                               # noqa: BLE001
             logger.warning("Не удалось записать журнал встреч", exc_info=True)
+
+    # ТРАКТОВКА КОЛОНОК ЗАПОМИНАЕТСЯ ПО СИГНАТУРЕ формата, а не по файлу: следующий прайс
+    # того же поставщика придёт с той же раскладкой, и спрашивать заново незачем. Выбор
+    # между двумя колонками закупки («самовывоз» и «с доставкой» у Линдервуда) — это
+    # договорённость с поставщиком, по файлу она не выводится ничем.
+    if remember_columns is not None and tools._price_cols:
+        try:
+            await remember_columns(dict(tools._price_cols))
+        except Exception:                               # noqa: BLE001
+            logger.warning("Не удалось запомнить колонки прайса", exc_info=True)
 
     # СВЕРКА МАРОК ПО 1С — ПОСЛЕ хода и БЕЗ участия модели.
     #
