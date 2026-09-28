@@ -350,6 +350,41 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         await provider.collect(self.queue)      # не должно бросить
         self.assertTrue(provider._dirty)
 
+    # --------------------------------------------- застрявшие «принятые» команды
+
+    async def test_stale_taken_command_is_closed(self):
+        """СЛУЧАЙ С БОЯ (28.09.2026, второй раз за трое суток). Команда, взятая агентом и
+        не закрытая, запирает форму навсегда: 1С считает её живой, а выдача отдавала
+        только «ждёт» — агент её больше не видел. Лечилось удалением строки руками."""
+        onec = FakeOnec()
+        onec.agent_commands = lambda: {
+            "server_time": "2026-09-28T12:00:00", "commands": [],
+            "stale": [{"id": "old-1", "kind": "сменить статус прайса", "price_id": 5,
+                       "task_id": 0, "created_at": "2026-09-28T11:00:00"}]}
+
+        await self.make(onec).collect(self.queue)
+
+        closed = [i for batch in onec.states for i in batch]
+        self.assertEqual([(i["id"], i["state"]) for i in closed],
+                         [("old-1", "выполнена")])
+        self.assertIn("перезапускался", closed[0]["message"])
+
+    async def test_own_command_in_flight_is_not_closed_as_stale(self):
+        """Своя команда, которая сейчас в работе, гаснуть не должна: колесико обязано
+        гореть до результата, а не до того, как 1С сочла её долгой."""
+        onec = FakeOnec([command(external="c1")])
+        provider = self.make(onec)
+        await provider.collect(self.queue)          # взяли c1, связка жива
+
+        onec.agent_commands = lambda: {
+            "server_time": "2026-09-28T12:00:00", "commands": [],
+            "stale": [{"id": "c1", "kind": "выполнить задачу", "price_id": 1,
+                       "task_id": 5, "created_at": "2026-09-28T11:00:00"}]}
+        onec.states.clear()
+        await provider.collect(self.queue)
+
+        self.assertEqual(onec.states, [], "свою команду не гасим")
+
     # ------------------------------------------------- связки переживают перезапуск
 
     async def test_restart_still_closes_the_command(self):

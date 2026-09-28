@@ -191,6 +191,28 @@ class OnecProvider(Listener):
         for qid in finished:
             await self._forget(qid)
 
+    async def _close_stale(self, stale) -> None:
+        """Погасить команды, которые 1С считает взятыми, а агент о них не помнит.
+
+        Своё — не трогаем: команда, чья связка ещё жива, сейчас в работе, и закрыть её
+        значило бы погасить колесико раньше результата. Гасим только чужое прошлому
+        процессу.
+        """
+        rows = [r for r in (stale or []) if isinstance(r, dict) and r.get("id")]
+        if not rows:
+            return
+
+        mine = {x for ids in self._sent.values() for x in ids}
+        items = [{"id": str(r["id"]), "state": "выполнена",
+                  "message": "агент перезапускался, исход неизвестен — смотрите "
+                             "результат задачи"}
+                 for r in rows if str(r["id"]) not in mine]
+        if not items:
+            return
+
+        logger.warning("Закрываю зависшие команды 1С: %d", len(items))
+        await asyncio.to_thread(self._onec.agent_commands_state, items)
+
     async def _remember(self, queue_id: int, external: str) -> None:
         """Записать связку в базу. Сбой записи команду не роняет — она уже в очереди, и
         отказаться от неё сейчас значило бы потерять нажатие админа; в худшем случае
@@ -345,6 +367,18 @@ class OnecProvider(Listener):
     async def _pull_commands(self, queue) -> None:
         answer = await asyncio.to_thread(self._onec.agent_commands)
         commands = answer.get("commands") or []
+
+        # ЗАСТРЯВШИЕ «ПРИНЯТЫЕ» ГАСИМ ПЕРВЫМ ДЕЛОМ, до разбора ждущих.
+        #
+        # Такая команда запирает форму навсегда: 1С считает её живой, а прежняя выдача
+        # отдавала только «ждёт» — агент её больше не видел и закрыть не мог. Дважды за
+        # трое суток это лечилось удалением строки регистра руками (28.09.2026).
+        #
+        # ВЫПОЛНЯТЬ ЗАНОВО НЕЛЬЗЯ: неизвестно, применилась ли она в прошлый раз, а
+        # «перенести в снятые» дважды — это перенести чужое. Поэтому только закрываем,
+        # честно говоря админу, что исход неизвестен: что вышло на самом деле, видно в
+        # самой задаче — её результат приезжает снимком.
+        await self._close_stale(answer.get("stale"))
 
         missing = answer.get("missing")
         if missing:
