@@ -303,6 +303,51 @@ class CommandFlowTest(Base):
         self.assertEqual(await self.queue.taken(), [])
 
 
+class ClosingSummaryTest(Base):
+    """Закрытие прайса и сводка менеджерам (решение админа 28.09.2026)."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        await self.submit()
+        self.price = self.model.prices[0]
+        self.seen.events.clear()
+
+    async def close(self):
+        await self.send(CommandKind.SET_PRICE_STATUS, price_id=self.price.id,
+                        payload={"status": "выполнен", "confirmed": True})
+
+    async def test_changes_go_to_managers(self):
+        self.price.tasks[0].digest = {"обновлены цены": 4}
+        await self.close()
+
+        summary = [e for e in self.seen.events
+                   if e.kind == EventKind.PRICE_SUMMARY]
+        self.assertEqual(len(summary), 1)
+        self.assertIn("обновлены цены (4)", summary[0].text)
+
+    async def test_without_changes_managers_get_nothing_but_admin_learns_why(self):
+        """СЛУЧАЙ С БОЯ (28.09.2026). Прайс закрылся, менеджер ничего не получил, и
+        понять почему можно было только по логам: задачи выполнялись до выкладки, и
+        дайджеста у них нет. Молчание в ответ на «Да» читается как поломка."""
+        await self.close()
+
+        self.assertFalse([e for e in self.seen.events
+                          if e.kind == EventKind.PRICE_SUMMARY],
+                         "менеджерам пусто не шлём")
+        texts = " ".join(e.text for e in self.seen.events
+                         if e.kind == EventKind.PRICE_STATUS)
+        self.assertIn("НЕ отправлена", texts)
+        self.assertIn("не выполнялись", texts)
+
+    async def test_admin_is_told_when_tasks_ran_but_wrote_nothing(self):
+        self.price.tasks[0].complete(TaskStatus.DONE, "менять было нечего")
+        await self.close()
+
+        texts = " ".join(e.text for e in self.seen.events
+                         if e.kind == EventKind.PRICE_STATUS)
+        self.assertIn("записей в 1С по ним не зафиксировано", texts)
+
+
 class RenameSupplierTest(Base):
     """Переименование поставщика ИЗ 1С (решение админа 26.09.2026).
 
