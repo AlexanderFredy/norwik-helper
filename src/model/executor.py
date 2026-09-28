@@ -1039,8 +1039,20 @@ async def run_normalization(onec, task, guard, scope=None):
     # первую настоящую запись до проверяемой глазами — правильно по умолчанию.
     only = task.address.subject.label() if task.subject == TaskSubject.COLLECTION else ""
 
+    # СПИСОК МАРОК НУЖЕН ДЛЯ ШУМА. Заводскую пометку в названии расцветки («Альфа PELI»)
+    # от породы дерева («Белый Дуб») отличает не положение слова, а происхождение: шум —
+    # это имя МАРКИ. Без списка правило молчит и ничего не снимает, поэтому сбой запроса
+    # тут не беда: потерять слово в наименовании хуже, чем оставить лишнее.
+    try:
+        marks = [m.name for m in
+                 await asyncio.to_thread(onec.selling_tm, True)]
+    except Exception:                                   # noqa: BLE001
+        logger.warning("Список марок не прочитался — шум в названиях не снимаем",
+                       exc_info=True)
+        marks = []
+
     inputs, skipped, discontinued, noise = nz.plan(nom.items, tm_code, tm_name,
-                                            only_collection=only)
+                                            only_collection=only, marks=marks)
 
     if not inputs and not skipped:
         return (TaskStatus.DONE,

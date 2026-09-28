@@ -94,7 +94,7 @@ class SharedTailTest(unittest.TestCase):
 
     def test_factory_marker_is_noise(self):
         titles = ["Альфа PELI", "Вега PELI", "Гамма PELI", "Ореон PELI"]
-        noise = nz.shared_tail(titles)
+        noise = nz.shared_tail(titles, marks=["Peli", "Westerhof / Вестерхоф"])
         self.assertEqual(noise, {"peli"})
         self.assertEqual([nz.drop_shared(t, noise) for t in titles],
                          ["Альфа", "Вега", "Гамма", "Ореон"])
@@ -103,7 +103,7 @@ class SharedTailTest(unittest.TestCase):
         """У «Effect» пометка AGT стоит у семи позиций из четырнадцати: поставщик
         проставил её не везде, и требование «у всех» обессмыслило бы правило."""
         titles = ["Альпы AGT", "Тибет AGT", "Логан", "Соларо", "Фудзияма AGT"]
-        noise = nz.shared_tail(titles)
+        noise = nz.shared_tail(titles, marks=["AGT", "Peli"])
         self.assertEqual(noise, {"agt"})
         self.assertEqual(nz.drop_shared("Логан", noise), "Логан")
         self.assertEqual(nz.drop_shared("Альпы AGT", noise), "Альпы")
@@ -112,14 +112,15 @@ class SharedTailTest(unittest.TestCase):
         """«Дуб» повторяется у всех, но он ЧАСТЬ названия. Разделяет их положение:
         род стоит спереди, маркер сзади."""
         titles = ["Дуб Авила", "Дуб Прато", "Дуб Ява"]
-        self.assertEqual(nz.shared_tail(titles), set())
+        self.assertEqual(nz.shared_tail(titles, marks=["Peli", "AGT"]), set())
 
     def test_unique_titles_give_no_noise(self):
-        self.assertEqual(nz.shared_tail(["Капри", "Наполи", "Гарда"]), set())
+        self.assertEqual(nz.shared_tail(["Капри", "Наполи", "Гарда"],
+                                        marks=["Peli"]), set())
 
     def test_single_word_titles_are_left_alone(self):
         """Из «Капри» снимать нечего: имя из одного слова — это и есть расцветка."""
-        self.assertEqual(nz.shared_tail(["Капри", "Капри"]), set())
+        self.assertEqual(nz.shared_tail(["Капри", "Капри"], marks=["Капри"]), set())
 
     def test_noise_in_the_middle_survives(self):
         """Слово внутри имени означает, что строку мы поняли неверно; молча кромсать
@@ -130,16 +131,34 @@ class SharedTailTest(unittest.TestCase):
     def test_title_never_becomes_empty(self):
         self.assertEqual(nz.drop_shared("PELI", {"peli"}), "PELI")
 
-    def test_several_markers_are_stripped_at_once(self):
+    def test_unknown_tail_word_is_kept(self):
+        """Слово, которое маркой не зовётся, снять нечем: «NEW» может оказаться частью
+        расцветки. Не снять лишнее — потеря на глаз; снять нужное — потеря молчаливая."""
         titles = ["Альфа PELI NEW", "Вега PELI NEW", "Гамма PELI NEW"]
-        noise = nz.shared_tail(titles)
-        self.assertEqual(nz.drop_shared("Альфа PELI NEW", noise), "Альфа")
+        noise = nz.shared_tail(titles, marks=["Peli"])
+        self.assertEqual(noise, {"peli"})
+        self.assertEqual(nz.drop_shared("Альфа PELI NEW", noise), "Альфа PELI NEW")
+
+    def test_genus_word_at_the_end_is_never_touched(self):
+        """СЛУЧАЙ С БОЯ (28.09.2026). У Peli род пишут В КОНЦЕ — «Белый Дуб», «Дымчатый
+        Дуб», — и правило «повторился в хвосте, значит шум» съело породу дерева:
+        наименование и имя для сайта стали «Белый» и «Дымчатый». Защита по положению
+        слова тут не работала, разделяет случаи происхождение: шум — это имя МАРКИ."""
+        titles = ["Белый Дуб", "Дымчатый Дуб", "Медовый Дуб"]
+        noise = nz.shared_tail(titles, marks=["Peli", "AGT", "Westerhof / Вестерхоф"])
+        self.assertEqual(noise, set())
+        self.assertEqual([nz.drop_shared(t, noise) for t in titles], titles)
+
+    def test_without_marks_nothing_is_stripped(self):
+        """Списка марок нет — правило молчит: отличить пометку от слова нечем."""
+        self.assertEqual(nz.shared_tail(["Альфа PELI", "Вега PELI"]), set())
 
     def test_plan_cleans_titles_of_the_whole_collection(self):
         """Шум считается по коллекции целиком: одна позиция о повторе не знает ничего."""
         items = [item(ref="T1", article="CO512", site="Альфа PELI", collection="Cosmo"),
                  item(ref="T2", article="CO520", site="Вега PELI", collection="Cosmo")]
-        inputs, _skipped, _dropped, _noise = nz.plan(items, "000000005", "Westerhof")
+        inputs, _skipped, _dropped, _noise = nz.plan(items, "000000005", "Westerhof",
+                                                     marks=["Peli", "Westerhof"])
         self.assertEqual([i["title"] for i in inputs[0]["items"]], ["Альфа", "Вега"])
 
 
