@@ -519,6 +519,37 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         # к каждой позиции приложена строка прайса — по ней и проставят артикул
         self.assertIn("Дуб Авила", blind["позиции"][0]["строка_прайса"])
 
+    async def test_article_differing_by_a_short_tail_is_reported(self):
+        """СЛУЧАЙ С БОЯ (28.09.2026). Linderwood пишет один декор тремя способами: в 1С
+        «LE-266», в прайсе «LE-266-32», в остатках «LE 266-V». Ключи не совпадают, сверка
+        говорит «нет в 1С», и агент завёл задачу завести позиции, которые там есть."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("YO-68874", "LE-266", site="Серый", collection="Elegance Large"),
+        ]))
+        got = await self.compare(tools, ["LE-266-32"], collection="Elegance Large")
+
+        self.assertEqual(got["missing_in_1c"], ["LE-266-32"])
+        near = got["похожие_артикулы_в_1С"]
+        self.assertEqual(len(near), 1)
+        self.assertIn("LE-266", near[0])
+        self.assertIn("YO-68874", near[0])
+
+    async def test_short_article_has_no_near_matches(self):
+        """У коротких кодов похожим окажется пол-марки — там правило молчит."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "301", site="Альфа", collection="Vintage"),
+        ]))
+        got = await self.compare(tools, ["3011"], collection="Vintage")
+        self.assertNotIn("похожие_артикулы_в_1С", got)
+
+    async def test_long_tail_is_not_a_near_match(self):
+        """«LE-266» и «LE-266123456» — разные коды, а не написание одного."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "LE-266", site="Серый", collection="Elegance Large"),
+        ]))
+        got = await self.compare(tools, ["LE-266123456"], collection="Elegance Large")
+        self.assertNotIn("похожие_артикулы_в_1С", got)
+
     async def test_remembered_columns_come_with_the_sheet(self):
         """ВОПРОС АДМИНА 28.09.2026. У Линдервуда две колонки закупки — самовывоз и с
         доставкой, — и по файлу не видно, какая наша: это договорённость с поставщиком.
