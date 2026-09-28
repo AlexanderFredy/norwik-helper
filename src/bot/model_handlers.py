@@ -18,10 +18,12 @@ import logging
 from aiogram import F, Router
 from aiogram.filters import Command as CommandFilter
 from aiogram.filters import CommandObject
-from aiogram.types import Message
+from aiogram.types import (CallbackQuery, InlineKeyboardButton,
+                           InlineKeyboardMarkup, Message)
 
 from src.model.commands import Command, CommandKind
-from src.model.events import Event, Listener
+from src.model.enums import PriceStatus
+from src.model.events import Event, EventKind, Listener
 from src.price_tool import model_view as view
 
 logger = logging.getLogger(__name__)
@@ -45,8 +47,64 @@ class TelegramListener(Listener):
         # он и так только что сделал командой.
         if not (event.text or "").strip():
             return
+        # Сводку по прайсу этот слушатель не трогает: у неё другие получатели и свой
+        # слушатель (`ManagerListener`), а админу он отправит короткую строку о доставке.
+        # Иначе админ получил бы весь текст дважды.
+        if event.kind == EventKind.PRICE_SUMMARY:
+            return
         for chat in self._chats:
             await self._bot.send_message(chat, event.text)
+
+
+class ManagerListener(Listener):
+    """Сводка по прайсу — МЕНЕДЖЕРАМ (решение админа 28.09.2026).
+
+    Единственное событие, адресованное не админу. Получатели — все из белого списка,
+    кроме него: отдельной роли «менеджер» в базе нет, и заводить её ради одной рассылки
+    незачем — список доступа и есть список тех, кто работает с ботом.
+
+    **АДМИНУ УХОДИТ ОТЧЁТ О ДОСТАВКЕ.** Менеджер, ни разу не писавший боту, сообщения не
+    получит — Telegram не разрешает писать первым. Раньше такие случаи оседали в логе, и
+    админ считал, что все оповещены.
+    """
+
+    def __init__(self, bot, users, admin_id: int) -> None:
+        self._bot = bot
+        self._users = users
+        self._admin = admin_id
+
+    async def notify(self, event: Event) -> None:
+        if event.kind != EventKind.PRICE_SUMMARY or not (event.text or "").strip():
+            return
+
+        try:
+            everyone = await self._users.list_all()
+        except Exception:                               # noqa: BLE001
+            logger.warning("Список получателей не прочитался", exc_info=True)
+            return
+
+        managers = [u for u in everyone if u.telegram_id != self._admin]
+        sent, failed = 0, []
+        for user in managers:
+            try:
+                await self._bot.send_message(user.telegram_id, event.text)
+                sent += 1
+            except Exception:                           # noqa: BLE001
+                failed.append(user.name or str(user.telegram_id))
+                logger.warning("Сводка не доставлена менеджеру %s", user.telegram_id,
+                               exc_info=True)
+
+        if not managers:
+            note = "Сводка не отправлена: менеджеров в списке доступа нет."
+        else:
+            note = f"Сводка отправлена менеджерам: {sent} из {len(managers)}."
+            if failed:
+                note += (" Не доставлено: " + ", ".join(failed[:10])
+                         + ". Такому получателю нужно самому написать боту хотя бы раз.")
+        try:
+            await self._bot.send_message(self._admin, note)
+        except Exception:                               # noqa: BLE001
+            logger.warning("Отчёт о рассылке не доставлен админу", exc_info=True)
 
 
 class TelegramProvider:
@@ -228,9 +286,58 @@ async def cmd_price_status(message: Message, command: CommandObject, model, queu
         await message.answer("Нужен номер прайса и статус: /price_status 1 выполнен\n"
                              "Допустимо: к обработке, частично обработан, выполнен")
         return
+    status = parts[1].strip()
+
+    # ЗАКРЫТИЕ СПРАШИВАЕТСЯ И ЗДЕСЬ (решение админа 28.09.2026). За «выполнен» стоит
+    # рассылка сводки менеджерам, и вопрос обязан звучать одинаково из обоих визуалов:
+    # одно и то же действие не может давать разный результат в зависимости от того,
+    # откуда нажали. Команда уйдёт только после «Да» — служба без подтверждения откажет.
+    if status.casefold() == PriceStatus.DONE.value:
+        await message.answer(
+            f"Прайс №{price_id}. Вы уверены, что закончили работать с этим прайсом и "
+            f"хотите оповестить менеджеров о результатах?",
+            reply_markup=_done_keyboard(price_id))
+        return
+
     await _send(message, Command(kind=CommandKind.SET_PRICE_STATUS, source="telegram",
                                  actor=_actor(message), price_id=price_id,
-                                 payload={"status": parts[1].strip()}), loop, queue)
+                                 payload={"status": status}), loop, queue)
+
+
+def _done_keyboard(price_id: int) -> InlineKeyboardMarkup:
+    """Да/Нет под вопросом о закрытии прайса.
+
+    «Нет» отменяет СМЕНУ СТАТУСА, а не только рассылку (решение админа): вопрос
+    спрашивает про «закончили ли», и отрицательный ответ означает, что работа
+    продолжается.
+    """
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да", callback_data=f"model:done:{price_id}"),
+        InlineKeyboardButton(text="Нет", callback_data="model:done:cancel")]])
+
+
+@router.callback_query(F.data.startswith("model:done:"))
+async def on_done_answer(call: CallbackQuery, model, queue, loop) -> None:
+    """Ответ на вопрос о закрытии прайса."""
+    tail = call.data.split(":")[-1]
+    if tail == "cancel":
+        await call.message.edit_text("Статус не менял — работа с прайсом продолжается.")
+        await call.answer()
+        return
+
+    price_id = _number(tail)
+    if price_id is None or model.price(price_id) is None:
+        await call.message.edit_text("Прайс не найден — возможно, его уничтожили.")
+        await call.answer()
+        return
+
+    await _send(call.message, Command(
+        kind=CommandKind.SET_PRICE_STATUS, source="telegram",
+        actor=str(call.from_user.id) if call.from_user else "",
+        price_id=price_id,
+        payload={"status": PriceStatus.DONE.value, "confirmed": True}), loop, queue)
+    await call.message.edit_text(f"Закрываю прайс №{price_id} и оповещаю менеджеров.")
+    await call.answer()
 
 
 @router.message(CommandFilter("rebuild"))

@@ -245,8 +245,17 @@ class CommandFlowTest(Base):
         self.assertTrue(self.price.ready)
         self.assertEqual(self.price.status, PriceStatus.TODO)
 
+        # ЗАКРЫТИЕ ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ: за статусом «выполнен» стоит рассылка сводки
+        # менеджерам, и спрашивать обязаны оба визуала одинаково (решение админа
+        # 28.09.2026). Визуал, который не спросил, получает внятный отказ.
         await self.send(CommandKind.SET_PRICE_STATUS, price_id=self.price.id,
                         payload={"status": "выполнен"})
+        self.assertEqual(self.price.status, PriceStatus.TODO, "без подтверждения — нет")
+        self.assertTrue(any(e.kind == EventKind.COMMAND_REJECTED
+                            for e in self.seen.events))
+
+        await self.send(CommandKind.SET_PRICE_STATUS, price_id=self.price.id,
+                        payload={"status": "выполнен", "confirmed": True})
         self.assertEqual(self.price.status, PriceStatus.DONE)
 
     async def test_rebuild_drops_statuses_and_gives_new_ids(self):

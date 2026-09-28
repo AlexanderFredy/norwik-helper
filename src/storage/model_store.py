@@ -78,7 +78,10 @@ CREATE TABLE IF NOT EXISTS price_task (
     tm_names        TEXT NOT NULL DEFAULT '[]',
     subject_code    TEXT NOT NULL DEFAULT '',
     subject_article TEXT NOT NULL DEFAULT '',
-    subject_names   TEXT NOT NULL DEFAULT '[]'
+    subject_names   TEXT NOT NULL DEFAULT '[]',
+    -- ЧТО ПРОГОН ЗАПИСАЛ В 1С, снимок момента записи (JSON). Сводка менеджерам уходит
+    -- позже — когда админ закрывает прайс, — и пересчитать её тогда неоткуда.
+    digest          TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS ix_task_price ON price_task (price_id);
 """
@@ -91,8 +94,22 @@ def _names(raw: str) -> tuple[str, ...]:
         return ()
 
 
-def _dump(names) -> str:
-    return json.dumps(list(names), ensure_ascii=False)
+def _dump(value) -> str:
+    """JSON для хранения. Списки имён и словарь дайджеста идут через одну дверь: два
+    сериализатора в одном файле разошлись бы по экранированию кириллицы."""
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
+    return json.dumps(list(value), ensure_ascii=False)
+
+
+def _counts(raw) -> dict:
+    """Дайджест обратно в словарь. Битое значение — пустой дайджест, а не падение:
+    сводка менеджерам не стоит того, чтобы из-за неё не поднялся список прайсов."""
+    try:
+        out = json.loads(raw or "{}")
+    except (ValueError, TypeError):
+        return {}
+    return out if isinstance(out, dict) else {}
 
 
 class ModelStore:
@@ -112,6 +129,11 @@ class ModelStore:
             task_have = {row[1] for row in await cur.fetchall()}
             if task_have and "run_at" not in task_have:
                 await db.execute("ALTER TABLE price_task ADD COLUMN run_at TEXT")
+            # Дайджест правок: у задач, прошедших до этой выкладки, его нет и взять
+            # негде — сводка по ним будет пустой, и это честно.
+            if task_have and "digest" not in task_have:
+                await db.execute("ALTER TABLE price_task ADD COLUMN digest "
+                                 "TEXT NOT NULL DEFAULT '{}'")
             if task_have and "done_at" in task_have:
                 await db.execute("UPDATE price_task SET run_at = done_at "
                                  "WHERE run_at IS NULL AND done_at IS NOT NULL")
@@ -154,7 +176,8 @@ class ModelStore:
             cur = await db.execute(
                 "SELECT id, price_id, kind, subject, status, description, result, "
                 "created_at, run_at, tm_code, tm_names, subject_code, "
-                "subject_article, subject_names FROM price_task ORDER BY created_at, id")
+                "subject_article, subject_names, digest "
+                "FROM price_task ORDER BY created_at, id")
             for row in await cur.fetchall():
                 tasks.setdefault(row[1], []).append(_task_from_row(row))
 
@@ -259,12 +282,12 @@ class ModelStore:
                 "UPDATE price_task SET kind = ?, subject = ?, status = ?, description = ?, "
                 "result = ?, run_at = ?, tm_code = ?, tm_names = ?, "
                 "subject_code = ?, "
-                "subject_article = ?, subject_names = ? WHERE id = ?",
+                "subject_article = ?, subject_names = ?, digest = ? WHERE id = ?",
                 (task.kind.value, task.subject.value, task.status.value, task.description,
                  task.result, task.run_at, addr.tm.code,
                  _dump(addr.tm.names),
                  addr.subject.code, addr.subject.article, _dump(addr.subject.names),
-                 task.id))
+                 _dump(task.digest or {}), task.id))
             await db.commit()
             return cur.rowcount > 0
 
@@ -356,12 +379,13 @@ class ModelStore:
         cur = await db.execute(
             "INSERT INTO price_task (price_id, kind, subject, status, description, result, "
             "created_at, run_at, tm_code, tm_names, subject_code, "
-            "subject_article, subject_names) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "subject_article, subject_names, digest) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (price_id, task.kind.value, task.subject.value, task.status.value,
              task.description, task.result, task.created_at, task.run_at,
              addr.tm.code, _dump(addr.tm.names), addr.subject.code,
-             addr.subject.article, _dump(addr.subject.names)))
+             addr.subject.article, _dump(addr.subject.names),
+             _dump(task.digest or {})))
         task.id = cur.lastrowid
 
 
@@ -369,7 +393,7 @@ def _task_from_row(row) -> PriceTask:
     """Собрать задачу обратно из строки. Имена уже нормализованы при записи."""
     (task_id, _price_id, kind, subject, status, description, result,
      created_at, run_at, tm_code, tm_names, subj_code, subj_article,
-     subj_names) = row
+     subj_names, digest) = row
 
     address = TaskAddress(
         tm=Ref(code=tm_code, names=_names(tm_names)),
@@ -378,5 +402,5 @@ def _task_from_row(row) -> PriceTask:
 
     task = PriceTask(kind=TaskKind(kind), address=address, description=description,
                      status=TaskStatus(status), result=result, id=task_id,
-                     created_at=created_at, run_at=run_at)
+                     created_at=created_at, run_at=run_at, digest=_counts(digest))
     return task

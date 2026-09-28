@@ -12,7 +12,8 @@ from src.bot.auth import AuthMiddleware
 from src.bot.commands import setup_bot_commands
 from src.bot.handlers import router
 from src.bot.catalog_handlers import router as catalog_router
-from src.bot.model_handlers import (TelegramListener, TelegramProvider,
+from src.bot.model_handlers import (ManagerListener, TelegramListener,
+                                    TelegramProvider,
                                     router as model_router)
 from src.bot.model_loop import AgentLoop
 from src.bot.polling import poll_forever
@@ -202,6 +203,9 @@ async def main() -> None:
 
     loop = AgentLoop(commands, model, providers=providers)
     model.events.subscribe(TelegramListener(bot, [config.admin_telegram_id]))
+    # СВОДКА ПО ПРАЙСУ — ЕДИНСТВЕННОЕ, что уходит НЕ админу: менеджерам из белого
+    # списка, когда админ закрывает прайс и подтверждает это (§ решение 28.09.2026).
+    model.events.subscribe(ManagerListener(bot, store, config.admin_telegram_id))
 
     dp = Dispatcher(store=store, orchestrator=orchestrator, openai_api_key=config.openai_api_key,
                     onec=onec, pricing_store=pricing_store,

@@ -340,6 +340,16 @@ class TaskTools:
         self.failed = 0
         self.errors: list[str] = []
         self.outcome: tuple[TaskStatus, str] | None = None
+        # ЧТО РЕАЛЬНО ЗАПИСАНО — вид правки → сколько позиций. Снимается В МОМЕНТ записи:
+        # позже «было» в справочнике уже затёрто «стало», и пересчитать это неоткуда.
+        # Нужен дайджест ПОТОМ: сводка менеджерам уходит, когда админ закрывает прайс.
+        self.digest: dict[str, int] = {}
+
+    def _note_change(self, kind: str, count: int = 1) -> None:
+        """Отметить в дайджесте, что записано. Ноль не отмечаем: «обновлено 0» в сводке
+        читается как работа, которой не было."""
+        if count > 0:
+            self.digest[kind] = self.digest.get(kind, 0) + count
 
     # ------------------------------------------------------------------ прайс
 
@@ -780,6 +790,26 @@ class TaskTools:
         updated = int(result.get("updated") or 0)
         errors = result.get("errors") or []
         self.written_items += created + updated
+
+        # ДЕЛИМ ПО ОПЕРАЦИИ, А НЕ ПО ВИДУ ЗАДАЧИ. Задача «изменение свойств» попутно
+        # создаёт позицию, «добавление новых» — правит размер. Менеджеру важно, ЧТО
+        # изменилось в товарах, а не как называлась работа.
+        self._note_change("заведены новые", len(plan.created))
+        # Нормализация в дайджест попадает, но в сводку менеджерам не идёт: про регистр и
+        # пробелы им не говорят вовсе (решение админа).
+        self._note_change("нормализованы имена", len(plan.normalized))
+        for item in plan.updated:
+            fields = {c.field for c in item.real_changes}
+            if fields & {"length_from", "length_to", "width_from", "width_to",
+                         "thickness", "size"}:
+                self._note_change("уточнены размеры")
+            if "pack_coefficient" in fields:
+                self._note_change("уточнена упаковка")
+            if "parent_ref" in fields:
+                self._note_change("перенесены в другую папку")
+            if fields - {"length_from", "length_to", "width_from", "width_to",
+                         "thickness", "size", "pack_coefficient", "parent_ref"}:
+                self._note_change("изменены свойства")
         self.failed += len(errors)
         for err in errors[:20]:
             self.errors.append(f"{err.get('ref') or err.get('index')}: "
@@ -912,6 +942,9 @@ class TaskTools:
         unchanged = int(result.get("unchanged") or 0)
         errors = result.get("errors") or []
         self.written_prices += updated
+        # ТОЛЬКО ЗАПИСАННОЕ. `unchanged` — это позиции, где цена совпала или отличалась
+        # меньше порога: работы там не было, и сообщать о ней менеджерам значит врать.
+        self._note_change("обновлены цены", updated)
         self.failed += len(errors)
         for err in errors[:20]:
             self.errors.append(f"{err.get('ref')}: {err.get('code')} {err.get('message')}")
@@ -1079,6 +1112,11 @@ async def run_normalization(onec, task, guard, scope=None):
             failed.append(f"{err.get('ref') or err.get('index')}: "
                           f"{err.get('code')} {err.get('message')}")
 
+    # НОРМАЛИЗАЦИЯ В ДАЙДЖЕСТЕ ЕСТЬ, НО МЕНЕДЖЕРАМ НЕ ИДЁТ (решение админа 28.09.2026):
+    # регистр и пробелы в наименовании — не та новость, ради которой их дёргают. Держим
+    # её здесь ради админа и ради проверки «а была ли вообще работа».
+    task.digest = {"нормализованы имена": written} if written else {}
+
     text = nz.report(written, skipped, discontinued, len(inputs), noise)
     if failed:
         text += ("\n\nНЕ ЗАПИСАНО " + str(len(failed)) + ":\n"
@@ -1226,6 +1264,7 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
                 f"({', '.join((i.site_name or i.name)[:20] for i in leaving[:5])}). "
                 f"Остальные {len(staying)} поз. коллекции «{wanted}» есть в прайсе — "
                 f"папку не трогал.")
+        task.digest = {"сняты с производства": len(leaving) - len(errors)}
         if errors:
             return (TaskStatus.PARTIAL, text + "\nОшибки 1С: "
                     + "; ".join(f"{e.get('code')} {e.get('message')}" for e in errors[:3]))
@@ -1241,6 +1280,10 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
         return (TaskStatus.TODO,
                 f"Папку «{folder.name}» перенести не удалось: "
                 + "; ".join(f"{e.get('code')} {e.get('message')}" for e in errors[:3]))
+
+    # ПАПКА УЕХАЛА ЦЕЛИКОМ — считаем ПОЗИЦИИ, а не операции. Операция была одна, но
+    # менеджеру важно, сколько товаров пропало с сайта, а не как мы это сделали.
+    task.digest = {"сняты с производства": len(live)}
 
     text = (f"Папка «{folder.name}» перенесена в снятые ({target}) целиком, "
             f"вместе с ней {len(live)} позиц. Наименования и цены не менялись.")
@@ -1322,6 +1365,10 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
     if task.kind == TaskKind.NORMALIZE_NAMES:
         return await run_normalization(onec, task, guard, scope=scope)
 
+    # ДАЙДЖЕСТ КЛАДЁТСЯ НА САМУ ЗАДАЧУ, а не возвращается третьим значением: подпись
+    # `run` читают три вызывающих и четыре теста, и расширять её ради поля, которое всё
+    # равно хранится с задачей, значило бы менять контракт ради удобства одной ветки.
+
     # ПЕРЕНОС ЦЕЛОЙ КОЛЛЕКЦИИ — тоже мимо модели: папка известна из позиций, целевая
     # папка снятых — из вида товара. Одна операция вместо N, и рассуждать не о чем.
     # Задача про ОДИН товар остаётся агенту: там надо понять, что именно снимают.
@@ -1340,6 +1387,8 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
         [{"role": "user", "content": task_brief(price, task)}],
         system=PROMPT, extra_tools=TOOLS, extra_executor=tools,
         base_tools=False, usage_labels=usage_labels)
+
+    task.digest = dict(tools.digest)
 
     if tools.outcome is not None:
         return tools.outcome

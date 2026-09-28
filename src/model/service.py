@@ -18,6 +18,7 @@ import logging
 
 from src.model import locks as lk
 from src.model import price_list as pl
+from src.model import report
 from src.model.commands import Command, CommandKind, Rejected
 from src.model.enums import PriceStatus, TaskStatus
 from src.model.events import Broadcaster, Event, EventKind
@@ -311,11 +312,43 @@ class PriceListService:
         except ValueError:
             return await self._reject(command, f"неизвестный статус «{raw}»")
 
+        # ЗАКРЫТИЕ ПРАЙСА ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ, и требует его СЛУЖБА, а не визуал.
+        #
+        # За статусом «выполнен» стоит не только смена подписи: менеджерам уходит сводка
+        # о том, что изменилось в каталоге (решение админа 28.09.2026). Спрашивать об
+        # этом обязаны оба визуала одинаково — иначе одно и то же действие даёт разный
+        # результат в зависимости от того, откуда нажали. Визуал, который не спросил,
+        # получит внятный отказ, а не тихо пропущенную рассылку.
+        if status == PriceStatus.DONE and not (command.payload or {}).get("confirmed"):
+            return await self._reject(
+                command, "закрытие прайса требует подтверждения: спросите админа, "
+                         "закончил ли он работу и оповещать ли менеджеров")
+
         price.status = status
         await self._store.set_price_status(price.id, status)
         await self.events.publish(Event(
             EventKind.PRICE_STATUS, price_id=price.id,
             text=f"Прайс №{price.id} — {status.value}."))
+
+        if status == PriceStatus.DONE:
+            await self._tell_managers(price)
+
+    async def _tell_managers(self, price) -> None:
+        """Сводка менеджерам о том, что изменилось в 1С по этому прайсу.
+
+        **ПУСТО — МОЛЧИМ.** Менялось ничего — сообщение «изменений нет» бесполезно
+        получателю и обесценивает следующие (решение админа 28.09.2026).
+
+        Текст собирается из дайджестов задач, снятых в момент записи: по тексту
+        результата не отличить «обновлены цены у четырёх» от «менять было нечего».
+        """
+        text = report.summary(price)
+        if not text:
+            logger.info("Прайс %s закрыт без изменений в 1С — менеджерам не пишем",
+                        price.id)
+            return
+        await self.events.publish(Event(
+            EventKind.PRICE_SUMMARY, price_id=price.id, text=text))
 
     async def _rebuild(self, command: Command) -> None:
         price = self.price(command.price_id)
