@@ -7,12 +7,14 @@
 нумерация зависела от фильтра, `/signature_delete 2` удалял бы разное в разных видах. Поэтому
 номер — позиция в ПОЛНОМ списке, а фильтр только прячет лишние строки.
 """
+import asyncio
 import logging
 
 from aiogram import Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
+from src.model import collection_audit as audit
 from src.model.events import Event, EventKind
 from src.price_tool import catalog_view as view
 from src.storage.suppliers import SupplierStore
@@ -260,3 +262,69 @@ async def cmd_price_file_delete(message: Message, command: CommandObject,
     await message.answer(f"Запись о файле «{target.filename}» убрана. "
                          "Сам файл удалится уборкой при старте, если на него больше никто "
                          "не ссылается.")
+
+
+# --------------------------------------------------- инвентаризация свойства «Коллекция»
+
+@router.message(Command("empty_collections"))
+async def cmd_empty_collections(message: Message, command: CommandObject,
+                                onec, is_admin: bool) -> None:
+    """Где в каталоге не проставлено свойство «Коллекция».
+
+    ОБХОД ИДЁТ ПО МАРКАМ, потому что другого входа в номенклатуру нет: `by-tm` требует
+    марку. Дорого это не по деньгам (модель не участвует вовсе), а по времени — минуты, —
+    поэтому ход показывается прямо в сообщении: молчащая три минуты команда читается как
+    зависшая.
+
+    БЕЗ АРГУМЕНТА СМОТРИМ ТОЛЬКО ПОМЕЧЕННЫЕ К ВЫГРУЗКЕ марки: свойство нужно ради сайта, а
+    непомеченная марка на сайт и не идёт. Назвали марку — смотрим её, помечена она или нет:
+    раз спросили именно про неё, довод про сайт уже не при чём.
+    """
+    if not is_admin:
+        return await _deny(message)
+    if onec is None:
+        await message.answer("Интеграция с 1С не настроена — смотреть нечего.")
+        return
+
+    wanted = (command.args or "").strip()
+    marks = await asyncio.to_thread(onec.selling_tm, bool(wanted))
+    if wanted:
+        marks = [m for m in marks if wanted.lower() in m.name.lower()]
+    if not marks:
+        await message.answer(f"Марок по «{wanted}» не нашлось." if wanted
+                             else "1С не отдала ни одной марки.")
+        return
+
+    status = await message.answer(f"Смотрю {len(marks)} марок — это займёт несколько минут.")
+    gaps: list = []
+    failed: list[str] = []
+    lost = live = 0
+
+    for number, mark in enumerate(marks, 1):
+        await _say(status, f"Смотрю {number} из {len(marks)}: {mark.name}…")
+        try:
+            nom = await asyncio.to_thread(onec.by_tm_all, mark.code)
+        except Exception as exc:                             # noqa: BLE001
+            # ОДНА УПАВШАЯ МАРКА НЕ ХОРОНИТ ОБХОД: канал теряет запросы (см. CLAUDE.md про
+            # туннель), и отчёт по двадцати девяти маркам полезнее, чем ошибка вместо всего.
+            # Имя упавшей марки попадёт в отчёт — иначе её дыры сойдут за отсутствие дыр.
+            logger.warning("Марка %s не выгрузилась: %s", mark.name, exc)
+            failed.append(mark.name)
+            continue
+        live += sum(1 for i in nom.items if not i.not_exported)
+        lost += len(nom.errors)
+        gaps.extend(audit.scan(mark.name, nom.items))
+
+    text = audit.render(gaps, marks=len(marks) - len(failed), live=live,
+                        failed=failed, lost=lost, scope=wanted)
+    for part in audit.split(text):
+        await message.answer(part)
+
+
+async def _say(status: Message, text: str) -> None:
+    """Показать ход обхода. Правка статуса — удобство, а не работа: сорвалась — идём
+    дальше, ронять из-за неё выгрузку, которая шла минуту, нельзя."""
+    try:
+        await status.edit_text(text)
+    except Exception:                                        # noqa: BLE001
+        pass

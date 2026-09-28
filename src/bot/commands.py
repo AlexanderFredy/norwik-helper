@@ -26,6 +26,7 @@ ADMIN_COMMANDS = COMMON_COMMANDS + [
     BotCommand(command="suppliers", description="Справочник поставщиков"),
     BotCommand(command="signatures", description="Форматы прайсов поставщиков"),
     BotCommand(command="price_files", description="Файлы прайсов на сервере"),
+    BotCommand(command="empty_collections", description="Где не проставлено свойство «Коллекция»"),
     BotCommand(command="adduser", description="Добавить пользователя"),
     BotCommand(command="removeuser", description="Удалить пользователя"),
     BotCommand(command="listusers", description="Список пользователей"),
@@ -90,6 +91,14 @@ _ADMIN_HELP = """
 
 Номера во всех этих списках <b>сквозные</b>: фильтр прячет лишние строки, но номера
 не сдвигает — иначе команда удалила бы не то, что видно.
+
+<b>Проверка каталога 1С</b>
+/empty_collections [&lt;марка&gt;] — где не проставлено свойство «Коллекция»
+
+По этому свойству коллекция опознаётся на сайте; пустое — имя выводится из папки, а в
+нём стоит размер. Сверка по прайсу такие позиции тоже считает, но только там, куда прайс
+дотянулся; эта команда обходит каталог целиком. Без марки — только помеченные к выгрузке,
+несколько минут. Токенов не стоит: считает код, модель не участвует.
 
 <b>Доступ к боту</b>
 /adduser &lt;id&gt; [имя] — добавить менеджера
