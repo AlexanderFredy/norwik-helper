@@ -79,14 +79,24 @@ class SummaryTest(unittest.TestCase):
         self.assertLess(line.index("сняты"), line.index("обновлены цены"))
         self.assertLess(line.index("обновлены цены"), line.index("уточнены размеры"))
 
-    def test_price_is_named_by_its_file(self):
+    def test_supplier_name_is_used_when_given(self):
+        """Имя файла менеджеру ничего не говорит и выглядит как внутренняя кухня:
+        поставщик — то, чем он поставку и называет (решение админа 28.09.2026)."""
+        text = report.summary(price([task(digest={"обновлены цены": 1})]),
+                              header="Стройиндустрия (Лиля)")
+        self.assertIn("Стройиндустрия (Лиля)", text)
+        self.assertNotIn(".xls", text, "имя файла наружу не идёт")
+
+    def test_file_name_is_the_fallback(self):
+        """Имени поставщика нет — безымянная сводка хуже некрасивой."""
         text = report.summary(price([task(digest={"обновлены цены": 1})]))
         self.assertIn("Прайс Linderwood.xls", text)
 
-    def test_header_overrides_the_file_name(self):
-        text = report.summary(price([task(digest={"обновлены цены": 1})]),
-                              header="Линдервуд")
-        self.assertIn("Линдервуд", text)
+    def test_no_trailing_boilerplate(self):
+        """«Подробности — у администратора» не несёт ничего, а краткость съедает."""
+        text = report.summary(price([task(digest={"обновлены цены": 1})]))
+        self.assertNotIn("администратор", text.lower())
+        self.assertTrue(text.strip().endswith(")"), "последняя строка — сама сводка")
 
 
 class FakeBot:
