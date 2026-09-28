@@ -127,10 +127,13 @@ async def main() -> None:
 
         # Ответ агента едет дальше вместе с задачами: когда их ноль, только он и
         # объясняет, почему — «расхождений нет» или «разобрал не тот лист».
+        # КАТЕГОРИИ (`/categories`) нужны и ЗДЕСЬ, не только исполнителю: раздел чужого
+        # вида товара — это не работа, и задачу по нему заводить незачем. Решает код.
         return await build(orchestrator, content, filename, onec=onec,
                            usage_labels={"kind": "pricing", "price_doc": filename},
                            elsewhere=await sightings.elsewhere(supplier_id),
-                           remember=remember)
+                           remember=remember,
+                           scope=[c["category"] for c in await pricing_store.list_scope()])
 
     async def run_task(price, task, content, guard):
         """Выполнение задачи агентом (§6.2) — С НАСТОЯЩЕЙ ЗАПИСЬЮ в 1С.

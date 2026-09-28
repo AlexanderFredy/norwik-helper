@@ -519,6 +519,51 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         # к каждой позиции приложена строка прайса — по ней и проставят артикул
         self.assertIn("Дуб Авила", blind["позиции"][0]["строка_прайса"])
 
+    async def test_task_for_a_product_type_out_of_scope_is_refused(self):
+        """СЛУЧАЙ С БОЯ (28.09.2026). Прайс Linderwood кончается разделом «ПОДЛОЖКА
+        ЛИСТОВАЯ 3 мм», и агент завёл задачу завести две позиции — при том, что подложки
+        в списке анализируемых категорий нет и работы по ней не предполагается вовсе.
+        Категории задаёт админ один раз на все прайсы; решает код, а не модель."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([]),
+                                 scope=["ламинат", "керамическая плитка"])
+        out = await tools.execute("add_task", {
+            "kind": "добавление новых", "tm": "Linderwood",
+            "collection": "ПОДЛОЖКА ЛИСТОВАЯ 3 мм", "product_type": "подложка",
+            "description": "завести 2 позиции"})
+
+        self.assertEqual(tools.collected, [], "задача не заведена")
+        self.assertIn("не входит в анализируемые категории", out)
+        self.assertIn("ламинат", out, "названы те категории, что разрешены")
+
+    async def test_task_within_the_scope_is_created(self):
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([]),
+                                 scope=["ламинат", "керамическая плитка"])
+        await tools.execute("add_task", {
+            "kind": "добавление новых", "tm": "Linderwood", "collection": "Vintage",
+            "product_type": "Ламинат", "description": "завести 2 позиции"})
+
+        self.assertEqual(len(tools.collected), 1)
+
+    async def test_unnamed_product_type_does_not_block_the_task(self):
+        """Вид не назван — не отказываем: модель может его не знать, а терять работу по
+        ламинату из-за незаполненного поля нельзя."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([]),
+                                 scope=["ламинат"])
+        await tools.execute("add_task", {
+            "kind": "изменение цен", "tm": "Linderwood", "collection": "Vintage",
+            "description": "обновить цены"})
+
+        self.assertEqual(len(tools.collected), 1)
+
+    async def test_empty_scope_allows_everything(self):
+        """Пустой список категорий значит «ограничений нет», а не наоборот."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([]))
+        await tools.execute("add_task", {
+            "kind": "добавление новых", "tm": "Linderwood", "collection": "Подложка",
+            "product_type": "подложка", "description": "завести 2 позиции"})
+
+        self.assertEqual(len(tools.collected), 1)
+
     async def test_same_article_in_another_collection_is_a_homonym(self):
         """СЛУЧАЙ С БОЯ (25.09.2026). Раздел «Westerhof SPARK» (4 мм) и коллекция Modern
         (3,6 мм) — один и тот же декор в двух толщинах, артикулы общие. Три кода прайса

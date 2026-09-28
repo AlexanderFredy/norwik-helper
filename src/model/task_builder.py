@@ -37,7 +37,7 @@ from src.model.task import PriceTask
 from src.model import price_check
 from src.price_tool.items import build_name
 from src.price_tool.parser import parse_price_table, render_preview
-from src.price_tool.scope import normalize
+from src.price_tool.scope import in_scope, normalize
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +216,9 @@ TOOLS = [
             "description — что КОНКРЕТНО предстоит сделать, с числами и артикулами из "
             "`compare_with_1c`. «Проверить, все ли заведены» — плохое описание: это ты "
             "уже проверил. «Завести 3 позиции: 3311, 3315, 3316» — хорошее.\n"
+            "product_type — вид товара раздела. Для «добавление новых» передавай всегда: "
+            "код по нему проверяет, входит ли товар в анализируемые категории, и задачу "
+            "по чужому виду не заведёт.\n"
             "Повторный вызов с тем же адресом и видом дополняет описание, а не плодит "
             "вторую задачу."),
         "input_schema": {
@@ -227,6 +230,13 @@ TOOLS = [
                 "collection": {"type": "string"},
                 "item": {"type": "string", "description": "если задача про один товар"},
                 "article": {"type": "string"},
+                "product_type": {
+                    "type": "string",
+                    "description": ("вид товара раздела: ламинат, керамическая плитка, "
+                                    "подложка, плинтус… Как назван в прайсе или в 1С. "
+                                    "ОБЯЗАТЕЛЕН для «добавление новых»: по нему код "
+                                    "проверяет, анализируем ли мы такой товар вообще"),
+                },
                 "description": {"type": "string"},
             },
             "required": ["kind", "tm", "description"],
@@ -240,10 +250,15 @@ class TaskBuilderTools:
     """Исполнитель инструментов одного прогона формирования задач."""
 
     def __init__(self, content: bytes, filename: str, onec=None,
-                 elsewhere: dict | None = None) -> None:
+                 elsewhere: dict | None = None, scope=None) -> None:
         self._content = content
         self._filename = filename
         self._onec = onec
+        # КАТЕГОРИИ (`/categories`) — что вообще разрешено трогать. Пустой список значит
+        # «ограничений нет», а не наоборот. Исполнитель задач их получал давно, сборщик —
+        # нет, и это стоило задачи «завести подложку» по прайсу Linderwood: вид товара в
+        # список не входит, работы по нему нет вовсе (бой 28.09.2026).
+        self._scope = [str(c).strip() for c in (scope or ()) if str(c).strip()]
         # Артикул → где его видели у ДРУГИХ поставщиков (`storage/sightings.py`). Снимок
         # берётся один раз перед ходом: спрашивать базу из синхронного кода инструментов
         # неоткуда, а таблица мала.
@@ -1093,6 +1108,27 @@ class TaskBuilderTools:
             self._tm_names[tm_code] = (nom.tm or "").strip()
         return self._items_cache[tm_code]
 
+    def _out_of_scope(self, product_type) -> str:
+        """Причина отказа, если такой вид товара мы не анализируем. Пусто — можно.
+
+        Пустой список категорий значит «ограничений нет», а не наоборот: так же это
+        устроено в прайсовом потоке (`scope.in_scope`), и второе правило разошлось бы с
+        первым молча.
+
+        Вид НЕ НАЗВАН — не отказываем. Модель может его не знать (в прайсе он бывает
+        только в шапке раздела), а отклонять задачу за отсутствие подсказки значило бы
+        терять работу по ламинату из-за не заполненного поля.
+        """
+        kind = str(product_type or "").strip()
+        if not self._scope or not kind:
+            return ""
+        if in_scope(self._scope, kind):
+            return ""
+        return (f"Вид товара «{kind}» не входит в анализируемые категории "
+                f"({', '.join(self._scope)}) — задачу по нему не завожу. Скажи об этом "
+                f"в итоговом ответе одной строкой: админ решит, расширять ли список "
+                f"командой /categories.")
+
     def _add(self, inp: dict) -> str:
         if len(self.collected) >= MAX_TASKS:
             return self._refuse(f"Достигнут потолок в {MAX_TASKS} задач — заканчивай.")
@@ -1110,6 +1146,21 @@ class TaskBuilderTools:
         item = (inp.get("item") or "").strip()
         collection = (inp.get("collection") or "").strip()
         mark = Ref.make(code=inp.get("tm_code"), names=[tm])
+
+        # ВИД ТОВАРА ПРОВЕРЯЕТ КОД, а не модель (§ категории).
+        #
+        # Прайс Linderwood кончается разделом «ПОДЛОЖКА ЛИСТОВАЯ 3 мм», и агент завёл
+        # задачу завести две позиции — при том, что подложки в списке анализируемых
+        # категорий нет и работы по ней не предполагается вовсе (бой 28.09.2026).
+        # Категории админ задаёт один раз на все прайсы, и решение это его, а не модели:
+        # та видит раздел в файле и добросовестно считает его работой.
+        #
+        # Вид товара код знать не может — в 1С такой коллекции нет, — поэтому его
+        # называет модель, а решение принимает код. Это то же разделение, что и везде:
+        # модель поставляет то, чего код не знает, решает код.
+        refused = self._out_of_scope(inp.get("product_type"))
+        if refused:
+            return self._refuse(refused)
 
         # Нормализация адресуется МАРКОЙ, поэтому предмет ей не нужен — требовать его
         # значило бы отклонять правильно составленную задачу.
@@ -1216,6 +1267,16 @@ PROMPT = """Ты — контент-менеджер интернет-магаз
    Вернётся, чего нет в 1С, чего нет в прайсе, какие свойства пустые и КАК КОЛЛЕКЦИЯ
    НАЗЫВАЕТСЯ В 1С.
 4. `add_task` на каждую пару (марка, коллекция), по которой есть что делать.
+
+МЫ РАБОТАЕМ НЕ СО ВСЕМ, ЧТО ЕСТЬ В ПРАЙСЕ. Магазин анализирует ОПРЕДЕЛЁННЫЕ виды товара —
+список задан админом, и код его знает. Прайс же обычно шире: в конце листа стоят разделы
+с подложкой, плинтусом, клеем, порогами. **Задачи по ним не нужны вовсе** — ни завести,
+ни сверить цены, ни перенести в снятые. Увидел такой раздел — пропусти его и скажи о нём
+ОДНОЙ СТРОКОЙ в итоговом ответе: «подложка (2 позиции) пропущена — вид товара вне
+анализируемых категорий». Админ решит, расширять ли список.
+
+Поэтому в `add_task` передавай `product_type` — вид товара раздела, как он назван в
+прайсе. Код проверит его по списку и задачу по чужому виду не заведёт.
 
 ИМЕНА КОЛЛЕКЦИЙ В ПРАЙСЕ И В 1С РАЗНЫЕ — это норма, а не ошибка. У Most Flooring в
 справочнике «Millenium Pro», «Provence», «High Glossy», а в прайсе «Миллениум Про»,
@@ -1644,7 +1705,7 @@ def fix_marks(tasks: list[PriceTask], owners: dict[str, set]) -> list[str]:
 async def build(orchestrator, content: bytes, filename: str, onec=None,
                 usage_labels: dict | None = None,
                 elsewhere: dict | None = None,
-                remember=None) -> tuple[list[PriceTask], str]:
+                remember=None, scope=None) -> tuple[list[PriceTask], str]:
     """Прогон формирования задач. Возвращает (задачи, короткий ответ агента).
 
     Пустой список — не ошибка: агент мог не найти, за что зацепиться. Вызывающий решает,
@@ -1654,7 +1715,8 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
     `remember(артикулы)` — куда сложить то, что показал этот прайс. Оба необязательны:
     без них поведение прежнее, то есть «нет в прайсе — кандидат в снятые».
     """
-    tools = TaskBuilderTools(content, filename, onec=onec, elsewhere=elsewhere)
+    tools = TaskBuilderTools(content, filename, onec=onec, elsewhere=elsewhere,
+                             scope=scope)
     task = f"Прайс «{filename}». Составь список задач по нему."
 
     answer, _ = await orchestrator.handle_turn(
