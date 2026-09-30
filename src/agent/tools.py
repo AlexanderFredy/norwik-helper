@@ -13,10 +13,9 @@ from pathlib import Path
 from src.email_tool.attachments import excel_sheet_names, extract_text
 from src.email_tool.classifier import classify, parse_signature
 from src.email_tool.client import MailClient
-from src.model import normalize as nz
 from src.price_tool.exclusive import find, resolve
 from src.price_tool.history import describe_group, describe_product
-from src.website_tool import photo_report, photos
+from src.website_tool import photo_report, photo_scan
 from src.website_tool.norwik import NorwikClient
 
 logger = logging.getLogger(__name__)
@@ -196,11 +195,14 @@ class ToolExecutor:
     """Выполняет кастомные инструменты. Серверные (web_search) выполняет API."""
 
     def __init__(self, mail: MailClient, norwik: NorwikClient, onec=None,
-                 pricing_store=None) -> None:
+                 pricing_store=None, photo_watch=None) -> None:
         self._mail = mail
         self._norwik = norwik
         self._onec = onec              # None, если интеграция с 1С не настроена
         self._pricing_store = pricing_store
+        # Журнал наблюдений за фото. None — работаем по-прежнему, снимком: прогресс просто
+        # не показывается. Отсутствие журнала не повод не отвечать на вопрос.
+        self._watch = photo_watch
         # ГОТОВЫЙ ОТВЕТ МИМО МОДЕЛИ. Длинный список (товары без фото) она обязана была бы
         # пересказать целиком — это выходные токены за копирование и риск, что ссылки в
         # пересказе разойдутся с настоящими. Инструмент кладёт список сюда, обработчик
@@ -340,72 +342,33 @@ class ToolExecutor:
         since = _months_ago(months)
         wanted = (inp.get("tm") or "").strip()
 
-        # ТОЛЬКО ПОМЕЧЕННЫЕ К ВЫГРУЗКЕ марки: товар непомеченной на сайт не попадает, и
-        # спрашивать о его фото бессмысленно. Второе условие — сам товар не в папке
-        # «Не выгружать» — держит `by_tm_all` своим умолчанием.
-        marks = await asyncio.to_thread(self._onec.selling_tm)
-        if wanted:
-            marks = [m for m in marks if wanted.lower() in m.name.lower()]
-            if not marks:
-                return f"Марки «{wanted}» нет среди выгружаемых на сайт."
-            walk = [(m.code, m.name) for m in marks]
-        else:
-            # ОДИН ЗАПРОС ВМЕСТО СТА ШЕСТИДЕСЯТИ ШЕСТИ. Обход по марке стоил 285 секунд на
-            # боевой базе — четыре с половиной минуты на вопрос в чате, и 166 поводов
-            # потерять запрос в туннеле. `by-tm` без `tm` (разрешено только с
-            # `created_from`) сам ограничивается марками, помеченными к выгрузке, а имя
-            # марки приходит в самой позиции.
-            walk = [(None, "")]
+        # ПОЗИЦИИ ИЗ ЖУРНАЛА, ВЫПАВШИЕ ИЗ ОКНА НОВИЗНЫ, проверяем тоже — но только когда
+        # спрашивают про весь каталог. Вопрос про одну марку не должен тащить за собой
+        # чужие: человек спросил про Classen и ждёт ответ про Classen.
+        extra = []
+        if self._watch is not None and not wanted:
+            extra = [{"ref": w.ref, "site_id": w.site_id, "tm": w.tm,
+                      "collection": w.collection, "name": w.name, "created": w.created}
+                     for w in await self._watch.open_ids()]
 
-        fresh, lost, dated = [], 0, False
-        for code, label in walk:
-            nom = await asyncio.to_thread(self._onec.by_tm_all, code, created_from=since)
-            if any(str(e.get("code")) == "tm_missing" for e in nom.errors):
-                # Старый by-tm.bsl запрос без марки не принимает и отвечает пустым
-                # списком. Принять его за «новых товаров нет» нельзя.
-                return ("1С не принимает запрос без марки — нужна выкладка обновлённого "
-                        "specs/1c/by-tm.bsl.")
-            lost += len(nom.errors)
-            dated = dated or any(i.created for i in nom.items)
-            for item in nom.items:
-                # Отбор ПОВТОРЯЕТСЯ здесь, а не доверяется 1С: со старым by-tm.bsl параметр
-                # `created_from` проходит мимо, и выгрузка приходит целиком.
-                if not item.not_exported and item.created and item.created >= since:
-                    fresh.append((label or item.tm or "Без марки", item))
-            if nom.items and not dated:
-                # Дат нет ни у одной позиции первой же марки — значит поле не отдаётся.
-                # Молча вернуть «новых нет» нельзя: это читается как «всё в порядке».
-                return ("1С не отдаёт дату создания товаров — отобрать новые нечем. "
-                        "Нужна выкладка обновлённого specs/1c/by-tm.bsl.")
-
-        if not fresh:
+        found = await photo_scan.scan(self._onec, since=since, tm=wanted, extra=extra)
+        if found.problem:
+            return found.problem
+        if not found.checked:
             return (f"Новых товаров с {since} нет — проверять нечего "
-                    f"(марок просмотрено {len(marks)}).")
+                    f"(марок просмотрено {found.marks}).")
 
-        checker = photos.PhotoChecker()
-        try:
-            state = await asyncio.to_thread(checker.statuses,
-                                            [i.id for _, i in fresh])
-        finally:
-            checker.close()
+        # ЖУРНАЛ НАПОЛНЯЕТСЯ ПОПУТНО: обход уже сделан, и записать его итог стоит одного
+        # обращения к базе. Без этого прогресс считать было бы не из чего.
+        progress = None
+        if self._watch is not None:
+            await self._watch.observe(found.observations)
+            progress = await self._watch.progress()
 
-        rows, no_card, failed = [], 0, 0
-        for tm_name, item in fresh:
-            verdict = state.get((item.id or "").strip(), photos.NO_CARD)
-            if verdict == photos.NONE:
-                rows.append(photo_report.Row(
-                    tm=tm_name, collection=nz.collection_of(item),
-                    name=item.site_name or item.name, url=photos.item_url(item.id),
-                    created=item.created))
-            elif verdict == photos.NO_CARD:
-                no_card += 1
-            elif verdict == photos.FAILED:
-                failed += 1
-
-        text = photo_report.render(rows, since=since, checked=len(fresh),
-                                   marks=len(marks), no_card=no_card, failed=failed,
-                                   scope=wanted)
-        return self._deliver(text, rows, since, lost)
+        text = photo_report.render(found.rows, since=since, checked=found.checked,
+                                   marks=found.marks, no_card=found.no_card,
+                                   failed=found.failed, scope=wanted, progress=progress)
+        return self._deliver(text, found.rows, since, found.lost)
 
     def _deliver(self, text: str, rows: list, since: str, lost: int) -> str:
         """Список — менеджеру напрямую, модели — только числа (см. `take_pending`)."""

@@ -16,12 +16,14 @@ from src.bot.model_handlers import (ManagerListener, TelegramListener,
                                     TelegramProvider,
                                     router as model_router)
 from src.bot.model_loop import AgentLoop
+from src.bot import photo_daily
 from src.bot.polling import poll_forever
 from src.bot.pricing_handlers import router as pricing_router
 from src.config import load_config
 from src.email_tool.client import MailClient
 from src.onec.client import OnecClient
 from src.onec.model_provider import OnecProvider
+from src.storage.photo_watch import PhotoWatchStore
 from src.storage.pricing import PricingStore
 from src.model.service import PriceListService
 from src.storage.command_queue import CommandQueue
@@ -89,6 +91,10 @@ async def main() -> None:
              | await model_store.known_paths())
     price_files.sweep(config.db_path, known)
 
+    # Журнал наблюдений за фото: по нему считается прогресс, а не снимок «48 без фото».
+    photo_watch = PhotoWatchStore(config.db_path)
+    await photo_watch.init()
+
     onec = None
     if config.onec_base_url and config.onec_token:
         onec = OnecClient(config.onec_base_url, config.onec_token, timeout=120)
@@ -102,7 +108,8 @@ async def main() -> None:
     norwik = NorwikClient()
     orchestrator = Orchestrator(
         api_key=config.anthropic_api_key,
-        executor=ToolExecutor(mail, norwik, onec=onec, pricing_store=pricing_store),
+        executor=ToolExecutor(mail, norwik, onec=onec, pricing_store=pricing_store,
+                              photo_watch=photo_watch),
         # Учёт расхода токенов (§9.6.3): журнал хранилища и есть приёмник. Метки к строке
         # добавляют обработчики — только они знают, чей это вызов и по какому прайсу.
         on_usage=pricing_store.record_usage,
@@ -225,7 +232,13 @@ async def main() -> None:
     # Поллинг поднимается через `poll_forever`, а не напрямую: моргнувший на старте DNS
     # ронял процесс насовсем, хотя ждать надо было секунды, — и уносил с собой цикл
     # модели, которому Telegram вообще не нужен (у формы 1С свой канал).
-    await asyncio.gather(poll_forever(dp, bot), loop.run())
+    jobs = [poll_forever(dp, bot), loop.run()]
+    if onec is not None:
+        # Ежедневная проверка фото наполняет журнал, по понедельникам шлёт админу
+        # напоминание о просроченных. Без 1С брать список новых товаров неоткуда.
+        jobs.append(photo_daily.run_forever(onec, photo_watch, bot,
+                                            config.admin_telegram_id))
+    await asyncio.gather(*jobs)
 
 
 if __name__ == "__main__":
