@@ -23,6 +23,7 @@ from src.config import load_config
 from src.email_tool.client import MailClient
 from src.onec.client import OnecClient
 from src.onec.model_provider import OnecProvider
+from src.storage.photo_subscribers import PhotoSubscriberStore
 from src.storage.photo_watch import PhotoWatchStore
 from src.storage.pricing import PricingStore
 from src.model.service import PriceListService
@@ -94,6 +95,10 @@ async def main() -> None:
     # Журнал наблюдений за фото: по нему считается прогресс, а не снимок «48 без фото».
     photo_watch = PhotoWatchStore(config.db_path)
     await photo_watch.init()
+    # Кому уходит еженедельный дайджест. Пустой список значит «никому», в том числе
+    # администратору: доступ к боту и подписка на рассылку — разные вещи.
+    photo_subscribers = PhotoSubscriberStore(config.db_path)
+    await photo_subscribers.init()
 
     onec = None
     if config.onec_base_url and config.onec_token:
@@ -216,7 +221,8 @@ async def main() -> None:
 
     dp = Dispatcher(store=store, orchestrator=orchestrator, openai_api_key=config.openai_api_key,
                     onec=onec, pricing_store=pricing_store,
-                    supplier_store=supplier_store, model=model, queue=commands, loop=loop)
+                    supplier_store=supplier_store, model=model, queue=commands, loop=loop,
+                    photo_subscribers=photo_subscribers)
     dp.message.middleware(AuthMiddleware(store, config.admin_telegram_id))
     dp.callback_query.middleware(AuthMiddleware(store, config.admin_telegram_id))
     dp.include_router(catalog_router)   # справочники: только команды, конфликтов нет
@@ -237,7 +243,7 @@ async def main() -> None:
         # Ежедневная проверка фото наполняет журнал, по понедельникам шлёт админу
         # напоминание о просроченных. Без 1С брать список новых товаров неоткуда.
         jobs.append(photo_daily.run_forever(onec, photo_watch, bot,
-                                            config.admin_telegram_id))
+                                            photo_subscribers))
     await asyncio.gather(*jobs)
 
 

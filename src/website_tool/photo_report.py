@@ -107,55 +107,48 @@ def render(rows: list[Row], *, since: str, checked: int, marks: int,
     return "\n".join(lines)
 
 
-#: Сколько просроченных называем поимённо в напоминании. Остальные — числом: напоминание
-#: читают по понедельникам мельком, и список на полсотни строк в нём не читается вовсе.
-#: Полный список всегда можно спросить у агента.
-REMINDER_ROWS = 20
+def digest(progress, waiting: list, today: str | None = None,
+           days: int = 30) -> str | None:
+    """Еженедельный дайджест подписчикам. None — рассказывать не о чем.
 
+    **СТРОКА НА МАРКУ, БЕЗ ПОИМЁННОГО СПИСКА** (решение админа 30.09.2026). Дайджест
+    отвечает на вопрос «где работа стоит», а не «что именно делать»: перечень читают, когда
+    садятся за него, и для этого есть вопрос агенту, который присылает список со ссылками.
+    Полсотни строк в еженедельном письме превращают его в то, что пролистывают.
 
-def reminder(progress, stale: list, today: str | None = None,
-             limit: int = REMINDER_ROWS) -> str | None:
-    """Еженедельное напоминание админу. None — беспокоить не о чем.
+    **«Из них больше месяца» пишется, только когда таких есть.** Приписка «— 0» в каждой
+    строке ничего не сообщает, а глаз за неё цепляется наравне с настоящими числами.
 
-    ПУСТОЕ НАПОМИНАНИЕ НЕ ОТПРАВЛЯЕТСЯ. Еженедельное «всё в порядке» обесценивает те
-    письма, в которых что-то есть, — через месяц их перестают открывать. Молчание здесь
-    само по себе сообщение: просроченных нет.
+    **ПУСТОЙ ДАЙДЖЕСТ НЕ ОТПРАВЛЯЕТСЯ**: ждать фото нечему — молчим. Еженедельное «всё в
+    порядке» обесценивает письма, в которых что-то есть.
     """
-    if not stale:
+    if not waiting:
         return None
 
-    lines = [f"Фото: {len(stale)} поз. ждут дольше месяца", ""]
-    if progress is not None:
-        lines.append(f"Всего ждут фото: {progress.waiting} поз.")
-        if progress.closed_month or progress.median_days:
-            moving = (f"Добавлено: за неделю {progress.closed_week}, "
-                      f"за месяц {progress.closed_month}.")
-            if progress.median_days is not None:
-                moving += f" Обычно от заведения до фото — {progress.median_days} дн."
-            lines.append(moving)
-        lines.append("")
-
-    lines.append("Дольше всего ждут:")
-    last = ""
-    for row in stale[:limit]:
-        where = f"{row.tm} / {row.collection}"
-        if where != last:
-            lines += ["", where]
-            last = where
+    by_tm: dict[str, list[int]] = {}
+    for row in waiting:
         waited = row.waiting_days(today)
-        tail = f" ({waited} дн.)" if waited is not None else ""
-        lines.append(f"— {row.name}{tail} — {item_link(row.site_id)}")
+        slot = by_tm.setdefault(row.tm or "Без марки", [0, 0])
+        slot[0] += 1
+        slot[1] += (waited or 0) >= days
 
-    if len(stale) > limit:
-        lines += ["", f"…и ещё {len(stale) - limit} поз. Весь список — спросите "
-                      "«покажи, где не добавлены фото»."]
+    lines = [f"Всего ждут фото: {len(waiting)} поз.", ""]
+    # Сперва марки с просрочкой и покрупнее: читают сверху и часто дальше первых строк не
+    # идут — значит наверху должно стоять то, где работа стоит дольше всего.
+    for tm, (count, late) in sorted(by_tm.items(),
+                                    key=lambda kv: (-kv[1][1], -kv[1][0], kv[0])):
+        tail = f", из них больше месяца — {late}" if late else ""
+        lines.append(f"- {tm} — {count}{tail}")
+
+    if progress is not None and (progress.closed_month or progress.median_days):
+        moving = (f"Фото добавлено: за неделю {progress.closed_week}, "
+                  f"за месяц {progress.closed_month}.")
+        if progress.median_days is not None:
+            moving += f" Обычно от заведения до фото — {progress.median_days} дн."
+        lines += ["", moving]
+
+    lines += ["", "Список со ссылками — спросите «покажи, где не добавлены фото»."]
     return "\n".join(lines)
-
-
-def item_link(site_id: str) -> str:
-    """Ссылка на карточку. Отдельной функцией, чтобы отчёт не зависел от модуля проверки —
-    он про текст, а не про то, как мы спрашиваем сайт."""
-    return f"https://www.norwik.ru/item/{site_id}"
 
 
 def fits_chat(text: str) -> bool:

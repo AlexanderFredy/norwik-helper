@@ -321,6 +321,87 @@ async def cmd_empty_collections(message: Message, command: CommandObject,
         await message.answer(part)
 
 
+# ------------------------------------------------- подписка на дайджест по фото
+
+@router.message(Command("photo_subs"))
+async def cmd_photo_subs(message: Message, photo_subscribers, store,
+                         is_admin: bool) -> None:
+    """Кто получает еженедельный дайджест «где не добавлены фото»."""
+    if not is_admin:
+        return await _deny(message)
+
+    rows = await photo_subscribers.list_all()
+    if not rows:
+        await message.answer(
+            "Дайджест по фото не получает никто. Подписать: "
+            "/photo_sub_add <id> [имя]\n\n"
+            "Пустой список значит «не слать никому» — в том числе администратору.")
+        return
+
+    names = {u.telegram_id: u.name for u in await store.list_all()}
+    lines = [f"{i}. {r.name or names.get(r.telegram_id) or '—'} ({r.telegram_id})"
+             for i, r in enumerate(rows, 1)]
+    await message.answer("Дайджест по фото получают (по понедельникам):\n"
+                         + "\n".join(lines)
+                         + "\n\nПодписать: /photo_sub_add <id> [имя]"
+                           "\nОтписать: /photo_sub_delete <номер>")
+
+
+@router.message(Command("photo_sub_add"))
+async def cmd_photo_sub_add(message: Message, command: CommandObject,
+                            photo_subscribers, store, is_admin: bool) -> None:
+    if not is_admin:
+        return await _deny(message)
+
+    parts = (command.args or "").split(maxsplit=1)
+    if not parts or not parts[0].lstrip("-").isdigit():
+        await message.answer("Укажите telegram-id: /photo_sub_add 1006193754 Иван")
+        return
+
+    who = int(parts[0])
+    name = parts[1].strip() if len(parts) > 1 else ""
+
+    # ПОДПИСАТЬ МОЖНО ТОЛЬКО ТОГО, У КОГО ЕСТЬ ДОСТУП К БОТУ: рассылка несёт наименования
+    # и ссылки на карточки каталога, и отправить их человеку, которому пользоваться ботом
+    # не разрешали, — значит выдать данные в обход белого списка.
+    allowed = {u.telegram_id: u.name for u in await store.list_all()}
+    if who not in allowed:
+        await message.answer(
+            f"У {who} нет доступа к боту — сперва /adduser {who}. "
+            "Рассылка несёт ссылки на карточки каталога, и получать её должен только тот, "
+            "кому и так разрешено пользоваться ботом.")
+        return
+
+    added = await photo_subscribers.add(who, name or allowed[who],
+                                        message.from_user.id if message.from_user else None)
+    await message.answer(
+        f"{'Подписан' if added else 'Уже был подписан'}: "
+        f"{name or allowed[who] or who}. Список: /photo_subs")
+
+
+@router.message(Command("photo_sub_delete"))
+async def cmd_photo_sub_delete(message: Message, command: CommandObject,
+                               photo_subscribers, is_admin: bool) -> None:
+    if not is_admin:
+        return await _deny(message)
+
+    rows = await photo_subscribers.list_all()
+    arg = (command.args or "").strip()
+    target = _pick(rows, arg)
+    if target is None and arg.lstrip("-").isdigit():
+        # Номер из списка удобнее, но id принимаем тоже: его видно в том же списке, и
+        # заставлять пересчитывать строки незачем.
+        target = next((r for r in rows if r.telegram_id == int(arg)), None)
+    if target is None:
+        await message.answer("Нужен номер из /photo_subs или telegram-id, "
+                             "например: /photo_sub_delete 1")
+        return
+
+    await photo_subscribers.remove(target.telegram_id)
+    await message.answer(f"Отписан: {target.name or target.telegram_id}. "
+                         "Список: /photo_subs")
+
+
 async def _say(status: Message, text: str) -> None:
     """Показать ход обхода. Правка статуса — удобство, а не работа: сорвалась — идём
     дальше, ронять из-за неё выгрузку, которая шла минуту, нельзя."""

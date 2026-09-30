@@ -141,7 +141,8 @@ class StoreTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([w.ref for w in await self.store.waiting()], ["B"])
 
 
-class ReminderTest(unittest.IsolatedAsyncioTestCase):
+class DigestTest(unittest.IsolatedAsyncioTestCase):
+    """Дайджест — строка на МАРКУ, без поимённого списка (решение админа 30.09.2026)."""
 
     async def asyncSetUp(self):
         self._dir = tempfile.TemporaryDirectory()
@@ -153,41 +154,56 @@ class ReminderTest(unittest.IsolatedAsyncioTestCase):
 
     async def text(self, rows, today="2026-09-30"):
         await self.store.observe(rows, today=today)
-        return photo_report.reminder(await self.store.progress(today=today),
-                                     await self.store.stale(today=today), today=today)
+        return photo_report.digest(await self.store.progress(today=today),
+                                   await self.store.waiting(), today=today)
 
-    async def test_nothing_overdue_means_no_message(self):
+    async def test_nothing_waiting_means_no_message(self):
         """Еженедельное «всё в порядке» через месяц перестают читать вместе с теми
         письмами, в которых что-то есть."""
-        self.assertIsNone(await self.text([seen(created="2026-09-28")]))
+        self.assertIsNone(await self.text([seen(state=photos.HAS)]))
 
-    async def test_overdue_are_named_with_links_and_days(self):
-        text = await self.text([seen(ref="A", created="2026-08-01")])
-        self.assertIn("Classen / Manor", text)
-        self.assertIn("Вернон (60 дн.)", text)
-        self.assertIn("https://www.norwik.ru/item/1001", text)
+    async def test_line_per_mark_with_totals(self):
+        rows = [seen(ref="A", tm="Classen", created="2026-08-01"),
+                seen(ref="B", tm="Classen", created="2026-09-28"),
+                seen(ref="C", tm="Peli", created="2026-09-28")]
+        text = await self.text(rows)
+        self.assertIn("Всего ждут фото: 3 поз.", text)
+        self.assertIn("- Classen — 2, из них больше месяца — 1", text)
+        self.assertIn("- Peli — 1", text)
+
+    async def test_zero_overdue_is_not_written_out(self):
+        """Приписка «— 0» ничего не сообщает, а глаз за неё цепляется наравне с числами."""
+        text = await self.text([seen(tm="Peli", created="2026-09-28")])
+        self.assertIn("- Peli — 1", text)
+        self.assertNotIn("больше месяца", text)
+
+    async def test_no_names_and_no_links(self):
+        """Поимённый список в еженедельном письме не нужен — для него есть вопрос агенту."""
+        text = await self.text([seen(name="Вернон", created="2026-08-01")])
+        self.assertNotIn("Вернон", text)
+        self.assertNotIn("https://", text)
+
+    async def test_marks_with_overdue_come_first(self):
+        rows = [seen(ref=f"S{i}", tm="Без просрочки", created="2026-09-28")
+                for i in range(5)]
+        rows.append(seen(ref="L", tm="С просрочкой", created="2026-01-01"))
+        text = await self.text(rows)
+        lines = [ln for ln in text.splitlines() if ln.startswith("- ")]
+        self.assertTrue(lines[0].startswith("- С просрочкой"))
 
     async def test_progress_numbers_are_there(self):
-        # Закрытие засчитывается только как переход «ждал → появилось»: сперва без фото.
         await self.store.observe([seen(ref="B", created="2026-09-01")],
                                  today="2026-09-20")
         await self.store.observe([seen(ref="B", created="2026-09-01",
                                        state=photos.HAS)], today="2026-09-25")
         text = await self.text([seen(ref="A", created="2026-08-01")])
-        self.assertIn("Всего ждут фото: 1", text)
-        self.assertIn("Добавлено: за неделю 1", text)
+        self.assertIn("Фото добавлено: за неделю 1", text)
 
     async def test_no_movement_no_line(self):
         """Журнал только завели — рассказывать о динамике нечего, и выдумывать её нельзя."""
         text = await self.text([seen(ref="A", created="2026-08-01"),
                                 seen(ref="B", created="2026-08-01", state=photos.HAS)])
-        self.assertNotIn("Добавлено:", text)
-
-    async def test_long_list_is_cut_with_a_tail(self):
-        rows = [seen(ref=f"R{i}", site_id=str(i), name=f"Декор {i}",
-                     created="2026-08-01") for i in range(30)]
-        text = await self.text(rows)
-        self.assertIn("…и ещё 10 поз.", text)
+        self.assertNotIn("Фото добавлено", text)
 
 
 class FakeBot:
@@ -198,8 +214,20 @@ class FakeBot:
         self.sent.append((chat_id, text))
 
 
+class FakeSubs:
+    """Список подписчиков. Пустой значит «никому», а не «всем»."""
+
+    def __init__(self, ids=()):
+        self._ids = list(ids)
+
+    async def list_all(self):
+        from src.storage.photo_subscribers import Subscriber
+        return [Subscriber(telegram_id=i, name=f"user{i}", added_by=1, added_at="")
+                for i in self._ids]
+
+
 class DailyTest(unittest.IsolatedAsyncioTestCase):
-    """Проверка ежедневная, напоминание еженедельное — это разные вещи."""
+    """Проверка ежедневная, дайджест еженедельный — это разные вещи."""
 
     async def asyncSetUp(self):
         self._dir = tempfile.TemporaryDirectory()
@@ -215,37 +243,46 @@ class DailyTest(unittest.IsolatedAsyncioTestCase):
         out.checked = len(out.observations)
         return out
 
-    async def run_day(self, day, result=None, bot=None):
+    async def run_day(self, day, result=None, bot=None, subs=None):
         async def fake_scan(_onec, **_kw):
             return result or self.scan_result()
 
         with patch.object(photo_daily.photo_scan, "scan", fake_scan):
-            await photo_daily.run_once(object(), self.store, bot, 100, today=day)
+            await photo_daily.run_once(object(), self.store, bot,
+                                       subs if subs is not None else FakeSubs([100]),
+                                       today=day)
 
     async def test_workday_writes_the_journal_and_stays_silent(self):
         bot = FakeBot()
         await self.run_day(date(2026, 9, 30), bot=bot)      # среда
         self.assertEqual(len(await self.store.waiting()), 1)
-        self.assertEqual(bot.sent, [], "по будням не напоминаем")
+        self.assertEqual(bot.sent, [], "по будням не рассылаем")
 
-    async def test_monday_reminds_about_the_overdue(self):
+    async def test_monday_sends_the_digest_to_every_subscriber(self):
         bot = FakeBot()
         result = self.scan_result([seen(ref="A", created="2026-08-01")])
-        await self.run_day(date(2026, 9, 28), result, bot)  # понедельник
-        self.assertEqual(len(bot.sent), 1)
-        chat, text = bot.sent[0]
-        self.assertEqual(chat, 100)
-        self.assertIn("ждут дольше месяца", text)
+        await self.run_day(date(2026, 9, 28), result, bot,   # понедельник
+                           subs=FakeSubs([100, 200]))
+        self.assertEqual([chat for chat, _ in bot.sent], [100, 200])
+        self.assertIn("Всего ждут фото: 1 поз.", bot.sent[0][1])
 
-    async def test_monday_without_overdue_sends_nothing(self):
+    async def test_empty_subscriber_list_means_nobody(self):
+        """Пустой список — «не слать никому», в том числе админу: обратное умолчание
+        однажды разошлёт каталог всем подряд."""
         bot = FakeBot()
-        result = self.scan_result([seen(created="2026-09-27")])
+        result = self.scan_result([seen(ref="A", created="2026-08-01")])
+        await self.run_day(date(2026, 9, 28), result, bot, subs=FakeSubs([]))
+        self.assertEqual(bot.sent, [])
+
+    async def test_monday_without_anyone_waiting_sends_nothing(self):
+        bot = FakeBot()
+        result = self.scan_result([seen(state=photos.HAS)])
         await self.run_day(date(2026, 9, 28), result, bot)
         self.assertEqual(bot.sent, [])
 
     async def test_broken_scan_does_not_touch_the_journal(self):
-        """Сломанный обход не имеет права стереть историю — и админ должен узнать причину,
-        иначе прогресс замрёт, а понять почему будет негде."""
+        """Сломанный обход не имеет права стереть историю — и подписчики должны узнать
+        причину, иначе прогресс замрёт, а понять почему будет негде."""
         bot = FakeBot()
         await self.run_day(date(2026, 9, 30),
                            self.scan_result(problem="1С не отдаёт дату создания"), bot)

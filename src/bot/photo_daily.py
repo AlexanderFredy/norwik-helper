@@ -6,12 +6,14 @@
 токенов. Напоминание же читает человек, и еженедельное — предел, за которым письмо
 перестают открывать; ежедневный список почти без изменений обесценил бы сам себя.
 
-**НАПОМИНАНИЕ ИДЁТ ТОЛЬКО АДМИНУ** (решение админа 30.09.2026). Рассылка по расписанию
-людям, которые на неё не подписывались, — шаг, который легче сделать вторым, чем отменить;
-админ видит список и сам решает, кому его передать.
+**ДАЙДЖЕСТ ИДЁТ ПО ОТДЕЛЬНОМУ СПИСКУ ПОДПИСЧИКОВ** (`storage/photo_subscribers`, решение
+админа 30.09.2026), и админ в нём — такой же участник: нет его в списке, дайджест ему не
+приходит. Доступ к боту и подписка на рассылку — разные вещи: пользоваться ботом нужно
+всем менеджерам, а сводку про фото получать тем, кто этим занимается. Пустой список значит
+«никому», а не «всем».
 
-**ПУСТОЕ НАПОМИНАНИЕ НЕ ОТПРАВЛЯЕТСЯ**: просроченных нет — молчим. Еженедельное «всё в
-порядке» через месяц перестают читать вместе с теми, в которых что-то есть.
+**ПУСТОЙ ДАЙДЖЕСТ НЕ ОТПРАВЛЯЕТСЯ**: ждать фото нечему — молчим. Еженедельное «всё в
+порядке» через месяц перестают читать вместе с теми письмами, в которых что-то есть.
 
 **ПРОПУЩЕННЫЙ ДЕНЬ ДОГОНЯЕТСЯ ПРИ СТАРТЕ.** Бота перезапускают среди дня, и проверка,
 привязанная только к часу, в этот день просто не случилась бы. Поэтому при подъёме мы
@@ -53,12 +55,9 @@ def next_run(now: datetime, hour: int = CHECK_HOUR) -> datetime:
     return today if today > now else today + timedelta(days=1)
 
 
-async def run_once(onec, store, bot=None, admin_id: int | None = None,
-                   today: date | None = None) -> photo_report.Row | None:
-    """Один проход: обойти, записать в журнал, при надобности напомнить.
-
-    Возвращать нечего — работа вся в журнале и в сообщении; возврат оставлен для тестов.
-    """
+async def run_once(onec, store, bot=None, subscribers=None,
+                   today: date | None = None) -> None:
+    """Один проход: обойти, записать в журнал, по понедельникам разослать дайджест."""
     day = today or date.today()
     stamp = day.isoformat()
     since = _months_ago(WATCH_MONTHS, day)
@@ -68,24 +67,40 @@ async def run_once(onec, store, bot=None, admin_id: int | None = None,
     found = await photo_scan.scan(onec, since=since, extra=extra)
     if found.problem:
         # Сломанный обход не имеет права молча стереть историю: журнал остаётся как был,
-        # а админ узнаёт причину — иначе прогресс замрёт, и понять почему будет негде.
+        # а подписчики узнают причину — иначе прогресс замрёт, и понять почему будет негде.
         logger.warning("Проверка фото не прошла: %s", found.problem)
-        if bot is not None and admin_id:
-            await _say(bot, admin_id, f"Проверка фото не прошла: {found.problem}")
-        return None
+        await _send(bot, subscribers, f"Проверка фото не прошла: {found.problem}")
+        return
 
     await store.observe(found.observations, today=stamp)
     logger.info("Проверка фото: %d позиций, без фото %d",
                 found.checked, len(found.rows))
 
-    if day.weekday() != REMIND_WEEKDAY or bot is None or not admin_id:
-        return None
+    if day.weekday() != REMIND_WEEKDAY:
+        return
 
-    text = photo_report.reminder(await store.progress(today=stamp),
-                                 await store.stale(today=stamp), today=stamp)
+    text = photo_report.digest(await store.progress(today=stamp),
+                               await store.waiting(), today=stamp)
     if text:
-        await _say(bot, admin_id, text)
-    return None
+        await _send(bot, subscribers, text)
+
+
+async def _send(bot, subscribers, text: str) -> None:
+    """Разослать подписчикам. ПУСТОЙ СПИСОК ЗНАЧИТ «НИКОМУ», а не «всем»: обратное
+    умолчание однажды разошлёт каталог всем подряд после неудачной миграции.
+
+    Админ тут не особенный: нет его в списке — дайджест ему не приходит (решение админа
+    30.09.2026). Поэтому о недоставке пишем В ЖУРНАЛ, а не ему в личку: сообщение тому,
+    кто на рассылку не подписывался, — ровно то, чего это правило и не допускает.
+    """
+    if bot is None or subscribers is None:
+        return
+    people = await subscribers.list_all()
+    if not people:
+        logger.info("Дайджест по фото никому не отправлен: список подписчиков пуст")
+        return
+    for person in people:
+        await _say(bot, person.telegram_id, text)
 
 
 async def _say(bot, chat_id: int, text: str) -> None:
@@ -97,11 +112,11 @@ async def _say(bot, chat_id: int, text: str) -> None:
         logger.exception("Не удалось отправить сообщение о фото")
 
 
-async def run_forever(onec, store, bot=None, admin_id: int | None = None) -> None:
+async def run_forever(onec, store, bot=None, subscribers=None) -> None:
     """Фоновая задача: догнать пропущенное и дальше ходить по расписанию."""
     try:
         if await store.last_run() != date.today().isoformat():
-            await run_once(onec, store, bot, admin_id)
+            await run_once(onec, store, bot, subscribers)
     except Exception:                                   # noqa: BLE001
         logger.exception("Проверка фото при старте сорвалась")
 
@@ -109,7 +124,7 @@ async def run_forever(onec, store, bot=None, admin_id: int | None = None) -> Non
         now = datetime.now()
         await asyncio.sleep(max(1.0, (next_run(now) - now).total_seconds()))
         try:
-            await run_once(onec, store, bot, admin_id)
+            await run_once(onec, store, bot, subscribers)
         except Exception:                               # noqa: BLE001
             # Сорвавшийся день — не повод прекращать наблюдение: завтра попробуем снова.
             logger.exception("Ежедневная проверка фото сорвалась")
