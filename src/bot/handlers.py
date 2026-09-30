@@ -2,10 +2,11 @@
 import html
 import io
 import logging
+from pathlib import Path
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import FSInputFile, Message
 
 from src.agent.prompts import build_system_prompt
 from src.bot.commands import build_help
@@ -25,6 +26,7 @@ _TOOL_STATUS: dict[str, str] = {
     "get_email_contacts": "Получаю контакты поставщика...",
     "search_norwik": "Ищу на сайте norwik.ru...",
     "get_norwik_product": "Проверяю карточку товара...",
+    "find_items_without_photo": "Проверяю фото новых товаров на сайте...",
     "web_search": "Ищу в интернете...",
 }
 
@@ -153,6 +155,40 @@ async def _process_query(message: Message, text: str, orchestrator, status_msg,
 
     for i in range(0, len(answer), 4096):
         await message.answer(answer[i : i + 4096])
+
+    await _send_pending(message, orchestrator)
+
+
+async def _send_pending(message: Message, orchestrator) -> None:
+    """Отправить то, что инструмент приготовил МИМО модели.
+
+    Длинный список (товары без фото) модель обязана была бы пересказать целиком — это
+    выходные токены за копирование и риск, что ссылки в пересказе разойдутся с настоящими.
+    Поэтому инструмент кладёт готовое, а отправляем его мы. Сбой здесь не должен съесть
+    ответ, который менеджер уже видит.
+    """
+    try:
+        text, file = orchestrator.executor.take_pending()
+    except Exception:                                  # noqa: BLE001
+        logger.exception("Не удалось забрать отложенный ответ инструмента")
+        return
+
+    try:
+        if text:
+            for i in range(0, len(text), 4096):
+                await message.answer(text[i : i + 4096])
+        if file is not None:
+            await message.answer_document(FSInputFile(str(file)))
+    except Exception:                                  # noqa: BLE001
+        logger.exception("Не удалось отправить отложенный ответ инструмента")
+    finally:
+        # Временный файл живёт ровно до отправки: он собирается заново на каждый вопрос,
+        # и хранить его незачем.
+        try:
+            if file is not None:
+                Path(str(file)).unlink(missing_ok=True)
+        except Exception:                              # noqa: BLE001
+            pass
 
 
 @router.message(F.voice)

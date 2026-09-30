@@ -8,12 +8,15 @@ import json
 import logging
 import re
 from datetime import date
+from pathlib import Path
 
 from src.email_tool.attachments import excel_sheet_names, extract_text
 from src.email_tool.classifier import classify, parse_signature
 from src.email_tool.client import MailClient
+from src.model import normalize as nz
 from src.price_tool.exclusive import find, resolve
 from src.price_tool.history import describe_group, describe_product
+from src.website_tool import photo_report, photos
 from src.website_tool.norwik import NorwikClient
 
 logger = logging.getLogger(__name__)
@@ -21,6 +24,30 @@ logger = logging.getLogger(__name__)
 
 def _tokens(text: str | None) -> set[str]:
     return set(re.findall(r"[0-9a-zа-яё]+", (text or "").lower()))
+
+
+def _months_ago(months: int, today: date | None = None) -> str:
+    """Дата «столько-то месяцев назад», ГГГГ-ММ-ДД.
+
+    Считаем ПО КАЛЕНДАРЮ, а не «месяц = 30 дней»: три месяца от 30 ноября это 28 февраля,
+    и разница с арифметикой по дням доходит до трёх суток — как раз столько, сколько
+    товаров заводят за день. Число месяца, которого в целевом месяце нет (31 мая → 31
+    февраля), сдвигаем на первое следующего: граница «с какого дня считать новым» должна
+    существовать в календаре.
+
+    Время в чистой функции передаётся явно — иначе тест пришлось бы привязывать к
+    сегодняшнему дню.
+    """
+    today = today or date.today()
+    month = today.month - months
+    year = today.year
+    while month <= 0:
+        month += 12
+        year -= 1
+    try:
+        return date(year, month, today.day).isoformat()
+    except ValueError:
+        return (date(year + month // 12, month % 12 + 1, 1)).isoformat()
 
 
 def _match_products(items: list, query: str) -> list:
@@ -137,6 +164,29 @@ TOOL_DEFINITIONS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "find_items_without_photo",
+        "description": (
+            "Новые товары, у которых на сайте нет ни одного фото. Отвечает на вопросы "
+            "вида «покажи, где не добавлены фото», «у каких новых товаров нет "
+            "фотографий». Смотрит только товары, заведённые за последние месяцы "
+            "(months, по умолчанию 3) и выгружаемые на сайт; tm сужает до одной марки, "
+            "если менеджер её назвал. "
+            "СПИСОК УЖЕ ОТПРАВЛЕН менеджеру — отдельным сообщением или файлом Excel, "
+            "смотря по длине. Тебе возвращаются ТОЛЬКО ЧИСЛА: ответь по ним одной "
+            "фразой и не пересказывай список, не придумывай наименования и ссылки."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tm": {"type": "string",
+                       "description": "торговая марка, если менеджер её назвал"},
+                "months": {"type": "integer",
+                           "description": "за сколько последних месяцев, по умолчанию 3"},
+            },
+            "additionalProperties": False,
+        },
+    },
     # Серверный инструмент Anthropic — поиск сайта производителя (случай А)
     {"type": "web_search_20260209", "name": "web_search"},
 ]
@@ -151,11 +201,27 @@ class ToolExecutor:
         self._norwik = norwik
         self._onec = onec              # None, если интеграция с 1С не настроена
         self._pricing_store = pricing_store
+        # ГОТОВЫЙ ОТВЕТ МИМО МОДЕЛИ. Длинный список (товары без фото) она обязана была бы
+        # пересказать целиком — это выходные токены за копирование и риск, что ссылки в
+        # пересказе разойдутся с настоящими. Инструмент кладёт список сюда, обработчик
+        # отправляет его сам, модель получает только числа. Тот же приём, что `last_summary`
+        # в прайсовом потоке.
+        self.pending_message: str | None = None
+        self.pending_file = None                # Path | None — Excel, когда в чат не влез
+
+    def take_pending(self) -> tuple[str | None, object | None]:
+        """Забрать отложенное и ОЧИСТИТЬ. Очистка обязательна: оставшийся список уехал бы
+        второй раз в ответ на следующий, совсем другой вопрос."""
+        message, file = self.pending_message, self.pending_file
+        self.pending_message, self.pending_file = None, None
+        return message, file
 
     async def execute(self, name: str, tool_input: dict) -> str:
         try:
             if name == "get_price_history":
                 return await self._price_history(tool_input)
+            if name == "find_items_without_photo":
+                return await self._photos_missing(tool_input)
             if name == "search_emails":
                 return await self._search_emails(tool_input)
             if name == "read_attachment":
@@ -256,6 +322,97 @@ class ToolExecutor:
             return {}
         active, _ = resolve(*await self._pricing_store.load_exclusives())
         return active
+
+    # ------------------------------------------------ фото на сайте (решение 30.09.2026)
+
+    async def _photos_missing(self, inp: dict) -> str:
+        """Новые товары без фото на сайте.
+
+        ТОТАЛЬНОГО ОБХОДА КАТАЛОГА ЗДЕСЬ НЕТ — это решение админа, а не упрощение: вопрос
+        про недавно заведённые товары, а «все товары без фото» будет отдельным
+        инструментом. Отбор идёт по `ДатаСоздания` на стороне 1С, иначе пришлось бы тянуть
+        каталог каждой марки целиком, чтобы отбросить его почти весь.
+        """
+        if self._onec is None:
+            return "Проверка фото недоступна: интеграция с 1С не настроена."
+
+        months = max(1, min(12, int(inp.get("months") or 3)))
+        since = _months_ago(months)
+        wanted = (inp.get("tm") or "").strip()
+
+        # ТОЛЬКО ПОМЕЧЕННЫЕ К ВЫГРУЗКЕ марки: товар непомеченной на сайт не попадает, и
+        # спрашивать о его фото бессмысленно. Второе условие — сам товар не в папке
+        # «Не выгружать» — держит `by_tm_all` своим умолчанием.
+        marks = await asyncio.to_thread(self._onec.selling_tm)
+        if wanted:
+            marks = [m for m in marks if wanted.lower() in m.name.lower()]
+            if not marks:
+                return f"Марки «{wanted}» нет среди выгружаемых на сайт."
+
+        fresh, lost, dated = [], 0, False
+        for mark in marks:
+            nom = await asyncio.to_thread(self._onec.by_tm_all, mark.code,
+                                          created_from=since)
+            lost += len(nom.errors)
+            dated = dated or any(i.created for i in nom.items)
+            for item in nom.items:
+                # Отбор ПОВТОРЯЕТСЯ здесь, а не доверяется 1С: со старым by-tm.bsl параметр
+                # `created_from` проходит мимо, и выгрузка приходит целиком.
+                if not item.not_exported and item.created and item.created >= since:
+                    fresh.append((mark.name, item))
+            if nom.items and not dated:
+                # Дат нет ни у одной позиции первой же марки — значит поле не отдаётся.
+                # Молча вернуть «новых нет» нельзя: это читается как «всё в порядке».
+                return ("1С не отдаёт дату создания товаров — отобрать новые нечем. "
+                        "Нужна выкладка обновлённого specs/1c/by-tm.bsl.")
+
+        if not fresh:
+            return (f"Новых товаров с {since} нет — проверять нечего "
+                    f"(марок просмотрено {len(marks)}).")
+
+        checker = photos.PhotoChecker()
+        try:
+            state = await asyncio.to_thread(checker.statuses,
+                                            [i.id for _, i in fresh])
+        finally:
+            checker.close()
+
+        rows, no_card, failed = [], 0, 0
+        for tm_name, item in fresh:
+            verdict = state.get((item.id or "").strip(), photos.NO_CARD)
+            if verdict == photos.NONE:
+                rows.append(photo_report.Row(
+                    tm=tm_name, collection=nz.collection_of(item),
+                    name=item.site_name or item.name, url=photos.item_url(item.id),
+                    created=item.created))
+            elif verdict == photos.NO_CARD:
+                no_card += 1
+            elif verdict == photos.FAILED:
+                failed += 1
+
+        text = photo_report.render(rows, since=since, checked=len(fresh),
+                                   marks=len(marks), no_card=no_card, failed=failed,
+                                   scope=wanted)
+        return self._deliver(text, rows, since, lost)
+
+    def _deliver(self, text: str, rows: list, since: str, lost: int) -> str:
+        """Список — менеджеру напрямую, модели — только числа (см. `take_pending`)."""
+        tail = (f" 1С не отдала {lost} поз. — они не проверены." if lost else "")
+        if not rows:
+            self.pending_message = None
+            return text + tail
+
+        if photo_report.fits_chat(text):
+            self.pending_message = text
+            how = "списком в чат"
+        else:
+            import tempfile
+            path = Path(tempfile.gettempdir()) / f"Без фото {date.today():%d.%m.%Y}.xlsx"
+            self.pending_file = photo_report.to_excel(rows, path)
+            how = "файлом Excel (в чат не влез)"
+
+        return (f"Найдено {len(rows)} товаров без фото среди заведённых с {since}. "
+                f"Список уже отправлен менеджеру {how} — не пересказывай его." + tail)
 
     async def _price_history(self, inp: dict) -> str:
         if self._onec is None:

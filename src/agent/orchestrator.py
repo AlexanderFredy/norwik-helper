@@ -64,6 +64,12 @@ class Orchestrator:
         # там, где этот контекст и живёт.
         self._on_usage = on_usage
 
+    @property
+    def executor(self) -> ToolExecutor:
+        """Исполнитель инструментов. Наружу он нужен ровно затем, чтобы забрать готовый
+        ответ, который инструмент отправляет МИМО модели (`take_pending`)."""
+        return self._executor
+
     async def _record_usage(self, response, labels: dict | None, iteration: int) -> None:
         """Снять расход одного вызова. Сбой учёта не имеет права трогать прогон.
 

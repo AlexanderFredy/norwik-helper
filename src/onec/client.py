@@ -78,6 +78,11 @@ class NomItem:
     thickness: float | None = None
     properties: tuple[ItemProperty, ...] = ()
     not_exported: bool = False
+    #: Дата создания карточки, ГГГГ-ММ-ДД. Пустая — реквизит не заполнен ЛИБО стоит старый
+    #: by-tm.bsl, который поля не отдаёт. Различать эти два случая по одной позиции нельзя,
+    #: поэтому отбор «новых» обязан говорить вслух, когда даты не пришли НИ У ОДНОЙ:
+    #: молчаливый пустой ответ читался бы как «новых товаров нет».
+    created: str = ""
 
 
 @dataclass(frozen=True)
@@ -461,6 +466,7 @@ class OnecClient:
     def by_tm(self, tm_code: str, page: int = 1, size: int = 200,
               include_not_exported: bool = False,
               product_type: str | None = None,
+              created_from: str | None = None,
               timeout: float | None = None) -> NomenclaturePage:
         """Номенклатура марки постранично.
 
@@ -468,12 +474,21 @@ class OnecClient:
         производства (§19.3). Без него проверка «нет ли товара среди снятых» невозможна:
         папка снятых помечена «Не выгружать», и агент завёл бы дубль вместо возврата.
         В ценовом режиме флаг не нужен — цены снятым не пишут.
+
+        `created_from` (ГГГГ-ММ-ДД) — отбор по дате создания НА СТОРОНЕ 1С. Отбирать в
+        Python было бы то же самое по смыслу и совсем другое по цене: вопрос «где нет
+        фото» касается товаров за пару месяцев, а без отбора пришлось бы тянуть каталог
+        каждой марки целиком. **Требует обновлённого by-tm.bsl**; старый его просто не
+        заметит и отдаст всё — поэтому вызывающая сторона обязана проверять `created`
+        у позиций, а не полагаться на то, что 1С отфильтровала.
         """
         params: dict = {"tm": tm_code, "page": page, "size": size}
         if include_not_exported:
             params["include_not_exported"] = 1
         if product_type:
             params["product_type"] = product_type
+        if created_from:
+            params["created_from"] = created_from
         r = self._get("/get-products/by-tm", params=params, timeout=timeout)
         r.raise_for_status()
         data = _loads_bom(r.content)
@@ -507,6 +522,7 @@ class OnecClient:
                     thickness=_number(it.get("thickness")),
                     properties=_item_properties(it.get("properties")),
                     not_exported=bool(it.get("not_exported", False)),
+                    created=str(it.get("created") or ""),
                 )
             )
         return NomenclaturePage(
@@ -746,7 +762,8 @@ class OnecClient:
 
     def by_tm_all(self, tm_code: str, size: int | None = None, max_pages: int = 500,
                   include_not_exported: bool = False,
-                  product_type: str | None = None) -> Nomenclature:
+                  product_type: str | None = None,
+                  created_from: str | None = None) -> Nomenclature:
         """Все страницы номенклатуры ТМ вместе с ошибками отдельных позиций.
 
         `size` — ПЕРЕОПРЕДЕЛЕНИЕ подобранного размера страницы, а не разовый параметр:
@@ -771,7 +788,8 @@ class OnecClient:
         """
         # Предел ожидания СЧИТАЕТСЯ ПО РАЗМЕРУ запроса (`_ask_page` и `_ask_item`), а не хранится
         # здесь: у половины размера 1 он обязан быть коротким, где бы она ни запрашивалась.
-        kw = {"include_not_exported": include_not_exported, "product_type": product_type}
+        kw = {"include_not_exported": include_not_exported, "product_type": product_type,
+              "created_from": created_from}
         if size is not None:
             self._page_size = max(1, int(size))
 
