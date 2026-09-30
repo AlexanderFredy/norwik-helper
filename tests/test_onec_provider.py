@@ -458,6 +458,32 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(closed), 1)
         self.assertIn("занят", closed[0]["message"])
 
+    async def test_open_form_is_reported_to_the_loop(self):
+        """Пока форма открыта, цикл не должен уходить в тридцатисекундный простой: первое
+        нажатие после паузы иначе ждёт полминуты (разбор 30.09.2026)."""
+        onec = FakeOnec()
+        onec.agent_commands = lambda: {"server_time": "2026-09-14T12:00:00",
+                                       "commands": [], "visual_active": True}
+        provider = self.make(onec)
+        self.assertFalse(provider.visual_active, "до первого опроса не знаем")
+        await provider.collect(self.queue)
+        self.assertTrue(provider.visual_active)
+
+    async def test_closed_form_lets_the_loop_sleep(self):
+        onec = FakeOnec()
+        onec.agent_commands = lambda: {"server_time": "2026-09-14T12:00:00",
+                                       "commands": [], "visual_active": False}
+        provider = self.make(onec)
+        provider.visual_active = True
+        await provider.collect(self.queue)
+        self.assertFalse(provider.visual_active)
+
+    async def test_old_bsl_without_the_field_means_no(self):
+        """Поля нет — работаем как раньше, а не считаем форму вечно открытой."""
+        provider = self.make(FakeOnec())
+        await provider.collect(self.queue)
+        self.assertFalse(provider.visual_active)
+
     async def test_missing_objects_are_logged_not_swallowed(self):
         onec = FakeOnec()
         onec.agent_commands = lambda: {"server_time": "2026-09-14T12:00:00",
