@@ -83,6 +83,11 @@ class NomItem:
     #: поэтому отбор «новых» обязан говорить вслух, когда даты не пришли НИ У ОДНОЙ:
     #: молчаливый пустой ответ читался бы как «новых товаров нет».
     created: str = ""
+    #: Марка позиции. Нужна, когда выгрузка идёт БЕЗ фильтра по марке: тогда внешнего цикла
+    #: по маркам нет, и группировать ответ по ТМ больше не по чему. При обычном запросе по
+    #: марке поле дублирует то, что вызывающий и так знает, — и это не повод его не слать.
+    tm: str = ""
+    tm_code: str = ""
 
 
 @dataclass(frozen=True)
@@ -463,7 +468,7 @@ class OnecClient:
         return [TradeMark(name=x.get("NameTM", ""), code=str(x.get("Code", "")),
                           selling=bool(x.get("Selling", True))) for x in data]
 
-    def by_tm(self, tm_code: str, page: int = 1, size: int = 200,
+    def by_tm(self, tm_code: str | None, page: int = 1, size: int = 200,
               include_not_exported: bool = False,
               product_type: str | None = None,
               created_from: str | None = None,
@@ -482,7 +487,11 @@ class OnecClient:
         заметит и отдаст всё — поэтому вызывающая сторона обязана проверять `created`
         у позиций, а не полагаться на то, что 1С отфильтровала.
         """
-        params: dict = {"tm": tm_code, "page": page, "size": size}
+        # БЕЗ МАРКИ — только вместе с `created_from`, и это правило держит 1С, а не мы:
+        # запрос без обоих ограничений выгреб бы справочник целиком.
+        params: dict = {"page": page, "size": size}
+        if tm_code:
+            params["tm"] = tm_code
         if include_not_exported:
             params["include_not_exported"] = 1
         if product_type:
@@ -523,6 +532,8 @@ class OnecClient:
                     properties=_item_properties(it.get("properties")),
                     not_exported=bool(it.get("not_exported", False)),
                     created=str(it.get("created") or ""),
+                    tm=str(it.get("tm") or ""),
+                    tm_code=str(it.get("tm_code") or ""),
                 )
             )
         return NomenclaturePage(
@@ -760,7 +771,7 @@ class OnecClient:
         """
         return self._post_json("/get-products/set-model-state", {"prices": prices})
 
-    def by_tm_all(self, tm_code: str, size: int | None = None, max_pages: int = 500,
+    def by_tm_all(self, tm_code: str | None, size: int | None = None, max_pages: int = 500,
                   include_not_exported: bool = False,
                   product_type: str | None = None,
                   created_from: str | None = None) -> Nomenclature:

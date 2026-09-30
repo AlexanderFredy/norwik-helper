@@ -17,12 +17,13 @@ from src.website_tool import photo_report, photos
 
 def item(ref="T1", site_id="1001", created="2026-09-01", name="Ламинат Classen Дуб Авола",
          parent="Adventure WR 1290x193x8", size="1290x193x8", collection="",
-         not_exported=False):
+         not_exported=False, tm="Classen / Классен"):
     return NomItem(
         ref=ref, id=site_id, name=name, article="", unit="м2", size=size,
         product_type="Ламинат", collection=collection, parent=parent,
         collection_ref="F1", alt_units={}, purchase=None, retail=None, rrc=None,
-        site_name=name, not_exported=not_exported, created=created)
+        site_name=name, not_exported=not_exported, created=created, tm=tm,
+        tm_code="1")
 
 
 class MonthsAgoTest(unittest.TestCase):
@@ -153,8 +154,10 @@ class ReportTest(unittest.TestCase):
 
 
 class FakeOnec:
-    def __init__(self, dumps, marks=None, errors=0):
-        self._dumps, self._errors = dumps, errors
+    """`None` в качестве кода марки — запрос БЕЗ `tm`, то есть по всем выгружаемым."""
+
+    def __init__(self, dumps, marks=None, errors=0, old_bsl=False):
+        self._dumps, self._errors, self._old = dumps, errors, old_bsl
         self.marks = marks or [TradeMark(name="Classen / Классен", code="1")]
         self.asked: list[tuple] = []
 
@@ -163,6 +166,11 @@ class FakeOnec:
 
     def by_tm_all(self, code, created_from=None, **kw):
         self.asked.append((code, created_from))
+        if self._old and code is None:
+            # Старый by-tm.bsl: запрос без марки не принимает и отвечает пустым списком.
+            return Nomenclature(tm="", total=0, items=[],
+                                errors=[{"ref": "", "code": "tm_missing",
+                                         "message": "Не передан параметр tm"}])
         items = self._dumps.get(code, [])
         return Nomenclature(tm="ТМ", total=len(items), items=list(items),
                             errors=[{"ref": "X"}] * self._errors)
@@ -196,7 +204,7 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
     async def test_list_goes_to_the_manager_not_through_the_model(self):
         """Пересказ сотни строк — это выходные токены за копирование и риск, что ссылки
         разойдутся с настоящими."""
-        onec = FakeOnec({"1": [item(site_id="1001"), item(site_id="1002")]})
+        onec = FakeOnec({None: [item(site_id="1001"), item(site_id="1002")]})
         ex, answer = await self.run_tool(onec, {"1001": photos.NONE})
         self.assertIn("Найдено 1", answer)
         self.assertNotIn("norwik.ru", answer, "ссылок модель не видит")
@@ -205,21 +213,21 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(file)
 
     async def test_pending_is_cleared_once_taken(self):
-        onec = FakeOnec({"1": [item()]})
+        onec = FakeOnec({None: [item()]})
         ex, _ = await self.run_tool(onec, {"1001": photos.NONE})
         ex.take_pending()
         self.assertEqual(ex.take_pending(), (None, None))
 
     async def test_date_filter_goes_to_1c(self):
         """Отбор на стороне 1С: иначе тянули бы каталог целиком, чтобы отбросить почти всё."""
-        onec = FakeOnec({"1": [item()]})
+        onec = FakeOnec({None: [item()]})
         await self.run_tool(onec, {}, {"months": 2})
         self.assertEqual(onec.asked[0][1], _months_ago(2))
 
     async def test_old_items_are_dropped_even_if_1c_sent_them(self):
         """Старый by-tm.bsl параметр не заметит и отдаст всё — отбор повторяем у себя."""
-        onec = FakeOnec({"1": [item(site_id="1001", created="2020-01-01"),
-                               item(site_id="1002", created=_months_ago(1))]})
+        onec = FakeOnec({None: [item(site_id="1001", created="2020-01-01"),
+                                item(site_id="1002", created=_months_ago(1))]})
         ex, answer = await self.run_tool(onec, {"1001": photos.NONE, "1002": photos.NONE})
         text, _ = ex.take_pending()
         self.assertIn("item/1002", text)
@@ -227,18 +235,18 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_dates_at_all_is_an_error_not_an_empty_answer(self):
         """«Новых нет» читалось бы как «всё в порядке», а поле просто не выложено."""
-        onec = FakeOnec({"1": [item(created=""), item(created="")]})
+        onec = FakeOnec({None: [item(created=""), item(created="")]})
         _, answer = await self.run_tool(onec, {})
         self.assertIn("не отдаёт дату создания", answer)
         self.assertIn("by-tm.bsl", answer)
 
     async def test_discontinued_are_skipped(self):
-        onec = FakeOnec({"1": [item(site_id="1001", not_exported=True)]})
+        onec = FakeOnec({None: [item(site_id="1001", not_exported=True)]})
         _, answer = await self.run_tool(onec, {"1001": photos.NONE})
         self.assertIn("Новых товаров", answer)
 
     async def test_items_without_a_card_are_not_listed(self):
-        onec = FakeOnec({"1": [item(site_id="1001"), item(site_id="1002")]})
+        onec = FakeOnec({None: [item(site_id="1001"), item(site_id="1002")]})
         ex, answer = await self.run_tool(
             onec, {"1001": photos.NO_CARD, "1002": photos.NONE})
         text, _ = ex.take_pending()
@@ -249,7 +257,7 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
         rows = [item(ref=f"R{i}", site_id=str(2000 + i),
                      name=f"Ламинат Classen Очень Длинное Название Декора Номер {i}")
                 for i in range(200)]
-        onec = FakeOnec({"1": rows})
+        onec = FakeOnec({None: rows})
         ex, answer = await self.run_tool(
             onec, {str(2000 + i): photos.NONE for i in range(200)})
         text, file = ex.take_pending()
@@ -257,6 +265,31 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(str(file).endswith(".xlsx"))
         self.assertIn("файлом Excel", answer)
         Path(str(file)).unlink(missing_ok=True)
+
+    async def test_without_a_mark_it_is_one_request_not_one_per_mark(self):
+        """Обход по марке стоил 285 с на 166 марок — четыре с половиной минуты на вопрос
+        в чате и 166 поводов потерять запрос в туннеле (замер 30.09.2026)."""
+        onec = FakeOnec({None: [item()]},
+                        marks=[TradeMark(name=f"Марка {i}", code=str(i))
+                               for i in range(166)])
+        await self.run_tool(onec, {"1001": photos.HAS})
+        self.assertEqual(onec.asked, [(None, _months_ago(3))])
+
+    async def test_mark_name_comes_from_the_item(self):
+        """Без внешнего цикла по маркам группировать по ТМ больше не по чему — имя
+        приходит в самой позиции."""
+        onec = FakeOnec({None: [item(site_id="1001", tm="Peli")]})
+        ex, _ = await self.run_tool(onec, {"1001": photos.NONE})
+        text, _ = ex.take_pending()
+        self.assertIn("Peli / Adventure WR", text)
+
+    async def test_old_bsl_refuses_the_tm_less_request(self):
+        """Старый by-tm.bsl отвечает пустым списком с tm_missing — принять это за «новых
+        товаров нет» нельзя."""
+        onec = FakeOnec({}, old_bsl=True)
+        _, answer = await self.run_tool(onec, {})
+        self.assertIn("не принимает запрос без марки", answer)
+        self.assertIn("by-tm.bsl", answer)
 
     async def test_mark_filter(self):
         onec = FakeOnec({"1": [item()]},
@@ -271,7 +304,7 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("нет среди выгружаемых", answer)
 
     async def test_lost_positions_are_named_to_the_model(self):
-        onec = FakeOnec({"1": [item()]}, errors=3)
+        onec = FakeOnec({None: [item()]}, errors=3)
         _, answer = await self.run_tool(onec, {"1001": photos.NONE})
         self.assertIn("не отдала 3", answer)
 

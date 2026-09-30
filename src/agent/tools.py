@@ -348,18 +348,30 @@ class ToolExecutor:
             marks = [m for m in marks if wanted.lower() in m.name.lower()]
             if not marks:
                 return f"Марки «{wanted}» нет среди выгружаемых на сайт."
+            walk = [(m.code, m.name) for m in marks]
+        else:
+            # ОДИН ЗАПРОС ВМЕСТО СТА ШЕСТИДЕСЯТИ ШЕСТИ. Обход по марке стоил 285 секунд на
+            # боевой базе — четыре с половиной минуты на вопрос в чате, и 166 поводов
+            # потерять запрос в туннеле. `by-tm` без `tm` (разрешено только с
+            # `created_from`) сам ограничивается марками, помеченными к выгрузке, а имя
+            # марки приходит в самой позиции.
+            walk = [(None, "")]
 
         fresh, lost, dated = [], 0, False
-        for mark in marks:
-            nom = await asyncio.to_thread(self._onec.by_tm_all, mark.code,
-                                          created_from=since)
+        for code, label in walk:
+            nom = await asyncio.to_thread(self._onec.by_tm_all, code, created_from=since)
+            if any(str(e.get("code")) == "tm_missing" for e in nom.errors):
+                # Старый by-tm.bsl запрос без марки не принимает и отвечает пустым
+                # списком. Принять его за «новых товаров нет» нельзя.
+                return ("1С не принимает запрос без марки — нужна выкладка обновлённого "
+                        "specs/1c/by-tm.bsl.")
             lost += len(nom.errors)
             dated = dated or any(i.created for i in nom.items)
             for item in nom.items:
                 # Отбор ПОВТОРЯЕТСЯ здесь, а не доверяется 1С: со старым by-tm.bsl параметр
                 # `created_from` проходит мимо, и выгрузка приходит целиком.
                 if not item.not_exported and item.created and item.created >= since:
-                    fresh.append((mark.name, item))
+                    fresh.append((label or item.tm or "Без марки", item))
             if nom.items and not dated:
                 # Дат нет ни у одной позиции первой же марки — значит поле не отдаётся.
                 # Молча вернуть «новых нет» нельзя: это читается как «всё в порядке».
