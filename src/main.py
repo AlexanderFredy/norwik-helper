@@ -222,7 +222,7 @@ async def main() -> None:
     dp = Dispatcher(store=store, orchestrator=orchestrator, openai_api_key=config.openai_api_key,
                     onec=onec, pricing_store=pricing_store,
                     supplier_store=supplier_store, model=model, queue=commands, loop=loop,
-                    photo_subscribers=photo_subscribers)
+                    photo_subscribers=photo_subscribers, photo_watch=photo_watch)
     dp.message.middleware(AuthMiddleware(store, config.admin_telegram_id))
     dp.callback_query.middleware(AuthMiddleware(store, config.admin_telegram_id))
     dp.include_router(catalog_router)   # справочники: только команды, конфликтов нет

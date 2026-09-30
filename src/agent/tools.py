@@ -390,22 +390,9 @@ class ToolExecutor:
         ежедневной проверкой. Расплата — возраст данных (до суток), и он называется в
         самом тексте, когда проверка была не сегодня.
         """
-        if self._watch is None:
-            return ("Журнал наблюдений за фото не подключён — короткой сводки нет. "
-                    "Спроси полный отчёт.")
-
-        waiting = await self._watch.waiting()
-        if tm:
-            waiting = [w for w in waiting if tm.lower() in (w.tm or "").lower()]
-        last = await self._watch.last_run()
-        if not last:
-            return ("Журнал пуст: ежедневная проверка фото ещё не отрабатывала. "
-                    "Спроси полный отчёт — он и наполнит журнал.")
-
-        text = photo_report.digest(await self._watch.progress(), waiting, as_of=last)
+        text, why = await photo_report.from_journal(self._watch, tm)
         if text is None:
-            return (f"Ни один новый товар не ждёт фото (проверка от {last})."
-                    + (f" Марка: «{tm}»." if tm else ""))
+            return why
 
         self.pending_message = text
         return ("Короткая сводка по фото уже отправлена менеджеру — не пересказывай её, "

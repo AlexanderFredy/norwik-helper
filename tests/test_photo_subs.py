@@ -84,6 +84,64 @@ class StoreTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.subs.has(200))
 
 
+class SummaryCommandTest(unittest.IsolatedAsyncioTestCase):
+    """`/no_photo_summury` — ДЛЯ ВСЕХ, кто работает с агентом: фото добавляют менеджеры,
+    им и нужно видеть, сколько работы осталось."""
+
+    async def asyncSetUp(self):
+        from src.storage.photo_watch import PhotoWatchStore
+
+        self._dir = tempfile.TemporaryDirectory()
+        self.watch = PhotoWatchStore(Path(self._dir.name) / "w.db")
+        await self.watch.init()
+
+    async def asyncTearDown(self):
+        self._dir.cleanup()
+
+    async def seen(self, tm="Classen", created="2026-08-01", state=None):
+        from src.website_tool import photos
+
+        await self.watch.observe([{"ref": tm, "site_id": "1", "tm": tm,
+                                   "collection": "Manor", "name": "Вернон",
+                                   "created": created,
+                                   "state": state or photos.NONE}], today="2026-09-28")
+
+    async def run_cmd(self, args=""):
+        msg = FakeMessage()
+        await ch.cmd_no_photo_summary(msg, Args(args), self.watch)
+        return msg
+
+    async def test_anyone_gets_the_summary(self):
+        """Никакой проверки на админа: доступ уже ограничен белым списком."""
+        await self.seen()
+        msg = await self.run_cmd()
+        self.assertIn("Всего ждут фото: 1 поз.", msg.text)
+        self.assertIn("- Classen — 1", msg.text)
+
+    async def test_mark_can_be_named(self):
+        await self.seen(tm="Classen")
+        await self.seen(tm="Peli")
+        msg = await self.run_cmd("peli")
+        self.assertIn("- Peli — 1", msg.text)
+        self.assertNotIn("Classen", msg.text)
+
+    async def test_empty_journal_is_not_reported_as_order(self):
+        """«Ждут 0» при ненаполненном журнале читается как «всё в порядке»."""
+        msg = await self.run_cmd()
+        self.assertIn("Журнал пуст", msg.text)
+
+    async def test_nobody_waiting(self):
+        from src.website_tool import photos
+
+        await self.seen(state=photos.HAS)
+        self.assertIn("не ждёт фото", (await self.run_cmd()).text)
+
+    async def test_without_the_journal_store(self):
+        msg = FakeMessage()
+        await ch.cmd_no_photo_summary(msg, Args(""), None)
+        self.assertIn("не подключён", msg.text)
+
+
 class CommandTest(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):

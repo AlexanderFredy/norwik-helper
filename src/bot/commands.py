@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 COMMON_COMMANDS = [
     BotCommand(command="start", description="Что я умею"),
     BotCommand(command="help", description="Справка по командам"),
+    # Фото добавляют менеджеры — сводка про них нужна им, а не только админу.
+    BotCommand(command="no_photo_summury", description="Сколько товаров ждут фото"),
 ]
 
 ADMIN_COMMANDS = COMMON_COMMANDS + [
@@ -50,7 +52,10 @@ _MANAGER_HELP = """<b>Поиск товара у поставщиков</b>
 
 <b>Команды</b>
 /start — короткое приветствие
-/help — эта справка"""
+/help — эта справка
+/no_photo_summury [&lt;марка&gt;] — короткая сводка: сколько товаров ждут фото, по маркам.
+Отвечает сразу, по данным ежедневной проверки. Полный список со ссылками — спросите
+«покажи, где не добавлены фото»."""
 
 _ADMIN_HELP = """
 

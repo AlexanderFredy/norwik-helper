@@ -17,6 +17,7 @@ from aiogram.types import Message
 from src.model import collection_audit as audit
 from src.model.events import Event, EventKind
 from src.price_tool import catalog_view as view
+from src.website_tool import photo_report as audit_photos
 from src.storage.suppliers import SupplierStore
 
 logger = logging.getLogger(__name__)
@@ -319,6 +320,29 @@ async def cmd_empty_collections(message: Message, command: CommandObject,
                         failed=failed, lost=lost, scope=wanted)
     for part in audit.split(text):
         await message.answer(part)
+
+
+# ------------------------------------------------------------ дайджест по фото
+
+# Имя команды — как его задал админ (30.09.2026). Правильное написание принимается вторым:
+# опечатка в имени команды оборачивается «команда не найдена», и человек решает, что
+# функции нет вовсе.
+@router.message(Command("no_photo_summury", "no_photo_summary"))
+async def cmd_no_photo_summary(message: Message, command: CommandObject,
+                               photo_watch) -> None:
+    """Короткая сводка «сколько товаров ждут фото» — ДЛЯ ВСЕХ, кто работает с агентом.
+
+    Проверки на админа здесь нет намеренно: фото добавляют менеджеры, им и нужно видеть,
+    сколько работы осталось. Доступ к боту уже ограничен белым списком (`AuthMiddleware`),
+    второй замок на ту же дверь только мешал бы.
+
+    СЧИТАЕТСЯ ПО ЖУРНАЛУ, поэтому отвечает мгновенно и не трогает ни 1С, ни сайт: всё
+    нужное посчитала ежедневная проверка. Полный список со ссылками — вопрос агенту
+    «покажи, где не добавлены фото».
+    """
+    text, why = await audit_photos.from_journal(photo_watch,
+                                                (command.args or "").strip())
+    await message.answer(text or why)
 
 
 # ------------------------------------------------- подписка на дайджест по фото

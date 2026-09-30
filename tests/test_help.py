@@ -67,7 +67,9 @@ class HelpTextTest(unittest.TestCase):
     def test_menu_scopes(self):
         common = {c.command for c in COMMON_COMMANDS}
         admin = {c.command for c in ADMIN_COMMANDS}
-        self.assertEqual(common, {"start", "help"})
+        # Сводка «сколько ждут фото» — в ОБЩЕМ меню: фото добавляют менеджеры, им и нужно
+        # видеть, сколько работы осталось (решение админа 30.09.2026).
+        self.assertEqual(common, {"start", "help", "no_photo_summury"})
         self.assertTrue(common < admin)
         self.assertIn("prices", admin)
         # Команды отключённого потока в меню не показываем: то, что не отвечает, хуже
