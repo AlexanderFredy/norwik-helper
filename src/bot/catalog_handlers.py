@@ -364,19 +364,25 @@ async def cmd_photo_sub_add(message: Message, command: CommandObject,
     # ПОДПИСАТЬ МОЖНО ТОЛЬКО ТОГО, У КОГО ЕСТЬ ДОСТУП К БОТУ: рассылка несёт наименования
     # и ссылки на карточки каталога, и отправить их человеку, которому пользоваться ботом
     # не разрешали, — значит выдать данные в обход белого списка.
+    #
+    # САМ СЕБЯ АДМИН ПОДПИСЫВАЕТ ВСЕГДА, и это не поблажка: `ADMIN_TELEGRAM_ID` проходит
+    # авторизацию МИМО белого списка (`bot/auth.py`), и в нём админа обычно нет вовсе —
+    # без этой ветки первая же команда «подпиши меня» отвечала бы «у вас нет доступа к
+    # боту» тому, кто этим ботом и распоряжается.
     allowed = {u.telegram_id: u.name for u in await store.list_all()}
-    if who not in allowed:
+    himself = bool(message.from_user) and who == message.from_user.id
+    if who not in allowed and not himself:
         await message.answer(
             f"У {who} нет доступа к боту — сперва /adduser {who}. "
             "Рассылка несёт ссылки на карточки каталога, и получать её должен только тот, "
             "кому и так разрешено пользоваться ботом.")
         return
 
-    added = await photo_subscribers.add(who, name or allowed[who],
-                                        message.from_user.id if message.from_user else None)
-    await message.answer(
-        f"{'Подписан' if added else 'Уже был подписан'}: "
-        f"{name or allowed[who] or who}. Список: /photo_subs")
+    label = name or allowed.get(who) or "Администратор"
+    added = await photo_subscribers.add(
+        who, label, message.from_user.id if message.from_user else None)
+    await message.answer(f"{'Подписан' if added else 'Уже был подписан'}: {label}. "
+                         "Список: /photo_subs")
 
 
 @router.message(Command("photo_sub_delete"))

@@ -120,6 +120,19 @@ class CommandTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/adduser 999", msg.text)
         self.assertEqual(await self.subs.list_all(), [])
 
+    async def test_admin_can_always_subscribe_himself(self):
+        """`ADMIN_TELEGRAM_ID` проходит авторизацию МИМО белого списка, и в нём админа
+        обычно нет вовсе: боевой случай 30.09.2026 — id 552457947 авторизован как админ,
+        а в списке доступа его не было. Без этой ветки команда «подпиши меня» отвечала бы
+        «у вас нет доступа к боту» тому, кто ботом и распоряжается."""
+        msg = await self.add("777", user_id=777)
+        self.assertIn("Подписан", msg.text)
+        self.assertEqual([r.telegram_id for r in await self.subs.list_all()], [777])
+
+    async def test_admin_still_cannot_subscribe_a_stranger(self):
+        msg = await self.add("999", user_id=777)
+        self.assertIn("нет доступа к боту", msg.text)
+
     async def test_name_falls_back_to_the_access_list(self):
         await self.add("200")
         self.assertEqual((await self.subs.list_all())[0].name, "user200")
