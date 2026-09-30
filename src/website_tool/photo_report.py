@@ -108,7 +108,7 @@ def render(rows: list[Row], *, since: str, checked: int, marks: int,
 
 
 def digest(progress, waiting: list, today: str | None = None,
-           days: int = 30) -> str | None:
+           days: int = 30, as_of: str = "") -> str | None:
     """Еженедельный дайджест подписчикам. None — рассказывать не о чем.
 
     **СТРОКА НА МАРКУ, БЕЗ ПОИМЁННОГО СПИСКА** (решение админа 30.09.2026). Дайджест
@@ -146,6 +146,13 @@ def digest(progress, waiting: list, today: str | None = None,
         if progress.median_days is not None:
             moving += f" Обычно от заведения до фото — {progress.median_days} дн."
         lines += ["", moving]
+
+    # ВОЗРАСТ ДАННЫХ НАЗЫВАЕМ, КОГДА ОН НЕ СЕГОДНЯШНИЙ. Дайджест собирается по журналу, а
+    # журнал наполняется раз в сутки: спрошенный днём, он отвечает вчерашней картиной, и
+    # выдавать её за свежую нельзя — по ней решают, сделана работа или нет.
+    stamp = today or date.today().isoformat()
+    if as_of and as_of != stamp:
+        lines += ["", f"По данным проверки от {_ru(as_of)}."]
 
     lines += ["", "Список со ссылками — спросите «покажи, где не добавлены фото»."]
     return "\n".join(lines)

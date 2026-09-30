@@ -308,6 +308,64 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
         _, answer = await self.run_tool(onec, {"1001": photos.NONE})
         self.assertIn("не отдала 3", answer)
 
+    async def test_brief_answers_from_the_journal_without_a_walk(self):
+        """Полный отчёт идёт в 1С и на сайт около минуты; сводка уже посчитана ежедневной
+        проверкой, и ходить за ней никуда не надо."""
+        from src.storage.photo_watch import PhotoWatchStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            watch = PhotoWatchStore(Path(tmp) / "w.db")
+            await watch.init()
+            await watch.observe([{"ref": "A", "site_id": "1", "tm": "Classen",
+                                  "collection": "Manor", "name": "Вернон",
+                                  "created": "2026-08-01", "state": photos.NONE}],
+                                today="2026-09-28")
+            onec = FakeOnec({})
+            ex = ToolExecutor(mail=None, norwik=None, onec=onec, photo_watch=watch)
+            answer = await ex._photos_missing({"brief": True})
+
+            self.assertEqual(onec.asked, [], "в 1С не ходили вовсе")
+            self.assertIn("сводка", answer.lower())
+            text, _ = ex.take_pending()
+            self.assertIn("Всего ждут фото: 1 поз.", text)
+            self.assertIn("- Classen — 1", text)
+            # Журнал наполняется раз в сутки: вчерашнюю картину нельзя выдавать за свежую.
+            self.assertIn("По данным проверки от 28.09.2026", text)
+
+    def test_todays_data_needs_no_age_line(self):
+        """Приписка про возраст нужна, только когда он не сегодняшний, — иначе она шум."""
+        from datetime import date
+
+        rows = [photo_report.Row(tm="Classen", collection="Manor", name="Вернон",
+                                 url="u", created="2026-08-01")]
+
+        class W:
+            def __init__(self, row):
+                self.tm, self.created = row.tm, row.created
+
+            def waiting_days(self, today=None):
+                return 60
+
+        stamp = date.today().isoformat()
+        text = photo_report.digest(None, [W(rows[0])], as_of=stamp)
+        self.assertNotIn("По данным проверки", text)
+
+    async def test_brief_on_an_empty_journal_says_so(self):
+        """«Ждут 0» при ненаполненном журнале читалось бы как «всё в порядке»."""
+        from src.storage.photo_watch import PhotoWatchStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            watch = PhotoWatchStore(Path(tmp) / "w.db")
+            await watch.init()
+            ex = ToolExecutor(mail=None, norwik=None, onec=FakeOnec({}),
+                              photo_watch=watch)
+            answer = await ex._photos_missing({"brief": True})
+            self.assertIn("Журнал пуст", answer)
+
+    async def test_brief_without_a_journal(self):
+        ex = ToolExecutor(mail=None, norwik=None, onec=FakeOnec({}))
+        self.assertIn("не подключён", await ex._photos_missing({"brief": True}))
+
     async def test_without_1c(self):
         ex = self.executor(None)
         self.assertIn("не настроена", await ex._photos_missing({}))

@@ -182,6 +182,15 @@ TOOL_DEFINITIONS = [
                        "description": "торговая марка, если менеджер её назвал"},
                 "months": {"type": "integer",
                            "description": "за сколько последних месяцев, по умолчанию 3"},
+                "brief": {
+                    "type": "boolean",
+                    "description": (
+                        "true — прислать КОРОТКУЮ СВОДКУ (дайджест) по маркам вместо "
+                        "списка позиций: та же, что уходит подписчикам по понедельникам. "
+                        "Ставь, когда просят «дайджест», «сводку», «коротко», «сколько "
+                        "всего ждут фото». Отвечает мгновенно, по данным последней "
+                        "ежедневной проверки."),
+                },
             },
             "additionalProperties": False,
         },
@@ -342,6 +351,9 @@ class ToolExecutor:
         since = _months_ago(months)
         wanted = (inp.get("tm") or "").strip()
 
+        if inp.get("brief"):
+            return await self._photo_digest(wanted)
+
         # ПОЗИЦИИ ИЗ ЖУРНАЛА, ВЫПАВШИЕ ИЗ ОКНА НОВИЗНЫ, проверяем тоже — но только когда
         # спрашивают про весь каталог. Вопрос про одну марку не должен тащить за собой
         # чужие: человек спросил про Classen и ждёт ответ про Classen.
@@ -369,6 +381,35 @@ class ToolExecutor:
                                    marks=found.marks, no_card=found.no_card,
                                    failed=found.failed, scope=wanted, progress=progress)
         return self._deliver(text, found.rows, since, found.lost)
+
+    async def _photo_digest(self, tm: str = "") -> str:
+        """Короткая сводка по маркам — ТА ЖЕ, что уходит подписчикам по понедельникам.
+
+        СЧИТАЕТСЯ ПО ЖУРНАЛУ, А НЕ ОБХОДОМ. Полный отчёт идёт в 1С и на сайт и занимает
+        около минуты; дайджест отвечает мгновенно, потому что всё нужное уже посчитано
+        ежедневной проверкой. Расплата — возраст данных (до суток), и он называется в
+        самом тексте, когда проверка была не сегодня.
+        """
+        if self._watch is None:
+            return ("Журнал наблюдений за фото не подключён — короткой сводки нет. "
+                    "Спроси полный отчёт.")
+
+        waiting = await self._watch.waiting()
+        if tm:
+            waiting = [w for w in waiting if tm.lower() in (w.tm or "").lower()]
+        last = await self._watch.last_run()
+        if not last:
+            return ("Журнал пуст: ежедневная проверка фото ещё не отрабатывала. "
+                    "Спроси полный отчёт — он и наполнит журнал.")
+
+        text = photo_report.digest(await self._watch.progress(), waiting, as_of=last)
+        if text is None:
+            return (f"Ни один новый товар не ждёт фото (проверка от {last})."
+                    + (f" Марка: «{tm}»." if tm else ""))
+
+        self.pending_message = text
+        return ("Короткая сводка по фото уже отправлена менеджеру — не пересказывай её, "
+                "ответь одной фразой.")
 
     def _deliver(self, text: str, rows: list, since: str, lost: int) -> str:
         """Список — менеджеру напрямую, модели — только числа (см. `take_pending`)."""
