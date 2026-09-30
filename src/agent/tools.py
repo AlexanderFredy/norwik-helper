@@ -25,6 +25,17 @@ def _tokens(text: str | None) -> set[str]:
     return set(re.findall(r"[0-9a-zа-яё]+", (text or "").lower()))
 
 
+#: Сколько строк листа показываем в ответе на вопрос в чате. Не лист целиком: на вопрос
+#: «в какой колонке декоры» хватает шапки и десятка строк, а боевой лист бывает на
+#: двенадцать тысяч. Дальше — параметром `from_row`.
+PRICE_CHAT_ROWS = 60
+
+#: Потолок ответа по прайсу. Разговор с менеджером идёт без истории, так что лист
+#: оплачивается один раз, — но и одного раза на сорок тысяч знаков хватит, чтобы вопрос
+#: «в какой колонке» стоил дороже всего разбора прайса.
+MAX_PRICE_CHARS = 12000
+
+
 def _months_ago(months: int, today: date | None = None) -> str:
     """Дата «столько-то месяцев назад», ГГГГ-ММ-ДД.
 
@@ -164,6 +175,31 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "read_loaded_price",
+        "description": (
+            "Прайс, загруженный админом в работу (НЕ из почты). Отвечает на вопросы "
+            "вида «в этом прайсе», «в загруженном прайсе», «на листе ЛАМИНАТ», «в какой "
+            "колонке декоры», «какие листы в прайсе». Без price_id берёт самый свежий "
+            "загруженный и называет, какой именно. "
+            "sheet — имя листа; from_row — с какой строки читать дальше; find — показать "
+            "только строки, где встречается эта подстрока (так ищут конкретный артикул "
+            "или декор). "
+            "Файл лежит у нас, в почту за ним ходить НЕ НАДО."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "price_id": {"type": "integer",
+                             "description": "номер прайса, если админ его назвал"},
+                "sheet": {"type": "string", "description": "имя листа"},
+                "from_row": {"type": "integer", "description": "читать с этой строки"},
+                "find": {"type": "string",
+                         "description": "показать только строки с этой подстрокой"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "find_items_without_photo",
         "description": (
             "Новые товары, у которых на сайте нет ни одного фото. Отвечает на вопросы "
@@ -204,7 +240,7 @@ class ToolExecutor:
     """Выполняет кастомные инструменты. Серверные (web_search) выполняет API."""
 
     def __init__(self, mail: MailClient, norwik: NorwikClient, onec=None,
-                 pricing_store=None, photo_watch=None) -> None:
+                 pricing_store=None, photo_watch=None, model=None) -> None:
         self._mail = mail
         self._norwik = norwik
         self._onec = onec              # None, если интеграция с 1С не настроена
@@ -212,6 +248,10 @@ class ToolExecutor:
         # Журнал наблюдений за фото. None — работаем по-прежнему, снимком: прогресс просто
         # не показывается. Отсутствие журнала не повод не отвечать на вопрос.
         self._watch = photo_watch
+        # Модель работы с прайсами. Нужна ровно за одним: показать агенту лист прайса,
+        # который админ загрузил в работу. Без неё он на вопрос «в этом прайсе» отвечает,
+        # что прайса у него нет, — и предлагает поискать письмо в почте.
+        self._model = model
         # ГОТОВЫЙ ОТВЕТ МИМО МОДЕЛИ. Длинный список (товары без фото) она обязана была бы
         # пересказать целиком — это выходные токены за копирование и риск, что ссылки в
         # пересказе разойдутся с настоящими. Инструмент кладёт список сюда, обработчик
@@ -219,6 +259,11 @@ class ToolExecutor:
         # в прайсовом потоке.
         self.pending_message: str | None = None
         self.pending_file = None                # Path | None — Excel, когда в чат не влез
+
+    def use_model(self, model) -> None:
+        """Подключить модель прайсов. Отдельным вызовом, а не параметром конструктора:
+        модель строится ПОЗЖЕ оркестратора, потому что её обработчики сами его зовут."""
+        self._model = model
 
     def take_pending(self) -> tuple[str | None, object | None]:
         """Забрать отложенное и ОЧИСТИТЬ. Очистка обязательна: оставшийся список уехал бы
@@ -231,6 +276,8 @@ class ToolExecutor:
         try:
             if name == "get_price_history":
                 return await self._price_history(tool_input)
+            if name == "read_loaded_price":
+                return await self._read_loaded_price(tool_input)
             if name == "find_items_without_photo":
                 return await self._photos_missing(tool_input)
             if name == "search_emails":
@@ -333,6 +380,76 @@ class ToolExecutor:
             return {}
         active, _ = resolve(*await self._pricing_store.load_exclusives())
         return active
+
+    # --------------------------------------------- загруженный прайс (решение 30.09.2026)
+
+    async def _read_loaded_price(self, inp: dict) -> str:
+        """Лист прайса, который админ загрузил в работу.
+
+        ЗАЧЕМ ОТДЕЛЬНЫЙ ИНСТРУМЕНТ. Загруженный прайс живёт в МОДЕЛИ, а менеджерский агент
+        видел только почту и сайт — и на вопрос «в какой колонке декоры в этом прайсе»
+        честно отвечал, что прайса у него нет, и просил назвать поставщика, чтобы поискать
+        письмо (бой 30.09.2026). Файл при этом лежал у нас на диске.
+
+        Разговор с менеджером БЕЗ ИСТОРИИ: каждый вопрос — отдельный запрос. Поэтому лист
+        оплачивается ровно один раз, тем вопросом, которому понадобился, и не едет в
+        следующие. Но и «этот прайс» по контексту не опознать — отсюда умолчание на самый
+        свежий и обязанность назвать, какой именно взяли.
+        """
+        if self._model is None:
+            return "Загруженных прайсов нет: работа с моделью не настроена."
+
+        prices = list(getattr(self._model, "prices", []) or [])
+        if not prices:
+            return "В работе нет ни одного загруженного прайса."
+
+        wanted = inp.get("price_id")
+        if wanted:
+            price = next((p for p in prices if p.id == int(wanted)), None)
+            if price is None:
+                have = ", ".join(f"№{p.id}" for p in prices)
+                return f"Прайса №{wanted} нет. Загружены: {have}."
+        else:
+            # Самый свежий по номеру: номера растут, и «этот прайс» в разговоре почти
+            # всегда про последний загруженный.
+            price = max(prices, key=lambda p: p.id)
+
+        from src.price_tool.parser import parse_price_table, render_preview
+        from src.storage import price_files
+
+        content = price_files.load(price.supplier_price.file_path)
+        if content is None:
+            return (f"Файл прайса №{price.id} не найден на сервере — "
+                    "возможно, прогон уже закрыт.")
+
+        sheets = parse_price_table(content, price.supplier_price.filename) or []
+        if not sheets:
+            return f"Прайс №{price.id} не разобрался: читать нечего."
+
+        head = (f"Прайс №{price.id}: «{price.supplier_price.filename}»\n"
+                f"Листы: {', '.join(s.name for s in sheets)}\n")
+
+        wanted_sheet = (inp.get("sheet") or "").strip().lower()
+        sheet = next((s for s in sheets if s.name.lower() == wanted_sheet), None)
+        if wanted_sheet and sheet is None:
+            return head + f"Листа «{inp.get('sheet')}» в этом прайсе нет."
+        sheet = sheet or sheets[0]
+
+        needle = (inp.get("find") or "").strip()
+        if needle:
+            from src.price_tool.parser import find_rows
+
+            found = find_rows(sheet, needle)
+            return (head + f"=== Лист «{sheet.name}», строки со словом «{needle}» ===\n"
+                    + (found or "ничего не нашлось"))[:MAX_PRICE_CHARS]
+
+        start = max(1, int(inp.get("from_row") or 1))
+        # ЧИТАЕМ КУСКОМ, а не листом целиком: на вопрос «в какой колонке декоры» хватает
+        # шапки и десятка строк, а боевой лист бывает на двенадцать тысяч строк, и целиком
+        # он не нужен ни разу — за ним есть `from_row`.
+        body = render_preview(sheet, max_rows=PRICE_CHAT_ROWS, start=start)
+        return (head + f"=== Лист «{sheet.name}» (со строки {start}) ===\n"
+                + body)[:MAX_PRICE_CHARS]
 
     # ------------------------------------------------ фото на сайте (решение 30.09.2026)
 

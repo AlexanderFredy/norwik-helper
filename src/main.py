@@ -193,6 +193,11 @@ async def main() -> None:
         # соединения.
         run_task=run_task if onec is not None else None)
     await model.load()
+    # Модель подключается к инструментам ПОСЛЕ создания: она строится с обработчиками,
+    # которые сами зовут оркестратор (сборка задач, выполнение), и раньше него появиться
+    # не может. Без этой строки агент на вопрос «в этом прайсе» отвечает, что прайса у
+    # него нет, и предлагает поискать письмо в почте.
+    orchestrator.executor.use_model(model)
     logger.info("Модель поднята: прайсов %d", len(model.prices))
 
     bot = Bot(token=config.telegram_bot_token)
