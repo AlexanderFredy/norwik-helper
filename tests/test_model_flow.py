@@ -303,6 +303,71 @@ class CommandFlowTest(Base):
         self.assertEqual(await self.queue.taken(), [])
 
 
+class ReopenOnRunTest(Base):
+    """Выполненный прайс, по которому снова запустили задачу, возвращается «к обработке»
+    (решение админа 30.09.2026).
+
+    «Выполнен» значит «работа закончена»: за ним стоит рассылка менеджерам и предложение
+    закрыть прогон. Запустив задачу, админ говорит обратное — и подпись обязана это
+    отражать, иначе список врёт ровно тогда, когда по прайсу идёт работа.
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        await self.submit()
+        self.price = self.model.prices[0]
+        self.task = self.price.tasks[0]
+
+    async def run_task(self):
+        await self.send(CommandKind.EXECUTE_TASK, price_id=self.price.id,
+                        task_id=self.task.id)
+
+    async def set_status(self, status, confirmed=True):
+        await self.send(CommandKind.SET_PRICE_STATUS, price_id=self.price.id,
+                        payload={"status": status, "confirmed": confirmed})
+
+    async def test_done_price_goes_back_to_todo(self):
+        await self.set_status("выполнен")
+        self.assertEqual(self.price.status, PriceStatus.DONE)
+
+        await self.run_task()
+        self.assertEqual(self.price.status, PriceStatus.TODO)
+
+    async def test_change_survives_a_restart(self):
+        """Статус меняется и в базе, а не только в памяти: иначе после перезапуска прайс
+        снова выглядел бы выполненным."""
+        await self.set_status("выполнен")
+        await self.run_task()
+
+        again = (await self.model_store.load_all())[0]
+        self.assertEqual(again.status, PriceStatus.TODO)
+
+    async def test_partial_is_not_touched(self):
+        """«Частично обработан» — осознанная отметка админа «ещё вернусь». Сбросить её в
+        «к обработке» значило бы стереть решение, о котором он не просил."""
+        await self.set_status("частично обработан")
+        await self.run_task()
+        self.assertEqual(self.price.status, PriceStatus.PARTIAL)
+
+    async def test_todo_stays_todo_without_extra_noise(self):
+        await self.run_task()
+        self.assertEqual(self.price.status, PriceStatus.TODO)
+        back = [e for e in self.seen.events
+                if e.kind == EventKind.PRICE_STATUS and "снова" in e.text]
+        self.assertEqual(back, [], "менять было нечего — и сообщать не о чем")
+
+    async def test_the_change_is_announced(self):
+        """Молча подменённый статус админ прочтёт как сбой зеркала."""
+        await self.set_status("выполнен")
+        self.seen.events.clear()
+        await self.run_task()
+
+        said = [e for e in self.seen.events
+                if e.kind == EventKind.PRICE_STATUS and "снова" in e.text]
+        self.assertEqual(len(said), 1)
+        self.assertIn("к обработке", said[0].text)
+
+
 class ClosingSummaryTest(Base):
     """Закрытие прайса и сводка менеджерам (решение админа 28.09.2026)."""
 

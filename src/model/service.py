@@ -192,6 +192,7 @@ class PriceListService:
             return
 
         lock = await self._take_lock(price, command.actor)
+        await self._reopen(price)
         await self.events.publish(Event(
             EventKind.TASK_RUNNING, price_id=price.id, task_id=task.id,
             text=f"Задача {task.id} взята в работу: {task.label()}"))
@@ -301,6 +302,32 @@ class PriceListService:
             text=f"Задача {task.id} удалена."))
 
     # ------------------------------------------------------------------ прайсы
+
+    async def _reopen(self, price) -> None:
+        """Выполненный прайс, по которому снова запустили задачу, возвращается «к обработке»
+        (решение админа 30.09.2026).
+
+        «Выполнен» значит «работа с прайсом закончена» — за этим статусом стоит рассылка
+        менеджерам и предложение закрыть прогон. Запустив задачу, админ этим самым
+        действием говорит обратное, и оставлять подпись «выполнен» — значит показывать в
+        списке неправду ровно в тот момент, когда по прайсу идёт работа.
+
+        Меняем ТОЛЬКО «выполнен». «Частично обработан» — осознанная отметка админа о том,
+        что он ещё вернётся; сбрасывать её в «к обработке» означало бы стирать его
+        решение, о котором он не просил.
+
+        Обратно в «выполнен» статус не возвращается сам: закрытие прайса требует
+        подтверждения и влечёт рассылку — это по-прежнему решение человека.
+        """
+        if price.status != PriceStatus.DONE:
+            return
+
+        price.status = PriceStatus.TODO
+        await self._store.set_price_status(price.id, PriceStatus.TODO)
+        await self.events.publish(Event(
+            EventKind.PRICE_STATUS, price_id=price.id,
+            text=f"Прайс №{price.id} снова «{PriceStatus.TODO.value}»: "
+                 "по нему запущена задача."))
 
     async def _set_price_status(self, command: Command) -> None:
         price = self.price(command.price_id)
