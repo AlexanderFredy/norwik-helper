@@ -122,6 +122,14 @@ class IntakeTest(Base):
         await self.submit(hint="Монарх")
         self.assertNotIn("/supplier_merge", self.seen.texts())
 
+    async def test_merged_supplier_is_applied_to_prices_in_memory(self):
+        """Иначе снимок для 1С уедет с кодом удалённого поставщика (бой 02.10.2026)."""
+        await self.submit(hint="Дубль")
+        was = self.model.prices[0].supplier_price.supplier_id
+
+        self.assertEqual(self.model.supplier_merged(was, 777), 1)
+        self.assertEqual(self.model.prices[0].supplier_price.supplier_id, 777)
+
     async def test_known_signature_identifies_the_supplier(self):
         """Сигнатуру уже видели — второй файл того же формата берёт её владельца."""
         await self.submit(name="Монарх 01.09.xlsx", hint="Монарх")

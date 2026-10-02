@@ -362,6 +362,40 @@ class CommandTest(Base):
         self.assertIn("влит", self.msg.last)
         self.assertEqual(len(await self.store.list_suppliers()), 1)
 
+    async def test_merge_moves_prices_in_memory_and_wakes_the_mirrors(self):
+        """Снимок для формы 1С собирается ИЗ ПАМЯТИ (бой 02.10.2026).
+
+        Слияние правит базу, и этого довольно для всего, что базу спрашивает. Но список
+        прайсов читается один раз при старте, и без перевеса в памяти модель продолжает
+        отправлять код УДАЛЁННОГО поставщика: 1С опознаёт элемент зеркала по коду и честно
+        показывает прежнее имя. Админ слил дубль, а в форме ничего не изменилось.
+        """
+        dup = await self.store.add_supplier("Дубль")
+        main = await self.store.add_supplier("Основной")
+        await self.store.add_signature(dup.id, "sig")
+
+        class Model:
+            def __init__(self):
+                self.moved = None
+                self.woken = False
+                self.events = self
+
+            def supplier_merged(self, source_id, target_id):
+                self.moved = (source_id, target_id)
+                return 1
+
+            async def publish(self, _event):
+                # Зеркала будятся ПОСЛЕ правки памяти, иначе снимок уедет со старым кодом.
+                assert self.moved is not None
+                self.woken = True
+
+        model = Model()
+        await self.ch.cmd_supplier_merge(self.msg, Args("1 2"), self.store, True,
+                                         model=model)
+
+        self.assertEqual(model.moved, (dup.id, main.id))
+        self.assertTrue(model.woken)
+
     async def test_merge_needs_two_numbers(self):
         await self.store.add_supplier("Один")
         await self.ch.cmd_supplier_merge(self.msg, Args("1"), self.store, True)

@@ -138,6 +138,11 @@ async def cmd_supplier_merge(message: Message, command: CommandObject,
     except ValueError as exc:
         await message.answer(f"Не получилось: {exc}")
         return
+    # ПАМЯТЬ МОДЕЛИ ПРАВИМ ДО ПРОБУЖДЕНИЯ ЗЕРКАЛ, иначе снимок уедет со старым кодом
+    # поставщика — а 1С опознаёт элемент зеркала по коду и покажет его прежнее имя.
+    if model is not None:
+        model.supplier_merged(source.id, target.id)
+
     await message.answer(view.render_merge(result, source.name, target.name))
     await _mirrors_know(model)
 
