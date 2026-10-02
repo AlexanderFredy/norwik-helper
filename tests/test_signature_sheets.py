@@ -295,6 +295,13 @@ class MirrorTest(unittest.IsolatedAsyncioTestCase):
                          [("ИЗМЕНЕНИЯ", False), ("ЛАМИНАТ", True), ("SPC", False)])
         self.assertTrue(all(r["signature"] == "hash-1" for r in rows))
 
+    async def test_supplier_goes_by_code_not_only_by_name(self):
+        """В 1С колонка «Поставщик» — ССЫЛКА на зеркало справочника (правка админа
+        02.10.2026), и элемент там опознаётся по коду: по имени зеркало плодило бы дубль
+        на каждое переименование."""
+        rows = await self.provider().sheets_snapshot()
+        self.assertTrue(all(r["supplier_code"] for r in rows))
+
     async def test_order_comes_from_the_file_not_the_alphabet(self):
         """Админ ищет лист глазами там, где он стоит в книге."""
         rows = await self.provider().sheets_snapshot()

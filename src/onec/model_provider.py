@@ -365,6 +365,10 @@ class OnecProvider(Listener):
                 out.append({
                     "signature": sig.signature,
                     "supplier": supplier,
+                    # КОД, а не только имя: в 1С колонка «Поставщик» — ССЫЛКА на зеркало
+                    # справочника (правка админа 02.10.2026), и элемент там опознаётся по
+                    # коду. По имени зеркало плодило бы дубль на каждое переименование.
+                    "supplier_code": str(sig.supplier_id or ""),
                     "format": sig.purpose or sig.sample_name or "",
                     "sheet": name,
                     "order": number,
