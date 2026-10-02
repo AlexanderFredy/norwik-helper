@@ -111,7 +111,13 @@ async def submit(content: bytes, filename: str, *, suppliers, model_store, price
         name = (filename.rsplit(".", 1)[0] or "Без названия").strip()
 
     supplier = await suppliers.add_supplier(name)
-    sig = await suppliers.add_signature(supplier.id, sig_hash, sample_name=filename)
+    # ИМЕНА ЛИСТОВ ЗАПОМИНАЕМ ЗДЕСЬ, на приёме: только тут они и известны — файл уже
+    # разобран ради сигнатуры, а дальше его читают по требованию. Без этой памяти указание
+    # «разбирать только такие-то листы» задавать не из чего: ни команда, ни форма 1С не
+    # могут показать, из чего выбирать, и админ набирал бы имена по памяти.
+    sig = await suppliers.add_signature(
+        supplier.id, sig_hash, sample_name=filename,
+        sheet_list=", ".join(s.name for s in sheets) if sheets else None)
 
     path = save_file(content, filename)
     if not path:

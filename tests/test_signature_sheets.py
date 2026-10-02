@@ -190,12 +190,48 @@ class StoreTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("только листы — ЛАМИНАТ, SPC", msg.text)
         self.assertEqual(await self.store.sheets_for("hash-1"), "ЛАМИНАТ, SPC")
 
-    async def test_command_without_sheets_clears(self):
+    async def test_dash_clears(self):
+        await self.store.set_signature_sheets(self.sig.id, "ЛАМИНАТ")
+        msg = FakeMessage()
+        await ch.cmd_signature_sheets(msg, Args("1 -"), self.store, is_admin=True)
+        self.assertIn("Ограничение снято", msg.text)
+        self.assertEqual(await self.store.sheets_for("hash-1"), "")
+
+    async def test_without_arguments_it_shows_what_to_choose_from(self):
+        """Имена листов знает только файл, и набирать их по памяти — верный способ
+        промахнуться: промах снимает ограничение целиком, то есть молча возвращает разбор
+        к полному."""
+        await self.store.add_signature(self.sig.supplier_id, "hash-1",
+                                       sheet_list="ЛАМИНАТ, SPC, КЛЕЙ")
         await self.store.set_signature_sheets(self.sig.id, "ЛАМИНАТ")
         msg = FakeMessage()
         await ch.cmd_signature_sheets(msg, Args("1"), self.store, is_admin=True)
-        self.assertIn("Ограничение снято", msg.text)
-        self.assertEqual(await self.store.sheets_for("hash-1"), "")
+        self.assertIn("Листы последнего файла: ЛАМИНАТ, SPC, КЛЕЙ", msg.text)
+        self.assertIn("Разбираем только: ЛАМИНАТ", msg.text)
+        self.assertEqual(await self.store.sheets_for("hash-1"), "ЛАМИНАТ",
+                         "показ ничего не меняет")
+
+    async def test_without_arguments_and_without_a_file_yet(self):
+        msg = FakeMessage()
+        await ch.cmd_signature_sheets(msg, Args("1"), self.store, is_admin=True)
+        self.assertIn("Листы пока неизвестны", msg.text)
+        self.assertIn("Ограничения нет", msg.text)
+
+    async def test_sheet_names_are_remembered_per_signature(self):
+        await self.store.add_signature(self.sig.supplier_id, "hash-1",
+                                       sheet_list="ЛАМИНАТ, SPC")
+        rows = await self.store.list_signatures()
+        self.assertEqual(rows[0].sheet_list, "ЛАМИНАТ, SPC")
+
+    async def test_fresh_file_replaces_the_sheet_list(self):
+        """Поставщик добавляет и убирает листы: накопленный список однажды предложил бы
+        выбрать тот, которого в прайсе давно нет."""
+        await self.store.add_signature(self.sig.supplier_id, "hash-1",
+                                       sheet_list="ЛАМИНАТ, SPC")
+        await self.store.add_signature(self.sig.supplier_id, "hash-1",
+                                       sheet_list="ЛАМИНАТ")
+        rows = await self.store.list_signatures()
+        self.assertEqual(rows[0].sheet_list, "ЛАМИНАТ")
 
     async def test_command_needs_a_number(self):
         msg = FakeMessage()

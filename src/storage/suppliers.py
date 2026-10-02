@@ -51,6 +51,10 @@ CREATE TABLE IF NOT EXISTS supplier_signature (
     -- и токенов, и кругов цикла. Живёт у СИГНАТУРЫ, потому что это свойство формата:
     -- следующий файл того же поставщика придёт с теми же листами.
     sheets      TEXT,
+    -- ВСЕ листы, какие были в последнем файле этого формата. Нужны, чтобы было ИЗ ЧЕГО
+    -- выбирать: сами имена знает только файл, и без этой памяти ни команда, ни форма не
+    -- могут показать список — админу пришлось бы набирать имена по памяти.
+    sheet_list  TEXT,
     first_seen  TEXT NOT NULL,
     last_seen   TEXT NOT NULL,
     UNIQUE (supplier_id, signature)
@@ -92,6 +96,8 @@ class Signature:
     last_seen: str
     #: Листы, которые разбирать, через запятую. Пусто — все.
     sheets: str = ""
+    #: Все листы последнего файла этого формата — из чего выбирать.
+    sheet_list: str = ""
 
 
 @dataclass(frozen=True)
@@ -125,8 +131,10 @@ class SupplierStore:
             # дописывания все запросы к сигнатурам упали бы разом.
             cur = await db.execute("PRAGMA table_info(supplier_signature)")
             have = {row[1] for row in await cur.fetchall()}
-            if have and "sheets" not in have:
-                await db.execute("ALTER TABLE supplier_signature ADD COLUMN sheets TEXT")
+            for column in ("sheets", "sheet_list"):
+                if have and column not in have:
+                    await db.execute(
+                        f"ALTER TABLE supplier_signature ADD COLUMN {column} TEXT")
             await db.commit()
 
     # ------------------------------------------------------------ поставщики
@@ -226,7 +234,8 @@ class SupplierStore:
 
     async def add_signature(self, supplier_id: int, signature: str,
                             sample_name: str | None = None,
-                            purpose: str | None = None) -> Signature:
+                            purpose: str | None = None,
+                            sheet_list: str | None = None) -> Signature:
         """Найти сигнатуру у ЭТОГО поставщика либо завести; отметить встречу.
 
         Повторная встреча той же сигнатуры — обычное дело (тот же прайс месяцем позже),
@@ -243,8 +252,12 @@ class SupplierStore:
                 await db.execute(
                     "UPDATE supplier_signature SET last_seen = ?, "
                     "sample_name = COALESCE(?, sample_name), "
-                    "purpose = COALESCE(?, purpose) WHERE id = ?",
-                    (now, sample_name, purpose, row[0]))
+                    "purpose = COALESCE(?, purpose), "
+                    # Список листов ПЕРЕЗАПИСЫВАЕТСЯ свежим файлом, а не дополняется:
+                    # поставщик добавляет и убирает листы, и накопленный список однажды
+                    # предложил бы выбрать тот, которого в прайсе давно нет.
+                    "sheet_list = COALESCE(?, sheet_list) WHERE id = ?",
+                    (now, sample_name, purpose, sheet_list, row[0]))
                 await db.commit()
                 return Signature(row[0], row[1], row[2], sample_name or row[3],
                                  purpose or row[4], row[5], now)
@@ -276,7 +289,8 @@ class SupplierStore:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
                 "SELECT id, supplier_id, signature, sample_name, purpose, first_seen, "
-                "last_seen, COALESCE(sheets, '') FROM supplier_signature"
+                "last_seen, COALESCE(sheets, ''), COALESCE(sheet_list, '') "
+                "FROM supplier_signature"
                 + where + " ORDER BY first_seen, id", params)
             return [Signature(*row) for row in await cur.fetchall()]
 

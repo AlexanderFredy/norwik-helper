@@ -343,17 +343,39 @@ async def cmd_signature_sheets(message: Message, command: CommandObject,
         await message.answer(
             "Нужен номер из /signatures и листы через запятую:\n"
             "/signature_sheets 2 ЛАМИНАТ, SPC\n\n"
-            "Без листов — снять ограничение: /signature_sheets 2")
+            "Посмотреть, какие листы есть: /signature_sheets 2\n"
+            "Снять ограничение: /signature_sheets 2 -")
         return
 
-    sheets = parts[1].strip() if len(parts) > 1 else ""
-    await supplier_store.set_signature_sheets(target.id, sheets)
-
     label = view.signature_label(target)
-    if not sheets:
+
+    # БЕЗ АРГУМЕНТА — ПОКАЗЫВАЕМ, ИЗ ЧЕГО ВЫБИРАТЬ. Имена листов знает только файл, и
+    # набирать их по памяти — верный способ промахнуться: промах снимает ограничение
+    # целиком, то есть молча возвращает разбор к полному.
+    if len(parts) == 1:
+        known = (target.sheet_list or "").strip()
+        chosen = (target.sheets or "").strip()
+        lines = [f"Формат «{label}»."]
+        lines.append(f"Листы последнего файла: {known}" if known
+                     else "Листы пока неизвестны — прайс этого формата ещё не приходил.")
+        lines.append(f"Разбираем только: {chosen}" if chosen
+                     else "Ограничения нет — разбираются все листы.")
+        lines.append("")
+        lines.append(f"Задать: /signature_sheets {parts[0]} ЛАМИНАТ, SPC")
+        lines.append(f"Снять: /signature_sheets {parts[0]} -")
+        await message.answer("\n".join(lines))
+        return
+
+    sheets = parts[1].strip()
+    # Прочерк — снять. Отдельным словом, а не пустым аргументом: пустой аргумент теперь
+    # показывает список, и два разных действия на одну запись команды путали бы.
+    if sheets == "-":
+        await supplier_store.set_signature_sheets(target.id, "")
         await message.answer(f"Ограничение снято: формат «{label}» будет разбираться "
                              "целиком, все листы.")
         return
+
+    await supplier_store.set_signature_sheets(target.id, sheets)
     await message.answer(
         f"Формат «{label}»: разбираем только листы — {sheets}.\n\n"
         "Имена сверяются без учёта регистра и пробелов. Если ни один не совпадёт с файлом, "
