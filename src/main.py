@@ -92,6 +92,18 @@ async def main() -> None:
              | await model_store.known_paths())
     price_files.sweep(config.db_path, known)
 
+    # ХЕШИ ФОРМАТОВ ПЕРЕСЧИТЫВАЕМ ПО НОВОМУ ПРАВИЛУ. Скелет перестал тащить в хеш данные
+    # файла (02.10.2026), и старые значения осиротели бы молча: следующий прайс каждого
+    # поставщика не нашёл бы владельца формата и завёл бы второго поставщика по имени файла,
+    # обнулив выбор листов. Идемпотентно — на втором старте работы нет.
+    from src.model.signature_rehash import rehash_signatures
+
+    rehashed = await rehash_signatures(supplier_store, pricing=pricing_store,
+                                       sightings=sightings, model_store=model_store)
+    for edit in rehashed:
+        logger.info("Хеш формата пересчитан: %s %s → %s (по файлу %s)",
+                    edit["supplier"], edit["old"][:12], edit["new"][:12], edit["file"])
+
     # ЛИСТЫ ФОРМАТОВ, заведённых до появления этой памяти, дозаполняем из файлов на диске:
     # иначе форма выбора листов открывается у них пустой таблицей, и видно только то, что
     # выбирать не из чего, — а почему, не видно (бой 02.10.2026).

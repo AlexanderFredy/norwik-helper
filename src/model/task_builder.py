@@ -37,6 +37,7 @@ from src.model.task import PriceTask
 from src.model import price_check
 from src.price_tool.items import build_name
 from src.price_tool.parser import parse_price_table, render_preview
+from src.price_tool.signature import sheet_key
 from src.price_tool.scope import in_scope, normalize
 
 logger = logging.getLogger(__name__)
@@ -372,9 +373,19 @@ class TaskBuilderTools:
             self.pick_problem = "листы не отмечены"
             return []
 
-        chosen = [s for s in every if s.name.strip().lower() in wanted]
+        # ДАТА В ИМЕНИ ЛИСТА НЕ ОТМЕНЯЕТ ОТМЕТКУ. У Стройиндустрии главный лист зовётся
+        # «Прайс от 20.04.2026», а месяцем позже — «Прайс от 01.10.2026»: точное сравнение
+        # снимало бы флажок с того же самого листа каждый месяц, молча и по-прежнему
+        # уверенно (бой 02.10.2026). Запасной проход сверяет имена правилом сигнатуры
+        # (`sheet_key`: числа → «#»), и точное совпадение по-прежнему решает первым.
+        loose = {sheet_key(n) for n in self._only}
+        chosen = [s for s in every
+                  if s.name.strip().lower() in wanted or sheet_key(s.name) in loose]
         found = {s.name.strip().lower() for s in chosen}
-        self.unknown_sheets = [n for n in self._only if n.strip().lower() not in found]
+        found_loose = {sheet_key(s.name) for s in chosen}
+        self.unknown_sheets = [n for n in self._only
+                               if n.strip().lower() not in found
+                               and sheet_key(n) not in found_loose]
 
         self.parsed_sheets = [s.name for s in chosen]
         self.skipped_sheets = [s.name for s in every if s not in chosen]

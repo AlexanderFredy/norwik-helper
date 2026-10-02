@@ -624,6 +624,27 @@ class PricingStore:
         return [{"signature": r[0], "sheet": r[1], "supplier": r[2],
                  "mapping": json.loads(r[3]), "updated_at": r[4], "uses": r[5]} for r in rows]
 
+    async def rehash_signature(self, old: str, new: str) -> int:
+        """Перевесить запомненные колонки со старого хеша формата на новый.
+
+        **ПЕРЕКЛЮЧЕНИЕ СИГНАТУРЫ — ЧИНИТ ПАМЯТЬ, А НЕ ПЕРЕНОСИТ ДАННЫЕ** (правка
+        02.10.2026). Правило подсчёта скелета изменилось: он перестал тащить в хеш данные
+        файла. Формат остался тот же, значение хеша другое — и всё, что на него ключуется,
+        осиротело бы молча. Поэтому старый хеш переписывается новым там, где он ключ.
+
+        `UPDATE OR REPLACE`: ключ здесь — (сигнатура, лист), и если под новым хешом уже
+        что-то запомнено, побеждает ОНО — оно свежее по построению, потому что посчитано
+        новым правилом.
+        """
+        if not old or not new or old == new:
+            return 0
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE OR REPLACE price_mappings SET signature = ? WHERE signature = ?",
+                (new, old))
+            await db.commit()
+            return cur.rowcount
+
     async def forget_mapping(self, signature: str, sheet: str = "") -> bool:
         """Забыть трактовку одного листа — остальные листы того же файла остаются."""
         async with aiosqlite.connect(self._db_path) as db:

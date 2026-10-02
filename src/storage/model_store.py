@@ -360,6 +360,26 @@ class ModelStore:
             row = await cur.fetchone()
         return row[0] if row else 0
 
+    async def rehash_signature(self, old: str, new: str) -> int:
+        """Перевесить принятые прайсы со старого хеша формата на новый.
+
+        **ПЕРЕКЛЮЧЕНИЕ СИГНАТУРЫ — ЧИНИТ ПАМЯТЬ, А НЕ ПЕРЕНОСИТ ДАННЫЕ** (правка
+        02.10.2026). Правило подсчёта скелета изменилось: он перестал тащить в хеш данные
+        файла. Формат остался тот же, значение хеша другое — и всё, что на него ключуется,
+        осиротело бы молча. Поэтому старый хеш переписывается новым там, где он ключ.
+
+        Прайс несёт сигнатуру НАРУЖУ: её видит форма 1С, и по ней открывается выбор листов.
+        Не переписав здесь, получили бы прайс, у которого формат «не записан», — двойной
+        щелчок по файлу отвечал бы отказом по прайсу, формат которого прекрасно известен.
+        """
+        if not old or not new or old == new:
+            return 0
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute("UPDATE price SET signature = ? WHERE signature = ?",
+                                   (new, old))
+            await db.commit()
+            return cur.rowcount
+
     async def known_paths(self) -> set[str]:
         """Файлы, на которые ссылается модель, — для уборки сирот при старте."""
         async with aiosqlite.connect(self._db_path) as db:

@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from src.model.commands import Command, CommandKind
 from src.model.commands import now as commands_now
 from src.model.events import Event, EventKind, Listener
+from src.price_tool.signature import sheet_key
 
 logger = logging.getLogger(__name__)
 
@@ -360,6 +361,12 @@ class OnecProvider(Listener):
                 # в таблице только мешала бы.
                 continue
             chosen = {n.strip().lower() for n in (sig.sheets or "").split(",") if n.strip()}
+            # Флажок обязан пережить дату в имени листа: отметка хранится именем, а
+            # поставщик каждый месяц переименовывает «Прайс от 20.04.2026» в «Прайс от
+            # 01.10.2026». Иначе админ видел бы снятый флажок на том листе, который сам же
+            # и отметил, — и снимал бы выбор заново каждый месяц (бой 02.10.2026). Правило
+            # сверки ТО ЖЕ, что у сборщика задач, иначе форма и разбор расходятся.
+            chosen_loose = {sheet_key(n) for n in chosen}
             supplier = await self._supplier_name(sig.supplier_id)
             for number, name in enumerate(every, 1):
                 out.append({
@@ -372,7 +379,8 @@ class OnecProvider(Listener):
                     "format": sig.purpose or sig.sample_name or "",
                     "sheet": name,
                     "order": number,
-                    "parse": name.strip().lower() in chosen,
+                    "parse": (name.strip().lower() in chosen
+                              or sheet_key(name) in chosen_loose),
                 })
         return out
 

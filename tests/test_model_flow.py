@@ -105,6 +105,23 @@ class IntakeTest(Base):
         self.assertEqual([s.name for s in await self.suppliers.list_suppliers()],
                          ["Линдервуд"])
 
+    async def test_guessed_supplier_is_named_out_loud(self):
+        """Имя из имени файла — это НЕ опознание, и молчать о нём нельзя (бой 02.10.2026).
+
+        Формат не нашёлся, в справочнике появилась запись-дубль: она растаскивает историю
+        цен, выбор листов и зеркало 1С на двух «поставщиков». Угадывать правильного код не
+        имеет права — ошибка приписала бы цены чужому, — поэтому говорим и даём команду.
+        """
+        await self.submit(name="ПРАЙС_ЛАМИНАТ_СТРОЙИНДУСТРИЯ_с_01_10.xlsx", hint="")
+        texts = self.seen.texts()
+        self.assertIn("формат этого файла мне незнаком", texts.lower())
+        self.assertIn("/supplier_merge", texts)
+
+    async def test_named_supplier_is_not_reported_as_guessed(self):
+        """Админ назвал поставщика — предупреждать не о чем."""
+        await self.submit(hint="Монарх")
+        self.assertNotIn("/supplier_merge", self.seen.texts())
+
     async def test_known_signature_identifies_the_supplier(self):
         """Сигнатуру уже видели — второй файл того же формата берёт её владельца."""
         await self.submit(name="Монарх 01.09.xlsx", hint="Монарх")

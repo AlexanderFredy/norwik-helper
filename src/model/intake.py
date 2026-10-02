@@ -36,6 +36,13 @@ class Intake:
     reason: str = ""
     supplier_name: str = ""
     outdated: bool = False
+    #: Имя поставщика взято ИЗ ИМЕНИ ФАЙЛА — опознать формат не удалось. Признак обязан
+    #: доезжать до админа: запись в справочнике появилась, но она НЕ опознана, и тихо
+    #: заведённый дубль растаскивает историю цен, выбор листов и зеркало 1С.
+    supplier_guessed: bool = False
+    #: Листы, которые велено разбирать у этого формата. Пусто — не разбираем ничего, и об
+    #: этом тоже нужно сказать: «Обновить задачи» даст пустой список (решение админа).
+    sheets: str = ""
 
 
 def read_signature(content: bytes, filename: str) -> tuple[str, list]:
@@ -107,8 +114,15 @@ async def submit(content: bytes, filename: str, *, suppliers, model_store, price
                             sig_hash[:12], len(owners))
             found = await suppliers.get_supplier(owners[0].supplier_id)
             name = found.name if found else ""
+    guessed = False
     if not name:
+        # ПОСЛЕДНИЙ РУБЕЖ, А НЕ ОПОЗНАНИЕ. Имя файла — не имя поставщика: «Стройиндустрия
+        # (Лиля)» так превратилась в «ПРАЙС_ЛАМИНАТ_СТРОЙИНДУСТРИЯ_с_01_10_2026_клиент»
+        # (бой 02.10.2026). Угадывать поставщика по имени файла нельзя — ошибка здесь
+        # приписывает цены ЧУЖОМУ поставщику, а на этом держится выбор наименьшей цены, —
+        # поэтому заводим запись и ГОВОРИМ, что она не опознана.
         name = (filename.rsplit(".", 1)[0] or "Без названия").strip()
+        guessed = True
 
     supplier = await suppliers.add_supplier(name)
     # ИМЕНА ЛИСТОВ ЗАПОМИНАЕМ ЗДЕСЬ, на приёме: только тут они и известны — файл уже
@@ -118,6 +132,11 @@ async def submit(content: bytes, filename: str, *, suppliers, model_store, price
     sig = await suppliers.add_signature(
         supplier.id, sig_hash, sample_name=filename,
         sheet_list=", ".join(s.name for s in sheets) if sheets else None)
+
+    # Листы к разбору спрашиваем ОТДЕЛЬНЫМ методом, а не берём из `sig`: `add_signature`
+    # возвращает запись без этого поля, и «пусто» из неё означало бы «не отмечено» даже у
+    # формата, где отмечено всё. `sheets_for` адресуется хешом — так же, как форма 1С.
+    sheets_wanted = await suppliers.sheets_for(sig_hash)
 
     path = save_file(content, filename)
     if not path:
@@ -145,13 +164,15 @@ async def submit(content: bytes, filename: str, *, suppliers, model_store, price
             await suppliers.delete_price_file(record.id)
             _drop(path)
         return Intake(None, "есть более свежий прайс этого поставщика того же формата",
-                      supplier.name, outdated=True)
+                      supplier.name, outdated=True, supplier_guessed=guessed,
+                      sheets=sheets_wanted)
 
     for task in stub_tasks(sheets, supplier.name):
         candidate.add_task(task)
 
     await model_store.add_price(candidate)
-    return Intake(candidate, "", supplier.name, outdated=outdated)
+    return Intake(candidate, "", supplier.name, outdated=outdated,
+                  supplier_guessed=guessed, sheets=sheets_wanted)
 
 
 def _drop(path) -> None:

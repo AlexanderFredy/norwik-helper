@@ -380,6 +380,62 @@ class SupplierStore:
             await db.commit()
             return True
 
+    async def rehash_signature(self, signature_id: int, new: str) -> bool:
+        """Переписать ХЕШ формата у одной записи, сохранив всё, что к ней привязано.
+
+        **ЗАЧЕМ.** Правило подсчёта скелета изменилось 02.10.2026 — он перестал тащить в хеш
+        данные файла. Формат остался тот же, значение хеша другое, и указание «разбирать
+        такие-то листы» вместе с запомненными колонками осиротело бы молча: следующий прайс
+        того же поставщика пришёл бы с новым хешом, не нашёл владельца и завёл ВТОРОГО
+        поставщика с именем из имени файла. Ровно это и случилось, когда хеш разошёлся сам.
+
+        Хеш у записи переписывается НА МЕСТЕ: номер записи не меняется, и всё, что ссылается
+        на него (файлы прайсов, выбор листов), остаётся на своих местах.
+
+        **Столкновение внутри одного поставщика сливается, а не падает.** Пара (поставщик,
+        хеш) обязана остаться одной, а два старых формата вполне могли различаться только
+        теми данными, которые новое правило больше не считает: тогда они и есть ОДИН формат.
+        Выживает запись, у которой УЖЕ есть новый хеш; файлы переезжают к ней, а указание о
+        листах подхватывается, если у неё самой его нет, — терять решение админа нельзя.
+        """
+        if not new:
+            return False
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT supplier_id, signature, COALESCE(sheets, ''), "
+                "COALESCE(sheet_list, '') FROM supplier_signature WHERE id = ?",
+                (signature_id,))
+            row = await cur.fetchone()
+            if not row:
+                return False
+            supplier_id, old, sheets, sheet_list = row
+            if old == new:
+                return False
+
+            cur = await db.execute(
+                "SELECT id, COALESCE(sheets, ''), COALESCE(sheet_list, '') "
+                "FROM supplier_signature WHERE supplier_id = ? AND signature = ?",
+                (supplier_id, new))
+            twin = await cur.fetchone()
+
+            if twin and twin[0] != signature_id:
+                await db.execute(
+                    "UPDATE OR IGNORE supplier_price_file SET signature_id = ? "
+                    "WHERE signature_id = ?", (twin[0], signature_id))
+                await db.execute("DELETE FROM supplier_price_file WHERE signature_id = ?",
+                                 (signature_id,))
+                await db.execute(
+                    "UPDATE supplier_signature SET sheets = ?, sheet_list = ? WHERE id = ?",
+                    (twin[1] or sheets, twin[2] or sheet_list, twin[0]))
+                await db.execute("DELETE FROM supplier_signature WHERE id = ?",
+                                 (signature_id,))
+            else:
+                await db.execute(
+                    "UPDATE supplier_signature SET signature = ? WHERE id = ?",
+                    (new, signature_id))
+            await db.commit()
+            return True
+
     async def delete_signature(self, signature_id: int) -> bool:
         """Удалить сигнатуру вместе с записями о её файлах.
 

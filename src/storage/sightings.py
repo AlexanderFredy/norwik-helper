@@ -183,6 +183,28 @@ class SightingStore:
                     rrc=rrc, price_date=price_date))
         return out
 
+    async def rehash_signature(self, old: str, new: str) -> int:
+        """Перевесить встречи артикулов со старого хеша формата на новый.
+
+        **ПЕРЕКЛЮЧЕНИЕ СИГНАТУРЫ — ЧИНИТ ПАМЯТЬ, А НЕ ПЕРЕНОСИТ ДАННЫЕ** (правка
+        02.10.2026). Правило подсчёта скелета изменилось: он перестал тащить в хеш данные
+        файла. Формат остался тот же, значение хеша другое — и всё, что на него ключуется,
+        осиротело бы молча. Поэтому старый хеш переписывается новым там, где он ключ.
+
+        Для журнала встреч это не косметика: сигнатура входит в ключ замещения («новый
+        прайс той же пары поставщик+формат свои строки ЗАМЕНЯЕТ»), и с осиротевшим хешом
+        следующий прайс не заменил бы прежние строки, а лёг рядом — «есть у другого» стало
+        бы значить «когда-то встречалось».
+        """
+        if not old or not new or old == new:
+            return 0
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE OR REPLACE price_sighting SET signature = ? WHERE signature = ?",
+                (new, old))
+            await db.commit()
+            return cur.rowcount
+
     async def forget_supplier(self, supplier_id: int) -> int:
         """Убрать поставщика из журнала — например, когда его сливают с другим."""
         async with aiosqlite.connect(self._db_path) as db:

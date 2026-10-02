@@ -59,6 +59,17 @@ class PickTest(unittest.TestCase):
         t = tools("  ламинат ,spc  ")
         self.assertEqual([s.name for s in t.sheets], ["ЛАМИНАТ", "SPC"])
 
+    def test_date_in_the_sheet_name_does_not_lose_the_sheet(self):
+        """«Прайс от 20.04.2026» и «Прайс от 01.10.2026» — один лист (бой 02.10.2026).
+
+        Отметка хранится именем, а поставщик дописывает в имя дату. Точное сравнение
+        теряло бы главный лист каждый месяц — и теряло бы ТИХО: формат опознан, лист в
+        книге есть, в отчёте он числится «пропущенным по указанию админа».
+        """
+        t = tools("Прайс от 20.04.2026, SPC", sheets=["Прайс от 01.10.2026", "SPC", "КЛЕЙ"])
+        self.assertEqual([s.name for s in t.sheets], ["Прайс от 01.10.2026", "SPC"])
+        self.assertEqual(t.unknown_sheets, [])
+
     def test_unknown_names_are_remembered(self):
         t = tools("ЛАМИНАТ, ОБОИ")
         self.assertEqual([s.name for s in t.sheets], ["ЛАМИНАТ"])
@@ -294,6 +305,20 @@ class MirrorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(r["sheet"], r["parse"]) for r in rows],
                          [("ИЗМЕНЕНИЯ", False), ("ЛАМИНАТ", True), ("SPC", False)])
         self.assertTrue(all(r["signature"] == "hash-1" for r in rows))
+
+    async def test_date_in_the_sheet_name_keeps_the_flag(self):
+        """Отметка хранится ИМЕНЕМ, а поставщик дописывает в имя дату (бой 02.10.2026).
+
+        «Прайс от 20.04.2026» в апреле и «Прайс от 01.10.2026» в октябре — один и тот же
+        лист. Точное сравнение снимало бы флажок каждый месяц, и админ отмечал бы заново
+        то, что уже отмечал, не понимая, почему выбор не держится.
+        """
+        await self.store.add_signature(self.sig.supplier_id, "hash-1",
+                                       sheet_list="Прайс от 01.10.2026, SPC")
+        await self.store.set_signature_sheets(self.sig.id, "Прайс от 20.04.2026")
+        rows = await self.provider().sheets_snapshot()
+        self.assertEqual([(r["sheet"], r["parse"]) for r in rows],
+                         [("Прайс от 01.10.2026", True), ("SPC", False)])
 
     async def test_supplier_goes_by_code_not_only_by_name(self):
         """В 1С колонка «Поставщик» — ССЫЛКА на зеркало справочника (правка админа
