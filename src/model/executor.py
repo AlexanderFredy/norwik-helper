@@ -1204,30 +1204,16 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
             if nz.collection_of(i).casefold() == wanted.casefold()]
     live = [i for i in mine if not i.not_exported]
 
-    # ПАПКУ ИЩЕМ В ДЕРЕВЕ, А НЕ ТОЛЬКО ПО ПОЗИЦИЯМ. Позиции коллекции могли уже уехать в
-    # снятые по одной — так и вышло с Brilliant, — и тогда `collection_ref` у них ведёт
-    # уже не сюда, а папка остаётся висеть в живой ветке пустой. Именно её и надо убрать.
+    # ПАПКУ СПРАШИВАЕМ У САМИХ ПОЗИЦИЙ, дерево — на подхвате (бой 02.10.2026). Дерево
+    # всё равно нужно: позиции коллекции могли уже уехать в снятые по одной — так вышло с
+    # Brilliant, — и тогда папка висит в живой ветке пустой, а узнать о ней можно только
+    # оттуда.
     tree = await asyncio.to_thread(onec.folders, tm=tm_code)
-    folder = _collection_folder(tree.items, task.address.subject, wanted)
+    folder, why = _collection_folder(tree.items, task.address.subject, wanted, live)
 
-    if folder is None:
-        return (TaskStatus.TODO,
-                f"Папка коллекции «{wanted}» у этой марки не нашлась — перенести нечего. "
-                "Возможно, позиции лежат прямо в папке марки.")
-
-    if folder.not_exported:
+    if folder is not None and folder.not_exported:
         return (TaskStatus.DONE,
                 f"Папка «{folder.name}» уже помечена невыгружаемой — коллекция снята.")
-
-    # ПАПКА ДОЛЖНА БЫТЬ НАША ЦЕЛИКОМ: перенос утащит всё, что внутри.
-    strangers = sorted({nz.collection_of(i) for i in nom.items
-                        if i.collection_ref == folder.ref
-                        and nz.collection_of(i).casefold() != wanted.casefold()})
-    if strangers:
-        return (TaskStatus.TODO,
-                f"В папке «{folder.name}» лежат и другие коллекции "
-                f"({', '.join(strangers[:5])}) — перенос утащил бы их следом. "
-                "Разберите папку либо перенесите позиции по одной.")
 
     # ЧТО ИЗ КОЛЛЕКЦИИ ЕЩЁ СТОИТ В ПРАЙСЕ. Необратимая операция обязана опираться на
     # файл, а не на формулировку задачи: её писала модель.
@@ -1246,7 +1232,8 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
                 "снимать нечего, ничего не трогал.")
 
     # Вид товара берём у позиций коллекции; если их не осталось — у папки.
-    type_ref = (mine[0].product_type_ref if mine else folder.product_type_ref)
+    type_ref = (mine[0].product_type_ref if mine
+                else (folder.product_type_ref if folder else ""))
     target = dc.folder_for(type_ref)
     if not target:
         return (TaskStatus.TODO,
@@ -1269,6 +1256,27 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
             return (TaskStatus.PARTIAL, text + "\nОшибки 1С: "
                     + "; ".join(f"{e.get('code')} {e.get('message')}" for e in errors[:3]))
         return TaskStatus.DONE, text
+
+    # ДАЛЬШЕ ЕДЕТ ПАПКА — и только здесь она вообще нужна. Раньше её искали ПЕРЕД
+    # разбором прайса, и ненайденная папка отменяла заодно поштучный перенос, которому
+    # она не нужна совсем: задача по восьми позициям из двадцати двух живых отказывалась
+    # выполняться из-за поиска, к ней не относящегося (бой 02.10.2026).
+    if folder is None:
+        return (TaskStatus.TODO,
+                f"Коллекция «{wanted}» уходит из прайса целиком, но папку для переноса "
+                f"выбрать не могу: {why or 'её нет в дереве этой марки'}. "
+                "Перенесите папку сами либо укажите её код в задаче — позиции я не двигал, "
+                "потому что по одной это оставило бы пустую папку в живой ветке.")
+
+    # ПАПКА ДОЛЖНА БЫТЬ НАША ЦЕЛИКОМ: перенос утащит всё, что внутри.
+    strangers = sorted({nz.collection_of(i) for i in nom.items
+                        if i.collection_ref == folder.ref
+                        and nz.collection_of(i).casefold() != wanted.casefold()})
+    if strangers:
+        return (TaskStatus.TODO,
+                f"В папке «{folder.name}» лежат и другие коллекции "
+                f"({', '.join(strangers[:5])}) — перенос утащил бы их следом. "
+                "Разберите папку либо перенесите позиции по одной.")
 
     guard()
     result = await asyncio.to_thread(
@@ -1294,36 +1302,63 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
     return TaskStatus.DONE, text
 
 
-def _collection_folder(folders, subject, wanted: str):
-    """Папка коллекции в дереве марки. None — не нашлась.
+def _collection_folder(folders, subject, wanted: str, positions=()):
+    """Папка коллекции в дереве марки. Возвращает (папка, почему не вышло).
 
-    Сперва по КОДУ из адреса задачи: его кладёт `_add_discontinued_candidates`, и это
-    точное попадание без всякого сопоставления имён. Имена папок в базе разнородны —
-    «Коллекция Brilliant - 10 декоров» рядом с «Provence», — и угадывать по ним значит
-    однажды перенести не ту.
+    Три источника, по убыванию надёжности.
 
-    Кода нет (задача заведена прежней версией) — ищем по имени как по СЛОВУ: «Brilliant»
-    внутри «Коллекция Brilliant - 10 декоров» есть, а «Accord» внутри «Accord Plus» —
-    другое слово. Нашлось несколько — не двигаем ничего.
+    **1. КОД из адреса задачи** — его кладёт `_add_discontinued_candidates`. Точное
+    попадание без всякого сопоставления имён.
+
+    **2. САМИ ПОЗИЦИИ** (правка 02.10.2026). У каждой живой позиции коллекции стоит
+    `collection_ref` — это и есть ответ на вопрос «какую папку двигать», причём ответ из
+    базы, а не из похожести имён. Раньше его не спрашивали вовсе, хотя докстринг
+    `run_discontinue` на него и ссылался: у Classen под маркой лежат ТРИ папки со словом
+    Visiogrande («Classen Visiogrande», «… (1286*282*8)», «… (1286*160*8)»), поиск по
+    имени нашёл двух кандидатов-коллекций, отказался выбирать — и задача по живой
+    коллекции ответила «папка не нашлась, возможно позиции лежат прямо в папке марки».
+    Все 22 живые позиции при этом стояли в одной папке, `YO-00024127`.
+
+    **3. ИМЯ как СЛОВО** — для коллекции, чьи позиции уже уехали в снятые по одной: папка
+    висит в живой ветке пустой, спросить её не у кого. «Brilliant» внутри «Коллекция
+    Brilliant - 10 декоров» есть, а «Accord» внутри «Accord Plus» — другое слово.
+    **Снятые папки в споре не участвуют:** переносить их незачем, а своим существованием
+    они делали выбор неоднозначным — ровно это и случилось с Visiogrande, где обе лишние
+    папки давно помечены невыгружаемыми. Осталось несколько — не двигаем ничего и
+    НАЗЫВАЕМ их: «не нашлась» про существующую папку админ читает как поломку, а это
+    выбор, которого код не вправе делать за него.
     """
     from src.price_tool.scope import normalize
 
     by_ref = {f.ref: f for f in folders}
     code = (subject.code or "").strip()
     if code and code in by_ref:
-        return by_ref[code]
+        return by_ref[code], ""
+
+    refs = {i.collection_ref for i in positions if getattr(i, "collection_ref", "")}
+    if len(refs) == 1:
+        ref = refs.pop()
+        if ref in by_ref:
+            return by_ref[ref], ""
+    elif len(refs) > 1:
+        return None, (f"живые позиции коллекции лежат в разных папках "
+                      f"({', '.join(sorted(refs)[:4])})")
 
     probe = normalize(wanted)
     if not probe:
-        return None
+        return None, "у задачи нет имени коллекции"
 
-    hits = [f for f in folders
-            if f.kind == "collection" and probe in normalize(f.name).split()]
+    live = [f for f in folders if f.kind == "collection" and not f.not_exported]
+    hits = [f for f in live if probe in normalize(f.name).split()]
     # Составное имя («ECO plus») одним словом не найти — пробуем вхождением целиком.
     if not hits:
-        hits = [f for f in folders
-                if f.kind == "collection" and probe in normalize(f.name)]
-    return hits[0] if len(hits) == 1 else None
+        hits = [f for f in live if probe in normalize(f.name)]
+    if len(hits) == 1:
+        return hits[0], ""
+    if hits:
+        return None, ("по имени подходит несколько папок: "
+                      + ", ".join(f"«{f.name}» ({f.ref})" for f in hits[:4]))
+    return None, f"папки с именем «{wanted}» в дереве марки нет"
 
 
 def task_brief(price, task) -> str:

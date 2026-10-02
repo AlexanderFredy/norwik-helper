@@ -527,6 +527,78 @@ class DiscontinueTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(onec.ops)
         self.assertEqual(status, TaskStatus.TODO)
 
+    async def test_folder_comes_from_the_live_positions(self):
+        """СЛУЧАЙ С БОЯ (02.10.2026, Classen / Visiogrande).
+
+        Под маркой лежат ТРИ папки со словом Visiogrande — живая «Classen Visiogrande» и
+        две размерные, давно помеченные невыгружаемыми. Поиск по имени нашёл двух
+        кандидатов-коллекций, отказался выбирать, и задача ответила «папка не нашлась,
+        возможно позиции лежат прямо в папке марки» — про папку, которая есть. Все живые
+        позиции при этом стояли в ней одной, и спросить следовало их.
+        """
+        items = [self.item_in("R1", collection="Visiogrande", folder="YO-24127"),
+                 self.item_in("R2", collection="Visiogrande", folder="YO-24127")]
+        onec = self.onec(items, [
+            self.Folder("YO-24127", "Classen Visiogrande"),
+            self.Folder("YO-34398", "Classen Visiogrande (1286*282*8)",
+                        not_exported=True),
+            self.Folder("YO-34399", "Classen Visiogrande (1286*160*8)", kind="group",
+                        not_exported=True)])
+
+        status, text = await run_discontinue(
+            onec, self.task_for("Visiogrande"), allow, self.price())
+
+        self.assertEqual(onec.ops, [{"op": "update_folder", "ref": "YO-24127",
+                                     "parent_ref": self.TARGET}])
+        self.assertEqual(status, TaskStatus.DONE)
+
+    async def test_discontinued_lookalikes_do_not_make_the_name_ambiguous(self):
+        """Позиции уже уехали в снятые — папку ищем по имени, и снятые однофамильцы в
+        споре не участвуют: переносить их незачем, а выбор они ломали."""
+        onec = self.onec([], [self.Folder("F1", "Visiogrande"),
+                              self.Folder("F2", "Visiogrande (282)", not_exported=True)])
+        status, text = await run_discontinue(
+            onec, self.task_for("Visiogrande"), allow, self.price())
+        self.assertEqual(onec.ops, [{"op": "update_folder", "ref": "F1",
+                                     "parent_ref": self.TARGET}])
+        self.assertEqual(status, TaskStatus.DONE)
+
+    async def test_partial_move_does_not_need_the_folder_at_all(self):
+        """Часть коллекции остаётся в прайсе — двигаем ПОЗИЦИИ, и папка тут не нужна.
+
+        Раньше её искали до разбора прайса, и ненайденная папка отменяла заодно поштучный
+        перенос: безопасная операция отказывалась выполняться из-за поиска, к ней не
+        относящегося.
+        """
+        alive = self.item_in("R1", collection="Visiogrande", folder="НЕТ-В-ДЕРЕВЕ")
+        object.__setattr__(alive, "site_name", "Альфа")
+        object.__setattr__(alive, "article", "")
+        gone = self.item_in("R2", collection="Visiogrande", folder="НЕТ-В-ДЕРЕВЕ")
+        object.__setattr__(gone, "site_name", "Бета")
+        object.__setattr__(gone, "article", "")
+
+        onec = self.onec([alive, gone], [])
+        status, text = await run_discontinue(
+            onec, self.task_for("Visiogrande"), allow,
+            self.price(("A1", "Ламинат Visiogrande Альфа", 1290)))
+
+        self.assertEqual(onec.ops, [{"op": "update_item", "ref": "R2",
+                                     "parent_ref": self.TARGET}])
+        self.assertEqual(status, TaskStatus.DONE)
+
+    async def test_several_candidates_are_named_not_hidden(self):
+        """«Не нашлась» про существующую папку админ читает как поломку. Это выбор,
+        которого код не вправе делать за него, — значит надо назвать, из чего выбирать."""
+        onec = self.onec([self.item_in("R1", folder="НЕТ-В-ДЕРЕВЕ")],
+                         [self.Folder("F1", "Brilliant"),
+                          self.Folder("F2", "Brilliant Plus")])
+        status, text = await run_discontinue(onec, self.task_for(), allow, self.price())
+
+        self.assertIsNone(onec.ops)
+        self.assertEqual(status, TaskStatus.TODO)
+        self.assertIn("несколько папок", text)
+        self.assertIn("F1", text)
+
     async def test_guard_stops_the_move(self):
         from src.model.executor import WriteRefused
 
