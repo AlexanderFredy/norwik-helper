@@ -88,5 +88,30 @@ class CompareGuardTest(unittest.TestCase):
                       "проверка на отсутствие строки должна стоять ДО обхода полей")
 
 
+class FormQueryTest(unittest.TestCase):
+    """Поле, читаемое из строки таблицы формы, обязано быть ВЫБРАНО в запросе (бой
+    02.10.2026).
+
+    Колонку реквизита формы мало объявить: `ЗаполнитьЗначенияСвойств` заполняет её из
+    выборки, и без `Т.Поле КАК Поле` в запросе колонка ЕСТЬ и всегда пуста. Ошибки при этом
+    никакой — двойной щелчок по имени файла честно отвечал «формат не записан» по прайсу, у
+    которого формат записан.
+    """
+
+    FORM = BSL.parent / "model-form-module.bsl"
+
+    #: Колонки, которых в запросах нет по построению: их считает сам модуль.
+    COMPUTED = {"Пометка"}
+
+    def test_every_read_field_is_selected(self):
+        text = self.FORM.read_text(encoding="utf-8")
+        read = set(re.findall(r"Текущий\.([А-Яа-яЁёA-Za-z_]+)", text))
+        selected = set(re.findall(r"\|\s*\w+\.([А-Яа-яЁёA-Za-z_]+) КАК", text))
+        missing = read - selected - self.COMPUTED
+        self.assertEqual(missing, set(),
+                         f"модуль читает поля, которых нет ни в одном запросе: "
+                         f"{sorted(missing)} — колонка будет всегда пустой, без ошибки")
+
+
 if __name__ == "__main__":
     unittest.main()
