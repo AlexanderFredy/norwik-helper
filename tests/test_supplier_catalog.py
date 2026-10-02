@@ -197,6 +197,42 @@ class MergeTest(Base):
         self.assertEqual(len(await self.store.list_signatures(self.main.id)), 1)
         self.assertEqual(len(await self.store.list_price_files(dst.id)), 2)
 
+    async def test_references_to_the_supplier_move_too(self):
+        """Ссылки на поставщика из ДРУГИХ таблиц переезжают здесь же (бой 02.10.2026).
+
+        `supplier_id` стоит у принятого прайса и у журнала встреч артикулов. Без переноса
+        слияние оставляло бы живой прайс со ссылкой на удалённого поставщика: в форме 1С и
+        в списке прайсов это пустое имя, а в журнале — «есть у другого поставщика» про
+        поставщика, которого нет.
+        """
+        from src.storage.model_store import ModelStore
+        from src.storage.sightings import SightingStore
+
+        model = ModelStore(self.store._db_path)
+        await model.init()
+        sightings = SightingStore(self.store._db_path)
+        await sightings.init()
+
+        sig = await self.store.add_signature(self.dup.id, "sig-lam")
+        made = await self.store.add_price_file(sig.id, "a.xlsx", "/p/a.xlsx")
+        await self._add_price(model, self.dup.id, made.id)
+        await sightings.remember(supplier_id=self.dup.id, signature="sig-lam",
+                                 items={"LE263": "Vintage"}, supplier="Монарх Логистик")
+
+        await self.store.merge_suppliers(self.dup.id, self.main.id)
+
+        prices = await model.load_all()
+        self.assertEqual([p.supplier_price.supplier_id for p in prices], [self.main.id])
+        seen = await sightings.elsewhere()
+        self.assertEqual(seen["LE263"].supplier_id, self.main.id)
+
+    async def _add_price(self, model, supplier_id, file_id):
+        from src.model.price import Price, SupplierPrice
+
+        await model.add_price(Price(supplier_price=SupplierPrice(
+            supplier_id=supplier_id, file_id=file_id, file_path="/p/a.xlsx",
+            filename="a.xlsx", signature="sig-lam")))
+
     async def test_empty_source_is_still_destroyed(self):
         res = await self.store.merge_suppliers(self.dup.id, self.main.id)
         self.assertEqual((res.moved, res.absorbed, res.files), (0, 0, 0))
