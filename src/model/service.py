@@ -165,8 +165,43 @@ class PriceListService:
             return await self._release(command)
         if kind == CommandKind.RENAME_SUPPLIER:
             return await self._rename_supplier(command)
+        if kind == CommandKind.SET_SIGNATURE_SHEETS:
+            return await self._set_signature_sheets(command)
 
         logger.warning("Неизвестная команда: %s", kind)
+
+    async def _set_signature_sheets(self, command: Command) -> None:
+        """Какие листы разбирать у формата прайса (решение админа 02.10.2026).
+
+        Адресат — СИГНАТУРА, не прайс: выбор действует на все будущие файлы этого формата,
+        и переспрашивать его на каждом файле незачем.
+
+        ЗАДАЧИ ЗДЕСЬ НЕ ПЕРЕСОБИРАЮТСЯ. Отметив листы, админ сам нажимает «Обновить
+        задачи» — это его решение, и делать за него дорогой прогон (на FLOOR SERVICE $5.83)
+        по каждому щелчку флажком нельзя: флажков он поставит несколько, а прогон нужен
+        один, после последнего.
+        """
+        data = command.payload or {}
+        signature = str(data.get("signature") or "").strip()
+        if not signature:
+            return await self._reject(command, "не передана сигнатура формата")
+
+        sheets = data.get("sheets")
+        if isinstance(sheets, (list, tuple)):
+            sheets = ", ".join(str(x).strip() for x in sheets if str(x).strip())
+        sheets = str(sheets or "").strip()
+
+        changed = await self._suppliers.set_sheets_by_signature(signature, sheets)
+        if not changed:
+            return await self._reject(
+                command, f"формат {signature[:12]} не найден в справочнике")
+
+        # Состояние зеркала изменилось — снимок обязан уехать, иначе флажки в форме
+        # вернутся к прежним при следующем обновлении.
+        await self.events.publish(Event(
+            EventKind.PRICE_STATUS,
+            text=(f"Формат {signature[:12]}: разбираем листы — {sheets}." if sheets
+                  else f"Формат {signature[:12]}: листы не отмечены, разбирать нечего.")))
 
     # ------------------------------------------------------------------ задачи
 
@@ -481,8 +516,13 @@ class PriceListService:
                 said = (answer or "").strip()
                 await self.events.publish(Event(
                     EventKind.TASKS_REBUILT, price_id=price.id,
-                    text=f"По прайсу №{price.id} работы нет: расхождений с 1С не нашлось."
-                         + (f"\n\n{said[:AGENT_SAY_LIMIT]}" if said else "")))
+                    # ПРИЧИНУ ПУСТОТЫ НАЗЫВАЕТ СБОРЩИК, когда ему есть что сказать.
+                    # «Расхождений не нашлось» — лишь ОДНА из причин, и с 02.10.2026 не
+                    # самая частая: листы могут быть не отмечены, и тогда мы ничего не
+                    # смотрели вовсе. Выдать это за сделанную работу нельзя.
+                    text=f"По прайсу №{price.id} задач нет."
+                         + (f"\n\n{said[:AGENT_SAY_LIMIT]}" if said
+                            else " Расхождений с 1С не нашлось.")))
                 return [], ""
             await self.events.publish(Event(
                 EventKind.TASKS_REBUILT, price_id=price.id,

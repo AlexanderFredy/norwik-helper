@@ -1451,8 +1451,8 @@ class ServiceFallbackTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(model.prices[0].tasks, [])
         told = " ".join(said)
-        self.assertIn("работы нет", told)
-        # и слова агента доезжают: без них «работы нет» неотличимо от «прочитал не тот лист»
+        self.assertIn("задач нет", told)
+        # и слова агента доезжают: без них «задач нет» неотличимо от «прочитал не тот лист»
         self.assertIn("цены совпадают", told)
 
     async def test_agent_failure_falls_back_to_the_stub(self):

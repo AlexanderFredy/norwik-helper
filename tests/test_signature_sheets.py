@@ -25,7 +25,7 @@ class Sheet:
 ALL = ["ИЗМЕНЕНИЯ", "АКЦИИ", "ЛАМИНАТ", "SPC", "КЛЕЙ"]
 
 
-def tools(only="", sheets=None):
+def tools(only=None, sheets=None):
     t = TaskBuilderTools(b"x", "Прайс.xlsx", only_sheets=only)
     t._sheets = t._pick([Sheet(n) for n in (sheets or ALL)])
     return t
@@ -33,10 +33,21 @@ def tools(only="", sheets=None):
 
 class PickTest(unittest.TestCase):
 
-    def test_without_instruction_all_sheets(self):
+    def test_no_instruction_at_all_means_all_sheets(self):
+        """`None` — выбором листов никто не управляет (так зовут из кода, которому до
+        листов дела нет). Это НЕ то же, что «админ ничего не отметил»."""
         t = tools()
         self.assertEqual([s.name for s in t.sheets], ALL)
         self.assertEqual(t.skipped_sheets, [])
+        self.assertEqual(t.pick_problem, "")
+
+    def test_nothing_ticked_means_nothing_parsed(self):
+        """Решение админа 02.10.2026: не отмечено — не разбираем. Обратное умолчание
+        стоило бы полного разбора каждого нового файла ($5.83 на FLOOR SERVICE)."""
+        t = tools(only="")
+        self.assertEqual(t.sheets, [])
+        self.assertEqual(t.pick_problem, "листы не отмечены")
+        self.assertEqual(t.skipped_sheets, ALL)
 
     def test_only_named_sheets_remain(self):
         t = tools("ЛАМИНАТ, SPC")
@@ -53,14 +64,12 @@ class PickTest(unittest.TestCase):
         self.assertEqual([s.name for s in t.sheets], ["ЛАМИНАТ"])
         self.assertEqual(t.unknown_sheets, ["ОБОИ"])
 
-    def test_empty_intersection_means_everything(self):
-        """Поставщик переименовал листы — указание устарело. Разобрав ноль листов, мы
-        получили бы ноль задач, а ноль задач в этой модели значит «расхождений нет»:
-        тихо выдать «работы нет» вместо «не нашёл названных листов» — худшее из возможного.
-        """
+    def test_stale_marks_parse_nothing_and_say_so(self):
+        """Поставщик переименовал листы — отмеченных в файле больше нет. Разбирать нечего,
+        и сказать об этом надо громко: иначе «задач нет» прочтётся как «расхождений нет»."""
         t = tools("ОБОИ, ПЛИТКА")
-        self.assertEqual([s.name for s in t.sheets], ALL)
-        self.assertEqual(t.skipped_sheets, [])
+        self.assertEqual(t.sheets, [])
+        self.assertEqual(t.pick_problem, "ни один отмеченный лист не найден в файле")
         self.assertEqual(t.unknown_sheets, ["ОБОИ", "ПЛИТКА"])
 
 
@@ -103,22 +112,26 @@ class ReportTest(unittest.TestCase):
     def test_nothing_opened_is_said_out_loud(self):
         self.assertIn("Ни одного листа не открыл", sheets_report(tools()))
 
-    def test_total_mismatch_says_the_limit_was_dropped(self):
-        t = tools("ОБОИ")
-        t._read({"sheet": "ЛАМИНАТ"})
-        text = sheets_report(t)
-        self.assertIn("которых в файле нет: ОБОИ", text)
-        self.assertIn("не применялось", text)
+    def test_nothing_ticked_report_tells_what_to_do(self):
+        """Список задач пуст, и без объяснения пустота читается как сделанная работа."""
+        text = sheets_report(tools(only=""))
+        self.assertIn("Листы не отмечены — задачи не собирал", text)
+        self.assertIn("В прайсе есть листы: ИЗМЕНЕНИЯ", text)
+        self.assertIn("Обновить задачи", text)
 
-    def test_partial_mismatch_does_not_claim_the_limit_was_dropped(self):
-        """Часть названий совпала — ограничение ПРИМЕНИЛОСЬ, и говорить обратное значило
-        бы соврать ровно о том, что админ и проверяет."""
+    def test_stale_marks_report_blames_the_renaming(self):
+        text = sheets_report(tools("ОБОИ"))
+        self.assertIn("Ни один отмеченный лист не найден", text)
+        self.assertIn("Отмечены: ОБОИ", text)
+        self.assertIn("переименовал", text)
+
+    def test_partial_mismatch_is_only_a_warning(self):
+        """Часть отмеченных нашлась — разбор состоялся, и это не повод бить тревогу."""
         t = tools("ЛАМИНАТ, ОБОИ")
         t._read({"sheet": "ЛАМИНАТ"})
         text = sheets_report(t)
+        self.assertIn("Проанализировал листы: ЛАМИНАТ.", text)
         self.assertIn("которых в файле нет: ОБОИ", text)
-        self.assertIn("ограничение применено", text)
-        self.assertNotIn("не применялось", text)
 
     def test_empty_groups_are_not_printed(self):
         t = tools("ЛАМИНАТ", sheets=["ЛАМИНАТ"])
@@ -247,3 +260,116 @@ class StoreTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MirrorTest(unittest.IsolatedAsyncioTestCase):
+    """Зеркало листов для формы 1С: строка на лист, флажок — отметка админа."""
+
+    async def asyncSetUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.store = SupplierStore(Path(self._dir.name) / "t.db")
+        await self.store.init()
+        supplier = await self.store.add_supplier("FLOOR SERVICE")
+        self.sig = await self.store.add_signature(
+            supplier.id, "hash-1", sample_name="прайс.xlsx",
+            sheet_list="ИЗМЕНЕНИЯ, ЛАМИНАТ, SPC")
+
+    async def asyncTearDown(self):
+        self._dir.cleanup()
+
+    def provider(self):
+        from src.onec.model_provider import OnecProvider
+
+        class Service:
+            prices = []
+
+            def lock_of(self, _id):
+                return None
+
+        return OnecProvider(onec=None, service=Service(), suppliers=self.store)
+
+    async def test_row_per_sheet_with_flags(self):
+        await self.store.set_signature_sheets(self.sig.id, "ЛАМИНАТ")
+        rows = await self.provider().sheets_snapshot()
+        self.assertEqual([(r["sheet"], r["parse"]) for r in rows],
+                         [("ИЗМЕНЕНИЯ", False), ("ЛАМИНАТ", True), ("SPC", False)])
+        self.assertTrue(all(r["signature"] == "hash-1" for r in rows))
+
+    async def test_order_comes_from_the_file_not_the_alphabet(self):
+        """Админ ищет лист глазами там, где он стоит в книге."""
+        rows = await self.provider().sheets_snapshot()
+        self.assertEqual([r["order"] for r in rows], [1, 2, 3])
+        self.assertEqual(rows[0]["sheet"], "ИЗМЕНЕНИЯ")
+
+    async def test_format_without_a_file_is_not_shown(self):
+        """Пустая строка в таблице только мешала бы: выбирать не из чего."""
+        supplier = await self.store.add_supplier("Новый")
+        await self.store.add_signature(supplier.id, "hash-2")
+        rows = await self.provider().sheets_snapshot()
+        self.assertEqual({r["signature"] for r in rows}, {"hash-1"})
+
+    async def test_without_a_catalogue_it_is_empty(self):
+        from src.onec.model_provider import OnecProvider
+
+        class Service:
+            prices = []
+
+            def lock_of(self, _id):
+                return None
+
+        provider = OnecProvider(onec=None, service=Service())
+        self.assertEqual(await provider.sheets_snapshot(), [])
+
+
+class CommandTest(unittest.IsolatedAsyncioTestCase):
+    """Команда из формы 1С: отмеченные листы приезжают в модель."""
+
+    async def asyncSetUp(self):
+        from src.model.service import PriceListService
+        from src.storage.model_store import ModelStore
+
+        self._dir = tempfile.TemporaryDirectory()
+        db = Path(self._dir.name) / "t.db"
+        self.store = SupplierStore(db)
+        await self.store.init()
+        model_store = ModelStore(db)
+        await model_store.init()
+        supplier = await self.store.add_supplier("FLOOR SERVICE")
+        self.sig = await self.store.add_signature(supplier.id, "hash-1",
+                                                  sheet_list="ЛАМИНАТ, SPC")
+        self.model = PriceListService(model_store, self.store,
+                                      save_file=lambda c, n: None)
+        await self.model.load()
+
+    async def asyncTearDown(self):
+        self._dir.cleanup()
+
+    async def send(self, payload):
+        from src.model.commands import Command, CommandKind
+
+        await self.model.apply(Command(kind=CommandKind.SET_SIGNATURE_SHEETS,
+                                       source="1c", actor="1c:Саша", payload=payload))
+
+    async def test_list_of_sheets_is_stored(self):
+        await self.send({"signature": "hash-1", "sheets": ["ЛАМИНАТ", "SPC"]})
+        self.assertEqual(await self.store.sheets_for("hash-1"), "ЛАМИНАТ, SPC")
+
+    async def test_string_is_accepted_too(self):
+        """Telegram шлёт строкой, форма — списком: принимаем оба, иначе один из визуалов
+        пришлось бы учить формату другого."""
+        await self.send({"signature": "hash-1", "sheets": "ЛАМИНАТ"})
+        self.assertEqual(await self.store.sheets_for("hash-1"), "ЛАМИНАТ")
+
+    async def test_empty_selection_is_stored_as_empty(self):
+        """Снять все флажки — законное действие: оно означает «этот формат не разбирать»."""
+        await self.store.set_signature_sheets(self.sig.id, "ЛАМИНАТ")
+        await self.send({"signature": "hash-1", "sheets": []})
+        self.assertEqual(await self.store.sheets_for("hash-1"), "")
+
+    async def test_unknown_signature_is_refused(self):
+        await self.send({"signature": "нет-такого", "sheets": ["ЛАМИНАТ"]})
+        self.assertEqual(await self.store.sheets_for("hash-1"), "")
+
+    async def test_without_signature_is_refused(self):
+        await self.send({"sheets": ["ЛАМИНАТ"]})
+        self.assertEqual(await self.store.sheets_for("hash-1"), "")

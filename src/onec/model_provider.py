@@ -294,7 +294,8 @@ class OnecProvider(Listener):
         snapshot = await self.snapshot()
         # Признак снимаем ТОЛЬКО ПОСЛЕ успешной отправки: исключение оставит его поднятым,
         # и следующий оборот повторит попытку.
-        await asyncio.to_thread(self._onec.set_model_state, snapshot)
+        await asyncio.to_thread(self._onec.set_model_state, snapshot,
+                                await self.sheets_snapshot())
         self._dirty = False
 
     async def snapshot(self) -> list[dict]:
@@ -314,6 +315,10 @@ class OnecProvider(Listener):
                 # справочника, и элемент там опознаётся по коду. По имени зеркало плодило
                 # бы дубль на каждое переименование, унося с собой привязанные юрлица.
                 "supplier_code": str(sp.supplier_id or ""),
+                # СИГНАТУРА ФОРМАТА едет вместе с прайсом: по ней форма открывает выбор
+                # листов двойным щелчком по имени файла. Иначе пришлось бы искать формат
+                # по имени файла, а имена меняются каждый месяц.
+                "signature": sp.signature or "",
                 "status": price.status.value,
                 "ready": price.ready,
                 "has_newer": price.has_newer,
@@ -323,6 +328,48 @@ class OnecProvider(Listener):
                 "created_at": price.created_at,
                 "tasks": [self._task(task) for task in price.sorted_tasks],
             })
+        return out
+
+    async def sheets_snapshot(self) -> list[dict]:
+        """Листы форматов с флажками — зеркало для формы выбора листов (02.10.2026).
+
+        СТРОКА НА ЛИСТ, а не строка на формат со списком в поле: в форме это таблица с
+        флажком, и 1С применяет снимок разницей — построчно. Список в одном поле означал бы
+        перезапись всей таблицы на каждое изменение одного флажка.
+
+        Порядок берём ИЗ ФАЙЛА, а не по алфавиту: админ ищет лист глазами там, где он стоит
+        в книге, и «АКЦИИ» выше «ЛАМИНАТА» сбивало бы с толку.
+
+        Без справочника (тесты, 1С без поставщиков) — пустой список: это честное «форматов
+        не знаю», и зеркало честно опустеет.
+        """
+        if self._suppliers is None:
+            return []
+
+        out: list[dict] = []
+        try:
+            signatures = await self._suppliers.list_signatures()
+        except Exception:                               # noqa: BLE001
+            logger.warning("Не удалось прочитать форматы прайсов", exc_info=True)
+            return []
+
+        for sig in signatures:
+            every = [n.strip() for n in (sig.sheet_list or "").split(",") if n.strip()]
+            if not every:
+                # Файла этого формата ещё не видели — показывать нечего, и пустая строка
+                # в таблице только мешала бы.
+                continue
+            chosen = {n.strip().lower() for n in (sig.sheets or "").split(",") if n.strip()}
+            supplier = await self._supplier_name(sig.supplier_id)
+            for number, name in enumerate(every, 1):
+                out.append({
+                    "signature": sig.signature,
+                    "supplier": supplier,
+                    "format": sig.purpose or sig.sample_name or "",
+                    "sheet": name,
+                    "order": number,
+                    "parse": name.strip().lower() in chosen,
+                })
         return out
 
     def _task(self, task) -> dict:

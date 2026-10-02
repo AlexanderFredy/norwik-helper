@@ -755,7 +755,8 @@ class OnecClient:
         """
         return self._post_json("/get-products/agent-commands-state", {"commands": items})
 
-    def set_model_state(self, prices: list[dict]) -> dict:
+    def set_model_state(self, prices: list[dict],
+                        sheets: list[dict] | None = None) -> dict:
         """Положить в 1С ПОЛНЫЙ снимок состояния модели (§3.3).
 
         Целиком, а не приращениями: снимок мал (десятки строк) и самоисцеляющийся —
@@ -769,7 +770,13 @@ class OnecClient:
         Отсутствующий ключ `prices` и пустой список — РАЗНОЕ: пустой честно вычищает
         зеркало, отсутствующий 1С отвергает, чтобы обрезанный запрос не стёр список.
         """
-        return self._post_json("/get-products/set-model-state", {"prices": prices})
+        payload = {"prices": prices}
+        # ЛИСТЫ ФОРМАТОВ — отдельным ключом и ТОЛЬКО когда их передали. Отсутствующий ключ
+        # 1С не трогает, пустой список честно вычищает зеркало: обрезанный запрос не должен
+        # стирать выбор админа, а снимок без форматов — должен.
+        if sheets is not None:
+            payload["sheets"] = sheets
+        return self._post_json("/get-products/set-model-state", payload)
 
     def by_tm_all(self, tm_code: str | None, size: int | None = None, max_pages: int = 500,
                   include_not_exported: bool = False,

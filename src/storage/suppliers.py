@@ -262,13 +262,17 @@ class SupplierStore:
                 return Signature(row[0], row[1], row[2], sample_name or row[3],
                                  purpose or row[4], row[5], now)
 
+            # Список листов пишется и ПРИ СОЗДАНИИ, а не только при повторной встрече:
+            # первый файл формата — как раз тот, на котором листы и становятся известны,
+            # и без этого выбирать их было бы не из чего до второго прайса.
             cur = await db.execute(
                 "INSERT INTO supplier_signature (supplier_id, signature, sample_name, "
-                "purpose, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
-                (supplier_id, signature, sample_name, purpose, now, now))
+                "purpose, sheet_list, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (supplier_id, signature, sample_name, purpose,
+                 (sheet_list or "").strip(), now, now))
             await db.commit()
             return Signature(cur.lastrowid, supplier_id, signature, sample_name,
-                             purpose, now, now)
+                             purpose, now, now, "", (sheet_list or "").strip())
 
     async def find_signatures(self, signature: str) -> list[Signature]:
         """ВСЕ владельцы этой сигнатуры.
@@ -305,6 +309,23 @@ class SupplierStore:
             cur = await db.execute(
                 "UPDATE supplier_signature SET sheets = ? WHERE id = ?",
                 ((sheets or "").strip(), signature_id))
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def set_sheets_by_signature(self, signature: str, sheets: str) -> bool:
+        """То же, но адресуясь ХЕШОМ сигнатуры — так её знает форма 1С.
+
+        Правим ВСЕ записи с этим хешом. Он может принадлежать двум поставщикам (скелеты
+        совпали случайно), и выбрав одну запись, мы получили бы формат, который ведёт себя
+        по-разному в зависимости от того, чей файл пришёл, — различить их админу было бы
+        нечем, потому что в форме он видит один набор листов.
+        """
+        if not signature:
+            return False
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE supplier_signature SET sheets = ? WHERE signature = ?",
+                ((sheets or "").strip(), signature))
             await db.commit()
             return cur.rowcount > 0
 

@@ -38,7 +38,7 @@ class FakeOnec:
         self.states.append(list(items))
         return {"updated": len(items), "results": []}
 
-    def set_model_state(self, prices):
+    def set_model_state(self, prices, sheets=None):
         self.snapshots.append(prices)
         return {"version": len(self.snapshots), "prices": len(prices), "changed": 1}
 
@@ -172,7 +172,7 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         onec = FakeOnec()
         broken = []
 
-        def fail(prices):
+        def fail(prices, sheets=None):
             broken.append(prices)
             raise RuntimeError("сеть моргнула")
 
@@ -308,7 +308,8 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         """
         onec = FakeOnec([command()])
         order = []
-        onec.set_model_state = lambda prices: order.append("снимок") or {"version": 1}
+        onec.set_model_state = (lambda prices, sheets=None:
+                                order.append("снимок") or {"version": 1})
         onec.agent_commands_state = lambda items: order.append(
             "судьба:" + items[0]["state"]) or {"updated": len(items)}
 
@@ -343,7 +344,7 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
             def agent_commands_state(self, items):
                 raise RuntimeError("1С недоступна")
 
-            def set_model_state(self, prices):
+            def set_model_state(self, prices, sheets=None):
                 raise RuntimeError("1С недоступна")
 
         provider = self.make(Dead())
