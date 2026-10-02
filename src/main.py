@@ -144,6 +144,19 @@ async def main() -> None:
         known_columns = {row.get("sheet", ""): (row.get("mapping") or {})
                          for row in await pricing_store.get_mappings(signature)}
 
+        # КАКИЕ ЛИСТЫ РАЗБИРАТЬ — указание админа, привязанное к СИГНАТУРЕ формата
+        # (`/signature_sheets`). У FLOOR SERVICE четырнадцать листов, по делу два-три, и
+        # каждый лишний стоит и токенов, и кругов цикла.
+        only_sheets = await supplier_store.sheets_for(signature)
+
+        async def note(text):
+            """Что разобрали и что пропустили — сообщением админу. Отдельно от задач:
+            по их списку не видно, обошли прайс целиком или треть его."""
+            from src.model.events import Event, EventKind
+
+            await model.events.publish(Event(
+                EventKind.TASKS_REBUILT, price_id=price.id, text=text))
+
         async def remember_columns(by_sheet):
             for sheet, spec in (by_sheet or {}).items():
                 await pricing_store.save_mapping(
@@ -159,7 +172,8 @@ async def main() -> None:
                            remember=remember,
                            scope=[c["category"] for c in await pricing_store.list_scope()],
                            known_columns=known_columns,
-                           remember_columns=remember_columns)
+                           remember_columns=remember_columns,
+                           only_sheets=only_sheets, note=note)
 
     async def run_task(price, task, content, guard):
         """Выполнение задачи агентом (§6.2) — С НАСТОЯЩЕЙ ЗАПИСЬЮ в 1С.

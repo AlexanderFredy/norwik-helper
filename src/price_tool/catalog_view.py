@@ -89,6 +89,12 @@ def render_signatures(rows, owner_names: dict[int, str] | None = None,
                      f"{n} {_plural(n, 'файл', 'файла', 'файлов')}")
         lines.append(f"   впервые {human_dt(sig.first_seen)}, "
                      f"последний раз {human_dt(sig.last_seen)}")
+        # ОГРАНИЧЕНИЕ ПО ЛИСТАМ ПОКАЗЫВАЕМ ЗДЕСЬ. Оно экономит токены, но делает разбор
+        # неполным по замыслу — и если его не видно в списке форматов, админ однажды будет
+        # искать, почему по прайсу нет задач по половине марок.
+        only = (getattr(sig, "sheets", "") or "").strip()
+        if only:
+            lines.append(f"   разбираем только листы: {only}")
     return "\n".join(lines)
 
 

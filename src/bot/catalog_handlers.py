@@ -322,6 +322,45 @@ async def cmd_empty_collections(message: Message, command: CommandObject,
         await message.answer(part)
 
 
+@router.message(Command("signature_sheets"))
+async def cmd_signature_sheets(message: Message, command: CommandObject,
+                               supplier_store: SupplierStore, is_admin: bool) -> None:
+    """Какие листы разбирать у этого формата прайса.
+
+    УКАЗАНИЕ ЖИВЁТ У СИГНАТУРЫ, а не у файла: следующий прайс того же поставщика придёт с
+    теми же листами, и повторять указание на каждый файл незачем.
+
+    Пустой список листов снимает ограничение — отдельной команды «разрешить всё» не надо:
+    она отличалась бы от этой только отсутствием аргумента, то есть ничем.
+    """
+    if not is_admin:
+        return await _deny(message)
+
+    parts = (command.args or "").strip().split(maxsplit=1)
+    every = await supplier_store.list_signatures()
+    target = _pick(every, parts[0]) if parts else None
+    if target is None:
+        await message.answer(
+            "Нужен номер из /signatures и листы через запятую:\n"
+            "/signature_sheets 2 ЛАМИНАТ, SPC\n\n"
+            "Без листов — снять ограничение: /signature_sheets 2")
+        return
+
+    sheets = parts[1].strip() if len(parts) > 1 else ""
+    await supplier_store.set_signature_sheets(target.id, sheets)
+
+    label = view.signature_label(target)
+    if not sheets:
+        await message.answer(f"Ограничение снято: формат «{label}» будет разбираться "
+                             "целиком, все листы.")
+        return
+    await message.answer(
+        f"Формат «{label}»: разбираем только листы — {sheets}.\n\n"
+        "Имена сверяются без учёта регистра и пробелов. Если ни один не совпадёт с файлом, "
+        "ограничение в тот раз не применится, а агент скажет об этом в отчёте — "
+        "молча разобрать ноль листов значило бы выдать «работы нет».")
+
+
 # ------------------------------------------------------------ дайджест по фото
 
 # Имя команды — как его задал админ (30.09.2026). Правильное написание принимается вторым:

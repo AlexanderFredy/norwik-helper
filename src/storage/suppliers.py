@@ -46,6 +46,11 @@ CREATE TABLE IF NOT EXISTS supplier_signature (
     signature   TEXT NOT NULL,          -- хеш скелета из price_signature()
     sample_name TEXT,                   -- имя файла, на котором сигнатуру впервые увидели
     purpose     TEXT,                   -- «ламинат», «плитка» — чем этот прайс отличается
+    -- КАКИЕ ЛИСТЫ РАЗБИРАТЬ. Пусто = все. Это УКАЗАНИЕ АДМИНА, а не наблюдение: у FLOOR
+    -- SERVICE четырнадцать листов, из них по делу два-три, а разбор каждого лишнего стоит
+    -- и токенов, и кругов цикла. Живёт у СИГНАТУРЫ, потому что это свойство формата:
+    -- следующий файл того же поставщика придёт с теми же листами.
+    sheets      TEXT,
     first_seen  TEXT NOT NULL,
     last_seen   TEXT NOT NULL,
     UNIQUE (supplier_id, signature)
@@ -85,6 +90,8 @@ class Signature:
     purpose: str | None
     first_seen: str
     last_seen: str
+    #: Листы, которые разбирать, через запятую. Пусто — все.
+    sheets: str = ""
 
 
 @dataclass(frozen=True)
@@ -114,6 +121,12 @@ class SupplierStore:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self._db_path) as db:
             await db.executescript(_SCHEMA)
+            # Колонку завели позже самой таблицы: у работающей базы её нет, и без
+            # дописывания все запросы к сигнатурам упали бы разом.
+            cur = await db.execute("PRAGMA table_info(supplier_signature)")
+            have = {row[1] for row in await cur.fetchall()}
+            if have and "sheets" not in have:
+                await db.execute("ALTER TABLE supplier_signature ADD COLUMN sheets TEXT")
             await db.commit()
 
     # ------------------------------------------------------------ поставщики
@@ -263,9 +276,41 @@ class SupplierStore:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
                 "SELECT id, supplier_id, signature, sample_name, purpose, first_seen, "
-                "last_seen FROM supplier_signature" + where + " ORDER BY first_seen, id",
-                params)
+                "last_seen, COALESCE(sheets, '') FROM supplier_signature"
+                + where + " ORDER BY first_seen, id", params)
             return [Signature(*row) for row in await cur.fetchall()]
+
+    async def set_signature_sheets(self, signature_id: int, sheets: str) -> bool:
+        """Какие листы разбирать у этого формата. Пустая строка — снять ограничение.
+
+        Храним КАК НАПИСАЛ АДМИН, без приведения к какому-то виду: имена листов сверяются
+        с файлом нестрого (регистр и пробелы), а показывать надо то, что он задал, — иначе
+        он не узнает в списке собственное указание.
+        """
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE supplier_signature SET sheets = ? WHERE id = ?",
+                ((sheets or "").strip(), signature_id))
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def sheets_for(self, signature: str) -> str:
+        """Листы по ХЕШУ сигнатуры — так её знает прайс на входе.
+
+        Сигнатура может принадлежать двум поставщикам (скелеты совпали случайно), поэтому
+        берём первое непустое указание: хоть одно заданное ограничение лучше, чем никакого,
+        а разные указания на один скелет — повод для разбирательства, а не для тишины.
+        """
+        if not signature:
+            return ""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT COALESCE(sheets, '') FROM supplier_signature "
+                "WHERE signature = ? ORDER BY id", (signature,))
+            for (value,) in await cur.fetchall():
+                if (value or "").strip():
+                    return value.strip()
+        return ""
 
     async def move_signature(self, signature_id: int, supplier_id: int) -> bool:
         """Перепривязать сигнатуру к другому поставщику (§2.3).

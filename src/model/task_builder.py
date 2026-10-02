@@ -251,7 +251,8 @@ class TaskBuilderTools:
 
     def __init__(self, content: bytes, filename: str, onec=None,
                  elsewhere: dict | None = None, scope=None,
-                 known_columns: dict | None = None) -> None:
+                 known_columns: dict | None = None,
+                 only_sheets: str = "") -> None:
         self._content = content
         self._filename = filename
         self._onec = onec
@@ -266,6 +267,23 @@ class TaskBuilderTools:
         # вовсе, и у Линдервуда с двумя колонками закупки (самовывоз и с доставкой) агент
         # выбирал заново каждую пересборку (вопрос админа 28.09.2026).
         self._known_columns = {str(k): dict(v) for k, v in (known_columns or {}).items()}
+        # УКАЗАНИЕ АДМИНА: какие листы разбирать. Хранится у сигнатуры формата, то есть
+        # действует и на следующий файл того же поставщика. У FLOOR SERVICE четырнадцать
+        # листов, по делу два-три, и каждый лишний стоит и токенов, и кругов цикла.
+        self._only = [n.strip() for n in (only_sheets or "").split(",") if n.strip()]
+        # Что в итоге разобрали и что пропустили — для отчёта админу. Считает КОД: он
+        # знает это точно, а пересказ модели однажды разойдётся с правдой.
+        self.parsed_sheets: list[str] = []
+        self.skipped_sheets: list[str] = []
+        self.unknown_sheets: list[str] = []
+        # Листы, которые агент РЕАЛЬНО прочитал. «Проанализировал» — это про них, а не про
+        # те, что ему предложили: лист можно было не открыть вовсе, и админ должен видеть
+        # разницу между «исключил я» и «агент сам не стал смотреть».
+        self.read_sheets: list[str] = []
+        # Указание не совпало НИ ОДНИМ листом и потому снято целиком. Отличать это от
+        # частичного промаха обязательно: там ограничение применилось, и сказать «не
+        # применялось» значило бы соврать ровно о том, что админ и проверяет.
+        self.instruction_dropped = False
         # Артикул → где его видели у ДРУГИХ поставщиков (`storage/sightings.py`). Снимок
         # берётся один раз перед ходом: спрашивать базу из синхронного кода инструментов
         # неоткуда, а таблица мала.
@@ -304,11 +322,46 @@ class TaskBuilderTools:
     def sheets(self):
         if self._sheets is None:
             try:
-                self._sheets = list(parse_price_table(self._content, self._filename) or [])
+                every = list(parse_price_table(self._content, self._filename) or [])
             except Exception:                           # noqa: BLE001
                 logger.warning("Не разобрался прайс %s", self._filename, exc_info=True)
-                self._sheets = []
+                every = []
+            self._sheets = self._pick(every)
         return self._sheets
+
+    def _pick(self, every: list) -> list:
+        """Оставить листы, которые велел разбирать админ.
+
+        **ПУСТОЕ ПЕРЕСЕЧЕНИЕ — ЭТО РАЗБИРАЕМ ВСЁ, А НЕ НИЧЕГО.** Поставщик переименует
+        лист, и указание, заданное месяц назад, перестанет совпадать. Разобрав ноль листов,
+        мы получили бы ноль задач — а ноль задач в этой модели законный результат, он
+        означает «расхождений нет». Тихо выдать «работы нет» вместо «я не нашёл ни одного
+        названного листа» — худшее, что тут можно сделать, поэтому ограничение снимается, а
+        о промахе говорится вслух.
+
+        Имена сверяются без учёта регистра и крайних пробелов: админ набирает их руками.
+        """
+        names = [s.name for s in every]
+        if not self._only:
+            self.parsed_sheets = list(names)
+            return every
+
+        wanted = {n.strip().lower() for n in self._only}
+        chosen = [s for s in every if s.name.strip().lower() in wanted]
+        found = {s.name.strip().lower() for s in chosen}
+        self.unknown_sheets = [n for n in self._only if n.strip().lower() not in found]
+
+        if not chosen:
+            # НИ ОДИН лист не совпал — указание снято целиком, и это надо отличать от
+            # частичного промаха: там ограничение как раз применилось.
+            self.instruction_dropped = True
+            self.parsed_sheets = list(names)
+            self.skipped_sheets = []
+            return every
+
+        self.parsed_sheets = [s.name for s in chosen]
+        self.skipped_sheets = [s.name for s in every if s not in chosen]
+        return chosen
 
     async def execute(self, name: str, inp: dict):
         try:
@@ -332,11 +385,22 @@ class TaskBuilderTools:
             return ("Файл не разобрался. Заводи задачи по тому, что известно из имени "
                     "файла, и скажи об этом в описании.")
         wanted = (inp.get("sheet") or "").strip().lower()
-        sheet = next((s for s in self.sheets if s.name.lower() == wanted), None) \
-            or self.sheets[0]
+        sheet = next((s for s in self.sheets if s.name.lower() == wanted), None)
+
+        # ИСКЛЮЧЁННЫЙ ЛИСТ НАЗЫВАЕМ ИСКЛЮЧЁННЫМ, а не подсовываем первый попавшийся. Молча
+        # подменив лист, мы заставили бы агента искать ламинат в листе «АКЦИИ» и потом
+        # объяснять в задаче, почему там ничего нет.
+        if wanted and sheet is None and any(
+                name.strip().lower() == wanted for name in self.skipped_sheets):
+            return (f"Лист «{inp.get('sheet')}» исключён указанием админа по этому формату. "
+                    f"Разбираем только: {', '.join(s.name for s in self.sheets)}.")
+
+        sheet = sheet or self.sheets[0]
         start = max(1, int(inp.get("from_row") or 1))
 
         self._last_sheet = sheet.name
+        if sheet.name not in self.read_sheets:
+            self.read_sheets.append(sheet.name)
         head = (f"Листы: {', '.join(s.name for s in self.sheets)}\n"
                 f"=== Лист: {sheet.name} === (со строки {start})\n")
         return head + self._remembered(sheet.name) \
@@ -1831,11 +1895,51 @@ def fix_marks(tasks: list[PriceTask], owners: dict[str, set]) -> list[str]:
     return notes
 
 
+def sheets_report(tools) -> str:
+    """Что разобрали, что исключили, что осталось нетронутым.
+
+    ТРИ ГРУППЫ, А НЕ ДВЕ, и это не педантизм. «Исключено указанием» — решение админа, и он
+    о нём знает. «Осталось нетронутым» — выбор самого агента: лист ему предложили, а он не
+    открыл. Второе бывает и ошибкой (прайс на три листа, агент обошёл один — бой
+    24.09.2026), и слить это с первым значило бы спрятать её за собственным же указанием.
+
+    Пустые группы не пишутся: строка «исключено: —» не сообщает ничего.
+    """
+    lines = []
+    if tools.read_sheets:
+        lines.append("Проанализировал листы: " + ", ".join(tools.read_sheets) + ".")
+    else:
+        lines.append("Ни одного листа не открыл.")
+
+    if tools.skipped_sheets:
+        lines.append("Исключены указанием по этому формату: "
+                     + ", ".join(tools.skipped_sheets) + ".")
+
+    untouched = [n for n in tools.parsed_sheets if n not in tools.read_sheets]
+    if untouched:
+        lines.append("Остались нетронутыми: " + ", ".join(untouched) + ".")
+
+    # ПРОМАХ УКАЗАНИЯ НАЗЫВАЕМ ГРОМКО. Поставщик переименует лист — и указание, заданное
+    # месяц назад, перестанет совпадать. Ограничение в этом случае снимается целиком
+    # (см. `_pick`), то есть разбор пройдёт шире ожидаемого, и узнать об этом админ должен
+    # сразу, а не по счёту токенов.
+    if tools.unknown_sheets:
+        tail = (" Ни один названный лист не совпал, поэтому ограничение на этот раз "
+                "не применялось — разобрал всё."
+                if getattr(tools, "instruction_dropped", False)
+                else " Остальные названные листы совпали, ограничение применено.")
+        lines.append("⚠️ В указании названы листы, которых в файле нет: "
+                     + ", ".join(tools.unknown_sheets)
+                     + "." + tail + " Поправить: /signature_sheets.")
+    return "\n".join(lines)
+
+
 async def build(orchestrator, content: bytes, filename: str, onec=None,
                 usage_labels: dict | None = None,
                 elsewhere: dict | None = None,
                 remember=None, scope=None, known_columns=None,
-                remember_columns=None) -> tuple[list[PriceTask], str]:
+                remember_columns=None, only_sheets: str = "",
+                note=None) -> tuple[list[PriceTask], str]:
     """Прогон формирования задач. Возвращает (задачи, короткий ответ агента).
 
     Пустой список — не ошибка: агент мог не найти, за что зацепиться. Вызывающий решает,
@@ -1846,7 +1950,8 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
     без них поведение прежнее, то есть «нет в прайсе — кандидат в снятые».
     """
     tools = TaskBuilderTools(content, filename, onec=onec, elsewhere=elsewhere,
-                             scope=scope, known_columns=known_columns)
+                             scope=scope, known_columns=known_columns,
+                             only_sheets=only_sheets)
     task = f"Прайс «{filename}». Составь список задач по нему."
 
     answer, _ = await orchestrator.handle_turn(
@@ -1888,6 +1993,20 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
             await remember_columns(dict(tools._price_cols))
         except Exception:                               # noqa: BLE001
             logger.warning("Не удалось запомнить колонки прайса", exc_info=True)
+
+    # ЧТО РАЗОБРАЛИ И ЧТО НЕТ — ОТДЕЛЬНЫМ СООБЩЕНИЕМ АДМИНУ (решение админа 02.10.2026).
+    #
+    # Указание «смотреть только эти листы» экономит токены, но делает молчаливым: по списку
+    # задач не видно, обошли прайс целиком или треть его. Сообщение закрывает ровно это, и
+    # составляет его КОД — он знает, какие листы агент открывал, а пересказ модели однажды
+    # разойдётся с правдой.
+    if note is not None:
+        said = sheets_report(tools)
+        if said:
+            try:
+                await note(said)
+            except Exception:                           # noqa: BLE001
+                logger.warning("Не удалось доложить о листах прайса", exc_info=True)
 
     # СВЕРКА МАРОК ПО 1С — ПОСЛЕ хода и БЕЗ участия модели.
     #
