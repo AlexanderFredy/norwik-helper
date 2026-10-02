@@ -143,6 +143,14 @@ class Command:
         if self.kind == CommandKind.RENAME_SUPPLIER:
             return None
 
+        # ВЫБОР ЛИСТОВ НЕ СХЛОПЫВАЕТСЯ, хотя номер прайса у него есть. Номер нужен ему
+        # ТОЛЬКО для адресации визуала: по нему форма гасит кнопки и показывает надпись
+        # «Записываю список листов…» (решение админа 02.10.2026). Объект же у команды
+        # другой — СИГНАТУРА формата, и схлопнувшись с «сменить статус прайса 6», она
+        # потеряла бы одно из двух несвязанных решений админа.
+        if self.kind == CommandKind.SET_SIGNATURE_SHEETS:
+            return None
+
         target = self.task_id if self.task_id is not None else self.price_id
         if target is None:
             return None
