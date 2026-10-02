@@ -380,3 +380,88 @@ class CommandTest(unittest.IsolatedAsyncioTestCase):
     async def test_without_signature_is_refused(self):
         await self.send({"sheets": ["ЛАМИНАТ"]})
         self.assertEqual(await self.store.sheets_for("hash-1"), "")
+
+
+class BackfillTest(unittest.IsolatedAsyncioTestCase):
+    """Дозаполнение листов у форматов, заведённых до появления этой памяти.
+
+    Файлы прайсов лежат на диске, и сигнатура у формата от них же и посчитана: значит имена
+    листов не потеряны — их достаточно прочитать (бой 02.10.2026, пять форматов).
+    """
+
+    async def asyncSetUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.root = Path(self._dir.name)
+        self.store = SupplierStore(self.root / "t.db")
+        await self.store.init()
+        supplier = await self.store.add_supplier("FLOOR SERVICE")
+        self.sig = await self.store.add_signature(supplier.id, "hash-1",
+                                                  sample_name="прайс.xlsx")
+
+    async def asyncTearDown(self):
+        self._dir.cleanup()
+
+    def workbook(self, *names):
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        wb.active.title = names[0]
+        for extra in names[1:]:
+            wb.create_sheet(extra)
+        path = self.root / "прайс.xlsx"
+        wb.save(path)
+        return path
+
+    async def add_file(self, path, received_at="2026-09-01T00:00:00"):
+        return await self.store.add_price_file(self.sig.id, path.name, str(path),
+                                              received_at=received_at)
+
+    async def run_fill(self):
+        from src.model.sheet_backfill import fill_sheet_lists
+
+        return await fill_sheet_lists(self.store)
+
+    async def test_names_are_read_from_the_file(self):
+        await self.add_file(self.workbook("ЛАМИНАТ", "SPC"))
+        self.assertEqual(await self.run_fill(), 1)
+        self.assertEqual((await self.store.list_signatures())[0].sheet_list,
+                         "ЛАМИНАТ, SPC")
+
+    async def test_existing_list_is_not_touched(self):
+        """Свежий приём всегда главнее починки: перезаписав, мы вернули бы устаревший
+        список из старого файла."""
+        await self.store.set_signature_sheets(self.sig.id, "ЛАМИНАТ")
+        await self.store.add_signature(self.sig.supplier_id, "hash-1",
+                                       sheet_list="ЛАМИНАТ, SPC")
+        await self.add_file(self.workbook("СОВСЕМ", "ДРУГИЕ"))
+        self.assertEqual(await self.run_fill(), 0)
+        self.assertEqual((await self.store.list_signatures())[0].sheet_list,
+                         "ЛАМИНАТ, SPC")
+
+    async def test_newest_file_wins(self):
+        """Поставщик добавляет и убирает листы: список месячной давности предложил бы
+        выбрать тот, которого в прайсе давно нет."""
+        import openpyxl
+
+        old = self.root / "старый.xlsx"
+        wb = openpyxl.Workbook()
+        wb.active.title = "СТАРЫЙ"
+        wb.save(old)
+        await self.add_file(old, received_at="2026-01-01T00:00:00")
+        await self.add_file(self.workbook("НОВЫЙ"), received_at="2026-09-09T00:00:00")
+
+        await self.run_fill()
+        self.assertEqual((await self.store.list_signatures())[0].sheet_list, "НОВЫЙ")
+
+    async def test_missing_file_is_skipped_without_a_crash(self):
+        await self.store.add_price_file(self.sig.id, "нет.xlsx",
+                                        str(self.root / "нет.xlsx"))
+        self.assertEqual(await self.run_fill(), 0)
+
+    async def test_format_without_files_is_skipped(self):
+        self.assertEqual(await self.run_fill(), 0)
+
+    async def test_running_twice_is_free(self):
+        await self.add_file(self.workbook("ЛАМИНАТ"))
+        self.assertEqual(await self.run_fill(), 1)
+        self.assertEqual(await self.run_fill(), 0)

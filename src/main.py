@@ -92,6 +92,15 @@ async def main() -> None:
              | await model_store.known_paths())
     price_files.sweep(config.db_path, known)
 
+    # ЛИСТЫ ФОРМАТОВ, заведённых до появления этой памяти, дозаполняем из файлов на диске:
+    # иначе форма выбора листов открывается у них пустой таблицей, и видно только то, что
+    # выбирать не из чего, — а почему, не видно (бой 02.10.2026).
+    from src.model.sheet_backfill import fill_sheet_lists
+
+    filled = await fill_sheet_lists(supplier_store)
+    if filled:
+        logger.info("Листы форматов дозаполнены: %d", filled)
+
     # Журнал наблюдений за фото: по нему считается прогресс, а не снимок «48 без фото».
     photo_watch = PhotoWatchStore(config.db_path)
     await photo_watch.init()
