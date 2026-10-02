@@ -113,5 +113,39 @@ class FormQueryTest(unittest.TestCase):
                          f"{sorted(missing)} — колонка будет всегда пустой, без ошибки")
 
 
+class CommandPayloadTest(unittest.TestCase):
+    """Нагрузка команды обязана уезжать СТРОКОЙ, а не структурой (бой 02.10.2026).
+
+    `Данные` в регистре `ии_МодельКоманды` — строка, и `ПоставитьКоманду` кладёт в неё то,
+    что дали, без преобразования. Передав структуру, форма записывает команду с нагрузкой,
+    из которой агент не достаёт ничего, и честно её отклоняет — а выглядит это как успех:
+    форма закрылась, надпись погасла, выбор листов «сохранился» в пустоту. Свёртка — это
+    `ДанныеКомандыВСтроку`.
+
+    Проверяем ровно то, что было нарушено: четвёртый аргумент вызова не должен быть
+    переменной, которой в этой же процедуре присвоили `Новый Структура`.
+    """
+
+    FORMS = ("model-form-module.bsl", "model-sheets-form-module.bsl")
+
+    CALL = re.compile(r"ПоставитьКоманду\(\s*([^)]*?)\)", re.S)
+
+    def test_payload_is_serialised(self):
+        for name in self.FORMS:
+            text = (BSL.parent / name).read_text(encoding="utf-8")
+            structures = set(re.findall(
+                r"^\s*([А-Яа-яЁёA-Za-z_]+)\s*=\s*Новый Структура", text, re.M))
+            for call in self.CALL.finditer(text):
+                args = [a.strip() for a in call.group(1).split(",")]
+                if len(args) < 4:
+                    continue
+                payload = args[3]
+                self.assertNotIn(
+                    payload, structures,
+                    f"{name}: в ПоставитьКоманду четвёртым аргументом уезжает структура "
+                    f"«{payload}» — поле `Данные` строковое, нагрузка потеряется молча. "
+                    f"Свернуть через ДанныеКомандыВСтроку.")
+
+
 if __name__ == "__main__":
     unittest.main()
