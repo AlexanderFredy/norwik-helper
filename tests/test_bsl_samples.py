@@ -127,8 +127,7 @@ class CommandPayloadTest(unittest.TestCase):
     переменной, которой в этой же процедуре присвоили `Новый Структура`.
     """
 
-    FORMS = ("model-form-module.bsl", "model-sheets-form-module.bsl",
-             "model-brands-form-module.bsl")
+    FORMS = ("model-form-module.bsl", "model-format-form-module.bsl")
 
     CALL = re.compile(r"ПоставитьКоманду\(\s*([^)]*?)\)", re.S)
 

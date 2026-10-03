@@ -278,6 +278,91 @@ class CommandTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.store.marks_wanted("hash-1"), [])
 
 
+class FormatCommandTest(unittest.IsolatedAsyncioTestCase):
+    """ОДНА команда на оба списка — единая форма формата (решение админа 03.10.2026).
+
+    Двумя командами это не сделать: адрес у них одинаковый (прайс и задача 0), и защита от
+    второго нажатия в 1С отклонила бы вторую с «по этому прайсу уже отправлена команда» —
+    половина выбора молча не доехала бы.
+    """
+
+    async def asyncSetUp(self):
+        from src.model.service import PriceListService
+        from src.storage import price_files
+        from src.storage.model_store import ModelStore
+
+        self._dir = tempfile.TemporaryDirectory()
+        db = Path(self._dir.name) / "t.db"
+        self.model_store = ModelStore(db)
+        await self.model_store.init()
+        self.store = SupplierStore(db)
+        await self.store.init()
+        supplier = await self.store.add_supplier("Керамика")
+        await self.store.add_signature(supplier.id, "hash-1",
+                                       sheet_list="TDSheet, АКЦИИ")
+        await self.store.remember_marks("hash-1", [("ABK", 22, "", ""),
+                                                   ("VitrA", 202, "", "")])
+        self.model = PriceListService(
+            self.model_store, self.store,
+            save_file=lambda content, name: price_files.save(db, name, content))
+        await self.model.load()
+
+    async def asyncTearDown(self):
+        self._dir.cleanup()
+
+    async def send(self, payload):
+        await self.model.apply(Command(kind=CommandKind.SET_SIGNATURE_FORMAT,
+                                       source="1c", actor="1c:Саша", payload=payload))
+
+    async def test_both_lists_are_saved_at_once(self):
+        await self.send({"signature": "hash-1",
+                         "sheets": ["TDSheet"],
+                         "marks": [{"brand": "ABK", "parse": True, "discount": 17.5},
+                                   {"brand": "VitrA", "parse": False}],
+                         "currency": "978", "currency_name": "EUR", "rate": 98.4})
+
+        self.assertEqual(await self.store.sheets_for("hash-1"), "TDSheet")
+        self.assertEqual(await self.store.marks_wanted("hash-1"), ["ABK"])
+        self.assertEqual(await self.store.last_currency("hash-1"),
+                         {"code": "978", "name": "EUR", "rate": 98.4})
+
+    async def test_missing_key_does_not_wipe_the_choice(self):
+        """Отсутствующий ключ — «про это ничего не сказано», пустой список — «ничего не
+        отмечено». Путать нельзя: обрезанная команда стёрла бы выбор админа."""
+        await self.send({"signature": "hash-1", "sheets": ["TDSheet"],
+                         "marks": [{"brand": "ABK", "parse": True}]})
+
+        await self.send({"signature": "hash-1", "marks": [{"brand": "ABK",
+                                                           "parse": False}]})
+
+        self.assertEqual(await self.store.sheets_for("hash-1"), "TDSheet")
+        self.assertEqual(await self.store.marks_wanted("hash-1"), [])
+
+    async def test_empty_lists_are_a_legal_choice(self):
+        """«Не разбирать этот формат» — законное решение, а не промах."""
+        await self.send({"signature": "hash-1", "sheets": [], "marks": []})
+        self.assertEqual(await self.store.sheets_for("hash-1"), "")
+        self.assertEqual(await self.store.marks_wanted("hash-1"), [])
+
+    async def test_unknown_signature_is_refused(self):
+        await self.send({"signature": "нет-такого", "sheets": ["TDSheet"]})
+        self.assertEqual(await self.store.sheets_for("hash-1"), "")
+
+    async def test_command_without_lists_is_refused(self):
+        """Ни листов, ни брендов — команде нечего применять, и она отклоняется: курс без
+        выбора ехал бы отдельной полуправдой."""
+        await self.send({"signature": "hash-1", "rate": 98})
+        got = await self.store.last_currency("hash-1")
+        self.assertIsNone(got["rate"])
+
+    async def test_it_does_not_collapse_in_the_queue(self):
+        """Номер прайса у неё есть, но объект — СИГНАТУРА: схлопнувшись с «сменить статус
+        прайса», она потеряла бы одно из двух несвязанных решений."""
+        command = Command(kind=CommandKind.SET_SIGNATURE_FORMAT, price_id=6,
+                          payload={"signature": "hash-1"})
+        self.assertIsNone(command.coalesce_key())
+
+
 class TelegramTest(unittest.IsolatedAsyncioTestCase):
     """Команда `/signature_marks` — отмечать можно и до выкладки формы в 1С."""
 
