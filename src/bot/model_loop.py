@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from src.model.commands import plan_batch
+from src.model.commands import group_by_actor, plan_batch
 
 logger = logging.getLogger(__name__)
 
@@ -99,12 +99,14 @@ class AgentLoop:
 
         # Занятость считается ОТДЕЛЬНО ДЛЯ КАЖДОГО инициатора: свой захват админа не
         # блокирует, чужой блокирует (§5.1). Общего набора «занятых» не существует.
+        #
+        # ГРУППЫ ОБХОДИМ ПО ВРЕМЕНИ НАЖАТИЯ (`group_by_actor`), а не по тому, как строки
+        # легли в очередь: первая группа берёт захват, вторая получает «прайс занят
+        # другим администратором». По порядку очереди выигрывал бы тот, чьего провайдера
+        # опросили раньше, — то самое, что правило «кто первый» (§7) и запрещает.
         applied = 0
-        by_actor: dict[str, list] = {}
-        for command in batch:
-            by_actor.setdefault(command.actor, []).append(command)
 
-        for actor, commands in by_actor.items():
+        for actor, commands in group_by_actor(batch):
             run, rejected = plan_batch(commands, self._service.busy_for(actor))
             for refusal in rejected:
                 await self._service.reject(refusal)

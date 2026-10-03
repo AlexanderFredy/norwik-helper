@@ -9,7 +9,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from src.model.commands import (Command, CommandKind, order_batch, plan_batch,
+from src.model.commands import (Command, CommandKind, group_by_actor,
+                                order_batch, plan_batch,
                                 sort_time)
 from src.storage.command_queue import CommandQueue
 
@@ -43,13 +44,53 @@ class PlanTest(unittest.TestCase):
         a.id, b.id = 7, 3
         self.assertEqual([c.id for c in order_batch([a, b])], [3, 7])
 
-    def test_first_wins_among_exclusive_commands(self):
+    def test_different_tasks_of_one_price_run_together(self):
+        """Решение админа 03.10.2026, сменившее решение от 14.09.2026.
+
+        Прежде правило «кто первый» брало прайс ЦЕЛИКОМ, и из пяти отмеченных в форме
+        задач выполнялась одна, а четыре получали «прайс занят» — отказ по действию,
+        которое админ сделал осознанно и одним нажатием «Выполнить». Объекты у этих команд
+        не пересекаются, конфликта нет.
+
+        Разрешение попасть в один оборот — НЕ разрешение писать в 1С разом: служба
+        применяет команды пачки последовательно (`AgentLoop._tick`).
+        """
         first = cmd(task=1, at=at_s(1))
         second = cmd(task=2, at=at_s(2))
+        third = cmd(task=3, at=at_s(3))
+        run, rejected = plan_batch([third, first, second])
+        self.assertEqual(run, [first, second, third])
+        self.assertEqual(rejected, [])
+
+    def test_two_commands_on_the_same_task_still_compete(self):
+        """Схлопывание в очереди такого не оставляет, но команды из РАЗНЫХ визуалов
+        схлопнуться могут не успеть: объект один, решение должно быть одно."""
+        first = cmd(task=1, at=at_s(1), source="1c")
+        second = cmd(task=1, at=at_s(2), source="telegram")
         run, rejected = plan_batch([second, first])
         self.assertEqual(run, [first])
-        self.assertEqual(len(rejected), 1)
+        self.assertIn("по этой задаче", rejected[0].reason)
+
+    def test_price_command_takes_the_price_whole(self):
+        """Команда по ПРАЙСУ меняет то, на что смотрят все его задачи: соседство с их
+        выполнением дало бы разный результат в зависимости от того, что успело первым."""
+        status = cmd(kind=CommandKind.SET_PRICE_STATUS, at=at_s(1))
+        one = cmd(task=1, at=at_s(2))
+        two = cmd(task=2, at=at_s(3))
+        run, rejected = plan_batch([one, two, status])
+        self.assertEqual(run, [status])
+        self.assertEqual(len(rejected), 2)
         self.assertIn("занят", rejected[0].reason)
+
+    def test_running_tasks_push_back_a_later_price_command(self):
+        """Обратная сторона того же правила: «кто первый» решает, кто из двух видов."""
+        one = cmd(task=1, at=at_s(1))
+        two = cmd(task=2, at=at_s(2))
+        destroy = cmd(kind=CommandKind.DESTROY_PRICE, at=at_s(3))
+        run, rejected = plan_batch([destroy, one, two])
+        self.assertEqual(run, [one, two])
+        self.assertEqual(rejected[0].command.kind, CommandKind.DESTROY_PRICE)
+        self.assertIn("его задачам", rejected[0].reason)
 
     def test_different_prices_do_not_block_each_other(self):
         a = cmd(price=1, at=at_s(1))
@@ -58,18 +99,18 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(len(run), 2)
         self.assertEqual(rejected, [])
 
-    def test_rule_applies_to_assignments_too(self):
-        """Решение админа от 14.09.2026: «кто первый» — для ВСЕХ команд без исключений.
+    def test_assignments_to_different_tasks_also_go_together(self):
+        """Правило одно для всех видов: разделяет не вид команды, а ОБЪЕКТ.
 
-        Две смены статуса ОДНОГО объекта сюда не доходят — они схлопываются ещё в очереди,
-        и в пачке остаётся одна. Под правило попадают команды к РАЗНЫМ объектам одного
-        прайса.
+        Решение от 14.09.2026 («кто первый» для всех команд) остаётся в силе там, где
+        объект один и тот же, — см. `test_two_commands_on_the_same_task_still_compete`.
+        Смены статуса ОДНОЙ задачи сюда не доходят вовсе: они схлопываются в очереди.
         """
         a = cmd(kind=CommandKind.SET_TASK_STATUS, task=1, at=at_s(1))
         b = cmd(kind=CommandKind.SET_TASK_STATUS, task=2, at=at_s(2))
         run, rejected = plan_batch([a, b])
-        self.assertEqual(run, [a])
-        self.assertEqual(len(rejected), 1)
+        self.assertEqual(run, [a, b])
+        self.assertEqual(rejected, [])
 
     def test_assignment_is_blocked_by_a_busy_price(self):
         """§5.1: пока с прайсом работает один админ, все его задачи закрыты для других."""
@@ -331,17 +372,35 @@ class EndToEndTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self._dir.cleanup()
 
-    async def test_two_admins_on_one_price_first_wins(self):
+    async def test_two_admins_are_ordered_by_press_time(self):
+        """Спор ДВУХ АДМИНОВ решается не в `plan_batch`: он разбирает пачку одного
+        инициатора (занятость считается для каждого своя, §5.1). Решает порядок ГРУПП —
+        первая берёт захват, вторая получает «прайс занят другим администратором».
+
+        Порядок обязан идти от времени НАЖАТИЯ: по порядку очереди выигрывал бы тот, чьего
+        провайдера опросили раньше, а это ровно то, что правило «кто первый» запрещает.
+        """
         await self.q.put(cmd(task=1, actor="admin-1", at=at_s(2),
                              source="telegram"))
         await self.q.put(cmd(task=2, actor="admin-2", at=at_s(1),
                              source="1c"))
 
-        run, rejected = plan_batch(await self.q.take())
+        groups = group_by_actor(await self.q.take())
 
-        # Выиграл тот, кто НАЖАЛ раньше, а не тот, чей провайдер опросили первым.
-        self.assertEqual(run[0].actor, "admin-2")
-        self.assertEqual(rejected[0].command.actor, "admin-1")
+        self.assertEqual([actor for actor, _ in groups], ["admin-2", "admin-1"])
+
+    async def test_one_admin_many_tasks_all_run(self):
+        """Случай админа 03.10.2026: выделил несколько задач, нажал «Выполнить» один раз."""
+        for number in (1, 2, 3):
+            await self.q.put(cmd(task=number, actor="admin-1", at=at_s(number),
+                                 source="1c"))
+
+        groups = group_by_actor(await self.q.take())
+        self.assertEqual(len(groups), 1)
+        run, rejected = plan_batch(groups[0][1])
+
+        self.assertEqual([c.task_id for c in run], [1, 2, 3])
+        self.assertEqual(rejected, [])
 
 
 if __name__ == "__main__":
