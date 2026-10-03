@@ -147,5 +147,41 @@ class CommandPayloadTest(unittest.TestCase):
                     f"Свернуть через ДанныеКомандыВСтроку.")
 
 
+class PlatformFunctionsTest(unittest.TestCase):
+    """В BSL для ЭТОЙ конфигурации нет части функций семейства `Стр*` (бой 03.10.2026).
+
+    Платформа отказалась от `СтрСоединить`; раньше так же отказалась от `СтрНачинаетсяС` и
+    `СтрЗаканчиваетсяНа` (22.09.2026). Ошибка вылезает не при выкладке модуля, а при первом
+    вызове — то есть у админа на рабочей форме, а не у меня.
+
+    Список — ТОЛЬКО подтверждённое админом, а не всё семейство 8.3.6. `СтрРазделить`,
+    например, на сервере работает: пачка `find-items` отвечает живьём (проверено
+    03.10.2026), и запрещать её значило бы выдумать ограничение.
+
+    Своя реализация под тем же именем разрешена — так сделано в `find-items.bsl`.
+    """
+
+    MISSING = ("СтрСоединить", "СтрНачинаетсяС", "СтрЗаканчиваетсяНа")
+
+    def test_no_calls_to_functions_this_platform_lacks(self):
+        for path in sorted(BSL.parent.glob("*.bsl")):
+            text = path.read_text(encoding="utf-8")
+            own = set(re.findall(r"^\s*Функция\s+([А-Яа-яЁёA-Za-z_]+)", text, re.M))
+            # Комментарии не считаем: имена называются в них по делу — ради объяснения,
+            # почему написана своя функция.
+            code = "\n".join(line for line in text.splitlines()
+                             if not line.lstrip().startswith("//"))
+            for name in self.MISSING:
+                if name in own:
+                    continue
+                found = re.search(rf"\b{name}\s*\(", code)
+                self.assertIsNone(
+                    found,
+                    f"{path.name}: вызов «{name}» — платформа этой конфигурации его не "
+                    f"знает, и упадёт это при первом вызове, а не при выкладке. Напишите "
+                    f"свою (образцы: СоединитьСтроки в model-form-module.bsl, "
+                    f"РазделитьСтроку в properties.bsl).")
+
+
 if __name__ == "__main__":
     unittest.main()
