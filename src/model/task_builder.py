@@ -34,9 +34,11 @@ from src.model.enums import TaskKind, TaskSubject
 from src.model.normalize import collection_of
 from src.model.refs import Ref, TaskAddress, norm_article
 from src.model.task import PriceTask
+from src.model import dealer_price
 from src.model import price_check
 from src.price_tool.items import build_name
-from src.price_tool.parser import parse_price_table, render_preview
+from src.price_tool.parser import (non_empty_rows, parse_price_table,
+                                   render_preview)
 from src.price_tool.brands import brands_in, find_brand_column, only_brands
 from src.price_tool.signature import sheet_key
 from src.price_tool.scope import in_scope, normalize
@@ -157,6 +159,9 @@ TOOLS = [
             "1) Цена у каждой позиции своя: передай `price_columns` — где артикул, где "
             "закупка, где РРЦ (номер колонки с единицы либо кусок заголовка). Достаточно "
             "одного раза на лист.\n"
+            "ЗАКУПКИ В ПРАЙСЕ МОЖЕТ НЕ БЫТЬ ВОВСЕ — только розница. Тогда НЕ называй "
+            "розницу закупкой: передай её как `retail` (рублёвую) и `retail_eur` "
+            "(валютную). Закупку посчитает код по скидке дилера и курсу.\n"
             "2) Цена ОДНА НА КОЛЛЕКЦИЮ (так пишут часто: цифры стоят в строке коллекции, "
             "у остальных декоров ячейки пустые): передай `prices` — {purchase, rrc}.\n"
             "Сравнивает код и отвечает полем `цены`: что расходится, сколько позиций уже "
@@ -192,6 +197,10 @@ TOOLS = [
                         "article": {"type": ["string", "integer"]},
                         "purchase": {"type": ["string", "integer"]},
                         "rrc": {"type": ["string", "integer"]},
+                        # Закупки в прайсе может не быть вовсе — тогда называй РОЗНИЦУ, а
+                        # закупку посчитает код по скидке дилера и курсу валюты.
+                        "retail": {"type": ["string", "integer"]},
+                        "retail_eur": {"type": ["string", "integer"]},
                         "sheet": {"type": "string"},
                     },
                     "additionalProperties": False,
@@ -255,7 +264,9 @@ class TaskBuilderTools:
                  elsewhere: dict | None = None, scope=None,
                  known_columns: dict | None = None,
                  only_sheets: str | None = None,
-                 only_marks: list | None = None) -> None:
+                 only_marks: list | None = None,
+                 discounts: dict | None = None,
+                 eur_rate: float | None = None) -> None:
         self._content = content
         self._filename = filename
         self._onec = onec
@@ -294,6 +305,12 @@ class TaskBuilderTools:
         #   []   — выбор ЕСТЬ и он пуст: ни один бренд не отмечен, разбирать нечего.
         self._marks = (None if only_marks is None
                        else [str(n).strip() for n in only_marks if str(n).strip()])
+        # УСЛОВИЯ ПЕРЕСЧЁТА ЦЕН для прайсов без закупки (решение админа 03.10.2026):
+        # скидка дилера от розницы — СВОЯ у каждого бренда, курс валюты — у прайса.
+        # Ключи скидок нормализованы (`scope.normalize`), как и имена брендов.
+        self._discounts = {normalize(k): v for k, v in (discounts or {}).items()
+                           if normalize(k)}
+        self._eur_rate = eur_rate
         # Что в итоге разобрали и что пропустили — для отчёта админу. Считает КОД: он
         # знает это точно, а пересказ модели однажды разойдётся с правдой.
         self.parsed_sheets: list[str] = []
@@ -515,8 +532,46 @@ class TaskBuilderTools:
             self.read_sheets.append(sheet.name)
         head = (f"Листы: {', '.join(s.name for s in self.sheets)}\n"
                 f"=== Лист: {sheet.name} === (со строки {start})\n")
-        return head + self._brand_note() + self._remembered(sheet.name) \
+        return head + self._brand_note() + self._price_shape_note(sheet) \
+            + self._remembered(sheet.name) \
             + render_preview(sheet, max_rows=MAX_SHEET_ROWS, start=start)
+
+    def _price_shape_note(self, sheet) -> str:
+        """Сказать, что закупки в прайсе нет, и как называть колонки (03.10.2026).
+
+        Без этой строки модель назовёт розницу закупкой — это самое естественное, что можно
+        сделать, глядя на лист, где других цен нет. И ошибка вышла бы ДОРОГОЙ: розница
+        уехала бы в 1С как закупка, то есть магазин потерял бы всю наценку на целой марке.
+
+        Признак считает код по шапке (`dealer_price.shape`): «розница» есть, «закупки»,
+        «опта» и «дилерской» нет. Решать тут нечего, а ошибиться дорого.
+        """
+        shape = dealer_price.shape(non_empty_rows(sheet))
+        if not shape.retail_only:
+            return ""
+
+        note = ("ЗАКУПОЧНЫХ ЦЕН В ЭТОМ ПРАЙСЕ НЕТ — только розница поставщика. НЕ называй "
+                "розницу закупкой: в `price_columns` передай её как `retail` (рублёвую)"
+                + (" и `retail_eur` (в евро)" if shape.euro else "")
+                + ". Закупку посчитает код: розница минус скидка дилера"
+                + (" и по курсу валюты" if shape.euro else "") + ".")
+
+        terms = dealer_price.Terms(discount=self._single_discount(), rate=self._eur_rate)
+        gap = dealer_price.missing(terms, currency=shape.euro)
+        if gap:
+            note += (" Внимание: " + gap
+                     + " Пока условий нет, задачу по ценам не заводи вовсе.")
+        return note + "\n"
+
+    def _single_discount(self):
+        """Единственная заданная скидка либо None — для сообщения, а не для расчёта.
+
+        Расчёт идёт ПО БРЕНДУ строки (`_terms_reader`); здесь нужно лишь понять, есть ли
+        условия в принципе, чтобы предупредить модель заранее.
+        """
+        values = {value for value in self._discounts.values() if value}
+        return values.pop() if len(values) == 1 else (next(iter(values), None)
+                                                      if values else None)
 
     def _brand_note(self) -> str:
         """Сказать агенту, что лист показан НЕ ЦЕЛИКОМ.
@@ -1316,12 +1371,87 @@ class TaskBuilderTools:
         if isinstance(cols, str):
             self._price_cols.pop(sheet_name, None)   # не запоминаем то, что не разрешилось
             return cols
-        from_price = price_check.prices_from_rows(sheet.rows, cols)
+
+        # ЗАКУПКИ В ПРАЙСЕ МОЖЕТ НЕ БЫТЬ ВОВСЕ — тогда её считает код из розницы по скидке
+        # дилера и курсу (решение админа 03.10.2026). Чего не хватает, говорим ПРЯМО и
+        # сверку не делаем: сравнить с пустым курсом значит сравнить с выдуманным числом,
+        # а дальше по этой сверке завелась бы задача и уехала бы запись в 1С.
+        if cols.from_retail:
+            gap = self._terms_gap(sheet, cols)
+            if gap:
+                self._price_cols.pop(sheet_name, None)
+                return {"цены_считать_нечем": gap,
+                        "вывод": "задачу по ценам не заводи: условия задаёт админ"}
+
+        from_price = price_check.prices_from_rows(sheet.rows, cols,
+                                                  self._terms_reader(sheet))
         if not from_price:
             return ("в названных колонках цен не нашлось ни одного числа — проверь, те ли "
                     "это колонки")
         self._remember_prices(from_price)
         return price_check.report(price_check.compare(found, from_price))
+
+    def _terms_reader(self, sheet):
+        """Функция «строка → условия пересчёта» для ОДНОГО листа.
+
+        Скидка у каждого бренда СВОЯ (решение админа 03.10.2026), а строки разных брендов
+        лежат на одном листе — значит условия спрашиваются по строке, а не на лист целиком.
+
+        **ОШИБКА ЗДЕСЬ НЕ ДАЁТ НЕВЕРНОЙ ЦЕНЫ, только отсутствующую.** Не нашли бренд строки
+        — условий нет, цена не считается вовсе, и позиция честно попадает в «в прайсе цены
+        нет». Это важное свойство: записать в 1С цену, посчитанную по чужой скидке, было бы
+        необратимо, а пропущенную позицию видно в отчёте.
+
+        Пустая ячейка бренда — объединённая с верхней, поэтому помним последнюю виденную.
+        Обход идёт по файлу сверху вниз (так читает `prices_from_rows`), и этого довольно.
+        """
+        spot = find_brand_column(sheet)
+        rate = self._eur_rate
+
+        if spot is None:
+            # Брендов в листе нет. Единственную заданную скидку применить можно — она
+            # относится к формату целиком; несколько разных привязать не к чему.
+            only = {value for value in self._discounts.values() if value}
+            single = dealer_price.Terms(
+                discount=only.pop() if len(only) == 1 else None, rate=rate)
+            return lambda row: single
+
+        last = {"brand": ""}
+
+        def read(row):
+            value = (str(row[spot.column] or "").strip()
+                     if len(row) > spot.column else "")
+            if value:
+                last["brand"] = value
+            return dealer_price.Terms(
+                discount=self._discounts.get(normalize(last["brand"])), rate=rate)
+
+        return read
+
+    def _terms_gap(self, sheet, cols) -> str:
+        """Чего не хватает, чтобы считать цены этого листа. Пусто — хватает всего.
+
+        Проверяем по БРЕНДАМ, которые реально разбираем: скидка нужна каждому, и достаточно
+        одного без скидки, чтобы сказать об этом заранее — иначе его позиции молча выпали бы
+        из сверки как «цены нет в прайсе», и причина осталась бы неизвестной.
+        """
+        currency = cols.retail is None and cols.retail_eur is not None
+        if currency and not dealer_price.Terms(rate=self._eur_rate).has_rate:
+            return dealer_price.missing(dealer_price.Terms(), currency=True)
+
+        spot = find_brand_column(sheet)
+        if spot is None:
+            terms = self._terms_reader(sheet)([])
+            return dealer_price.missing(terms, currency=currency)
+
+        without = [brand for brand, _ in brands_in(sheet, spot)
+                   if not dealer_price.Terms(
+                       discount=self._discounts.get(normalize(brand))).has_discount]
+        if not without:
+            return ""
+        return ("скидка дилера не задана у брендов: " + ", ".join(without[:8])
+                + ". Задаётся в форме «Бренды» в 1С, колонка «Скидка, %»; "
+                "без неё закупку из розницы считать нельзя.")
 
     def _remember_prices(self, from_price: dict) -> None:
         """Отложить цены прайса для журнала предложений (§6.4).
@@ -2106,6 +2236,7 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
                 remember=None, scope=None, known_columns=None,
                 remember_columns=None, only_sheets: str | None = None,
                 only_marks: list | None = None,
+                discounts: dict | None = None, eur_rate: float | None = None,
                 note=None) -> tuple[list[PriceTask], str]:
     """Прогон формирования задач. Возвращает (задачи, короткий ответ агента).
 
@@ -2118,7 +2249,8 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
     """
     tools = TaskBuilderTools(content, filename, onec=onec, elsewhere=elsewhere,
                              scope=scope, known_columns=known_columns,
-                             only_sheets=only_sheets, only_marks=only_marks)
+                             only_sheets=only_sheets, only_marks=only_marks,
+                             discounts=discounts, eur_rate=eur_rate)
     task = f"Прайс «{filename}». Составь список задач по нему."
 
     # РАЗБИРАТЬ НЕЧЕГО — МОДЕЛЬ НЕ ЗОВЁМ ВОВСЕ. Ради этого вся затея и нужна: прогон по

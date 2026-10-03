@@ -193,6 +193,17 @@ async def main() -> None:
             # по листам. Молча этого не оставляем, но и прогон не роняем.
             logger.warning("Бренды формата %s не собраны", signature[:12], exc_info=True)
 
+        # УСЛОВИЯ ПЕРЕСЧЁТА ЦЕН для прайсов, где закупки нет (решение админа 03.10.2026):
+        # скидка дилера от розницы — своя у каждого бренда, курс валюты — у прайса. Формулу
+        # подтвердил админ: закупка = розница × (1 − скидка/100), РРЦ = розница.
+        discounts = {}
+        try:
+            discounts = {m.brand: m.discount
+                         for m in await supplier_store.marks_for(signature)
+                         if m.discount}
+        except Exception:                               # noqa: BLE001
+            logger.warning("Скидки формата %s не прочитаны", signature[:12], exc_info=True)
+
         async def note(text):
             """Что разобрали и что пропустили — сообщением админу. Отдельно от задач:
             по их списку не видно, обошли прайс целиком или треть его."""
@@ -218,6 +229,8 @@ async def main() -> None:
                            known_columns=known_columns,
                            remember_columns=remember_columns,
                            only_sheets=only_sheets, only_marks=only_marks,
+                           discounts=discounts,
+                           eur_rate=price.supplier_price.eur_rate,
                            note=note)
 
     async def run_task(price, task, content, guard):
@@ -237,11 +250,29 @@ async def main() -> None:
         seller = await supplier_store.get_supplier(price.supplier_price.supplier_id)
         # ЖУРНАЛ ПРЕДЛОЖЕНИЙ (§6.4): по нему исполнитель пишет наименьшую АКТУАЛЬНУЮ цену,
         # а не ту, что в обрабатываемом прайсе. Без журнала поведение прежнее.
+        # УСЛОВИЯ ПЕРЕСЧЁТА ЦЕН для прайса без закупки (решение админа 03.10.2026).
+        # Скидка задана у БРЕНДА, задача адресована МАРКЕ — связывает их `tm_code`,
+        # который админ выставил в форме брендов. Не нашли — условий нет, и цены по такой
+        # задаче не запишутся вовсе: лучше отказ с причиной, чем цифра наугад в боевой 1С.
+        terms = None
+        try:
+            from src.model.dealer_price import Terms
+
+            code = (task.address.tm.code or "").strip()
+            marks = await supplier_store.marks_for(price.supplier_price.signature or "")
+            mine = next((m for m in marks if m.tm_code and m.tm_code == code), None)
+            if mine is not None:
+                terms = Terms(discount=mine.discount,
+                              rate=price.supplier_price.eur_rate)
+        except Exception:                               # noqa: BLE001
+            logger.warning("Условия пересчёта цен не прочитаны", exc_info=True)
+
         return await run(orchestrator, onec, price, task, content, guard, scope=scope,
                          usage_labels={"kind": "model_task",
                                        "price_doc": price.supplier_price.filename},
                          offers=sightings,
-                         supplier_name=seller.name if seller else "")
+                         supplier_name=seller.name if seller else "",
+                         terms=terms)
 
     model = PriceListService(
         model_store, supplier_store,

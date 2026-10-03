@@ -23,6 +23,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
+from src.model import dealer_price
 from src.price_tool.changes import SAME_PRICE_PCT, same_price
 from src.model.refs import norm_article
 
@@ -37,20 +38,40 @@ from src.model.refs import norm_article
 KINDS = ("purchase", "rrc")
 LABEL = {"purchase": "закупка", "rrc": "РРЦ"}
 
+#: Колонки-ИСТОЧНИКИ: из них цена ВЫЧИСЛЯЕТСЯ, а не берётся как есть. Нужны прайсам без
+#: закупки (решение админа 03.10.2026): дилеру дают скидку процентом от розницы, своим на
+#: каждую марку, а валютную цену приводят курсом.
+SOURCES = ("retail", "retail_eur")
+
 # Мусор, который бывает в ценовой ячейке: валюта, единица, неразрывные пробелы.
 _CLEAN = re.compile(r"[^\d,.\-]")
 
 
 @dataclass(frozen=True)
 class Columns:
-    """Разрешённые номера колонок (с нуля). `article` обязателен, цены — нет."""
+    """Разрешённые номера колонок (с нуля). `article` обязателен, цены — нет.
+
+    `retail` и `retail_eur` — РОЗНИЦА поставщика (решение админа 03.10.2026). У части
+    прайсов закупки нет вовсе, и закупку считает код: розница минус скидка дилера, валютная
+    — ещё и по курсу (`model/dealer_price.py`). Это ИСТОЧНИК, а не вид цены: сверяются и
+    пишутся по-прежнему только закупка и РРЦ.
+    """
     article: int
     purchase: int | None = None
     rrc: int | None = None
+    retail: int | None = None
+    retail_eur: int | None = None
 
     @property
     def any_price(self) -> bool:
-        return self.purchase is not None or self.rrc is not None
+        return any(value is not None for value in
+                   (self.purchase, self.rrc, self.retail, self.retail_eur))
+
+    @property
+    def from_retail(self) -> bool:
+        """Цены придётся считать из розницы: прямых колонок нет."""
+        return (self.purchase is None and self.rrc is None
+                and (self.retail is not None or self.retail_eur is not None))
 
 
 @dataclass(frozen=True)
@@ -95,7 +116,7 @@ def resolve_columns(rows, spec: dict) -> Columns | str:
     лист табами, без буквенных имён колонок, и заголовок для неё надёжнее счёта.
     """
     got: dict[str, int | None] = {}
-    for key in ("article", *KINDS):
+    for key in ("article", *KINDS, *SOURCES):
         raw = spec.get(key)
         if raw is None or raw == "":
             got[key] = None
@@ -108,7 +129,8 @@ def resolve_columns(rows, spec: dict) -> Columns | str:
 
     if got["article"] is None:
         return "В price_columns обязателен article: сверка идёт по артикулу."
-    cols = Columns(article=got["article"], purchase=got["purchase"], rrc=got["rrc"])
+    cols = Columns(article=got["article"], purchase=got["purchase"], rrc=got["rrc"],
+                   retail=got["retail"], retail_eur=got["retail_eur"])
     if not cols.any_price:
         return "В price_columns нет ни одной ценовой колонки — сверять нечего."
     return cols
@@ -134,7 +156,8 @@ def _index(rows, raw) -> int | None:
     return None
 
 
-def prices_from_rows(rows, cols: Columns) -> dict[str, dict[str, Decimal]]:
+def prices_from_rows(rows, cols: Columns,
+                     terms_for=None) -> dict[str, dict[str, Decimal]]:
     """Цены прайса по артикулам. Первая встреченная строка выигрывает: ниже по листу
     тот же артикул обычно повторяется в блоке «в упаковке» и в сводках."""
     out: dict[str, dict[str, Decimal]] = {}
@@ -158,10 +181,40 @@ def prices_from_rows(rows, cols: Columns) -> dict[str, dict[str, Decimal]]:
                 value = to_decimal(row[at])
                 if value is not None:
                     found[kind] = value
+
+        # ЗАКУПКИ В ПРАЙСЕ МОЖЕТ НЕ БЫТЬ ВОВСЕ (решение админа 03.10.2026). Тогда считаем
+        # её из розницы: минус скидка дилера, валютную — ещё и по курсу. Прямые колонки
+        # ГЛАВНЕЕ: нашлась настоящая закупка — считать нечего, в прайсе она и есть.
+        if not found and cols.from_retail:
+            found = _from_retail(row, cols, terms_for)
+
         if found:
             for key in keys:
                 out[key] = found
     return out
+
+
+def _from_retail(row, cols: Columns, terms_for) -> dict:
+    """Закупка и РРЦ из розничной цены строки. Пустой словарь — считать нечем.
+
+    Рублёвая розница ГЛАВНЕЕ валютной: для неё не нужен курс, то есть меньше того, что
+    может быть не задано. Условия (скидка бренда, курс) спрашиваются ПО СТРОКЕ: скидка у
+    каждой марки своя, а строки разных марок лежат на одном листе.
+    """
+    if terms_for is None:
+        return {}
+
+    for at, currency in ((cols.retail, False), (cols.retail_eur, True)):
+        if at is None or len(row) <= at:
+            continue
+        value = to_decimal(row[at])
+        if value is None:
+            continue
+        got = dealer_price.from_retail(value, terms_for(row) or dealer_price.Terms(),
+                                       currency=currency)
+        if got:
+            return got
+    return {}
 
 
 def flat_prices(items, purchase=None, rrc=None) -> dict[str, dict[str, Decimal]]:

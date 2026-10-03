@@ -26,6 +26,7 @@ import logging
 from datetime import date
 from decimal import Decimal
 
+from src.model import dealer_price
 from src.model import normalize as nz
 from src.model.offers import Offer, best
 from src.model.enums import TaskKind, TaskStatus, TaskSubject
@@ -246,6 +247,10 @@ TOOLS = [
             "ДВА СПОСОБА: purchase (и rrc) на всю коллекцию (ламинат — коллекция это один "
             "декор в разных цветах) либо items[{ref, purchase, rrc}] по товарам (КЕРАМИКА: "
             "в одной папке настенная, напольная, декор, бордюр — у каждого своя цена).\n"
+            "ЗАКУПКИ В ПРАЙСЕ МОЖЕТ НЕ БЫТЬ ВОВСЕ — только розница поставщика. Тогда "
+            "передавай её как retail (рубли) либо retail_eur (валюта) и НЕ называй "
+            "розницу закупкой: закупку посчитает код по скидке дилера и курсу. Условий "
+            "нет — цены не запишутся, и инструмент скажет, чего не хватает.\n"
             "Изменения меньше 2% отбрасываются сами."),
         "input_schema": {
             "type": "object",
@@ -257,6 +262,12 @@ TOOLS = [
                 "purchase": {"type": "number", "description": "закупка на всю коллекцию"},
                 "rrc": {"type": "number",
                         "description": "РРЦ (МРЦ) из прайса на всю коллекцию"},
+                "retail": {"type": "number",
+                           "description": "РОЗНИЦА поставщика в рублях — когда закупки в "
+                                          "прайсе нет. Закупку посчитает код"},
+                "retail_eur": {"type": "number",
+                               "description": "розница поставщика в валюте; код приведёт "
+                                              "её курсом"},
                 "items": {
                     "type": "array",
                     "description": "цены по товарам: [{ref, purchase, rrc}]",
@@ -264,7 +275,9 @@ TOOLS = [
                         "type": "object",
                         "properties": {"ref": {"type": "string"},
                                        "purchase": {"type": "number"},
-                                       "rrc": {"type": "number"}},
+                                       "rrc": {"type": "number"},
+                                       "retail": {"type": "number"},
+                                       "retail_eur": {"type": "number"}},
                     },
                 },
             },
@@ -308,7 +321,8 @@ class TaskTools:
     def __init__(self, onec, content: bytes, filename: str, guard, scope=None,
                  kind: TaskKind = TaskKind.CHANGE_PRICES, offers=None,
                  supplier_id: int = 0, price_date: str | None = None,
-                 supplier_name: str = "") -> None:
+                 supplier_name: str = "",
+                 terms=None) -> None:
         self._onec = onec
         self._content = content
         self._filename = filename
@@ -328,6 +342,11 @@ class TaskTools:
         self._supplier_id = supplier_id
         self._supplier_name = supplier_name
         self._price_date = price_date
+        # УСЛОВИЯ ПЕРЕСЧЁТА ЦЕН, когда закупки в прайсе нет (решение админа 03.10.2026):
+        # скидка дилера от розницы и курс валюты. ОДНИ на задачу — задача адресована одной
+        # марке, а скидка задана у бренда этой марки. Нет условий — розницу не пересчитываем
+        # и цены не пишем вовсе.
+        self._terms = terms
         # Код товара → чей прайс дал записываемую цену. Едет в 1С полем `source`, чтобы
         # там было видно, у кого закупаем (§6.4). Заполняется ТОЛЬКО для тех позиций,
         # которые пишем мы: чужие записи не трогаем и чужой источник не выдумываем.
@@ -542,6 +561,48 @@ class TaskTools:
         if not changed and not asked:
             return rows
         return out
+
+    def _to_purchase(self, inp: dict) -> str:
+        """Розницу в полезной нагрузке заменить на закупку и РРЦ. Текст — значит отказ.
+
+        **ОТКАЗ, А НЕ ДОГАДКА.** Нет скидки или курса — не пишем НИЧЕГО и говорим, чего не
+        хватает: цена уезжает в боевую 1С, и записать её по пустому курсу значит поставить
+        товару цифру, которой нет, причём необратимо.
+
+        Розница приходит в тех же местах, где раньше приходила закупка: на коллекцию и
+        по товарам в `items`. Прямо названная закупка ГЛАВНЕЕ — если модель её назвала,
+        значит в прайсе она есть, и пересчитывать нечего.
+        """
+        spots = [inp] + [row for row in (inp.get("items") or []) if isinstance(row, dict)]
+        wants = [spot for spot in spots
+                 if spot.get("purchase") is None
+                 and (spot.get("retail") is not None
+                      or spot.get("retail_eur") is not None)]
+        if not wants:
+            return ""
+
+        terms = self._terms or dealer_price.Terms()
+        currency = any(spot.get("retail") is None
+                       and spot.get("retail_eur") is not None for spot in wants)
+        gap = dealer_price.missing(terms, currency=currency)
+        if gap:
+            return ("Цены НЕ записаны: " + gap
+                    + " Задачу оставь незакрытой либо закрой как «к обработке» с этой "
+                      "причиной — считать закупку наугад нельзя.")
+
+        for spot in wants:
+            value, in_currency = ((spot.get("retail"), False)
+                                  if spot.get("retail") is not None
+                                  else (spot.get("retail_eur"), True))
+            got = dealer_price.from_retail(value, terms, currency=in_currency)
+            if not got:
+                continue
+            spot["purchase"] = float(got["purchase"])
+            # РРЦ не трогаем, если модель назвала её сама: в прайсе могла стоять и РРЦ
+            # отдельной колонкой, и тогда она точнее пересчитанной розницы.
+            if spot.get("rrc") is None:
+                spot["rrc"] = float(got["rrc"])
+        return ""
 
     async def _nomenclature(self, tm_code: str) -> list:
         """Выгрузка марки с кешем на прогон: справочник за задачу не меняется до записи."""
@@ -874,6 +935,15 @@ class TaskTools:
         collection = (inp.get("collection") or "").strip()
         if not tm_code or not collection:
             return "Нужны tm_code и collection."
+
+        # РОЗНИЦА → ЗАКУПКА ДО ВСЕГО ОСТАЛЬНОГО (решение админа 03.10.2026). У части
+        # поставщиков закупки в прайсе нет вовсе, и считает её КОД: розница минус скидка
+        # дилера, валютная — ещё и по курсу. Пересчёт стоит здесь, в самом начале, потому
+        # что ниже цены идут и в выбор наименьшей (`_cheapest`), и в планировщик, — а
+        # обрабатывать два вида входа в двух местах значит однажды разойтись.
+        gap = self._to_purchase(inp)
+        if gap:
+            return gap
 
         current = await self._nomenclature(tm_code)
 
@@ -1361,7 +1431,7 @@ def _collection_folder(folders, subject, wanted: str, positions=()):
     return None, f"папки с именем «{wanted}» в дереве марки нет"
 
 
-def task_brief(price, task) -> str:
+def task_brief(price, task, terms=None) -> str:
     """Что именно предстоит сделать — одним куском для модели."""
     lines = [
         f"ЗАДАЧА №{task.id}: {task.kind.value}",
@@ -1371,6 +1441,19 @@ def task_brief(price, task) -> str:
     tm = task.address.tm
     if tm.code:
         lines.append(f"Код марки в 1С: {tm.code}")
+
+    # УСЛОВИЯ ПЕРЕСЧЁТА ЦЕН — в задание, если они есть. Модель должна знать, что закупку
+    # считать не ей: иначе она умножит сама, и в 1С уедет её арифметика вместо кодовой.
+    # Админу эта строка тоже нужна: закупка в прайсе не стоит, и без неё происхождение
+    # цифры неизвестно никому.
+    if terms is not None:
+        line = dealer_price.explain(terms, currency=bool(getattr(terms, "rate", None)))
+        if line:
+            lines.append(f"Цены считаются из розницы: {line}. Передавай в write_prices "
+                         f"РОЗНИЦУ (retail либо retail_eur) — пересчёт сделает код.")
+        else:
+            lines.append("Внимание: " + dealer_price.missing(terms)
+                         + " Цены по этой задаче писать нельзя.")
     subject = task.address.subject
     if subject.article:
         lines.append(f"Артикул: {subject.article}")
@@ -1385,7 +1468,7 @@ def task_brief(price, task) -> str:
 
 async def run(orchestrator, onec, price, task, content: bytes, guard,
               scope=None, usage_labels: dict | None = None, offers=None,
-              supplier_name: str = ""):
+              supplier_name: str = "", terms=None):
     """Выполнить задачу. Возвращает (статус, текст результата).
 
     `guard` — функция без аргументов, бросающая `WriteRefused`, если прогон потерял право
@@ -1416,10 +1499,10 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
                       scope=scope, kind=task.kind, offers=offers,
                       supplier_id=price.supplier_price.supplier_id,
                       price_date=price.supplier_price.price_date,
-                      supplier_name=supplier_name)
+                      supplier_name=supplier_name, terms=terms)
 
     answer, _ = await orchestrator.handle_turn(
-        [{"role": "user", "content": task_brief(price, task)}],
+        [{"role": "user", "content": task_brief(price, task, terms)}],
         system=PROMPT, extra_tools=TOOLS, extra_executor=tools,
         base_tools=False, usage_labels=usage_labels)
 
