@@ -70,7 +70,37 @@ CREATE TABLE IF NOT EXISTS supplier_price_file (
     UNIQUE (signature_id, path)
 );
 CREATE INDEX IF NOT EXISTS ix_price_file_signature ON supplier_price_file (signature_id);
+-- БРЕНДЫ ВНУТРИ ЛИСТА (решение админа 03.10.2026). Второй список у формата, рядом с
+-- `sheets`: у «Остатков» один лист на 1286 строк и 23 бренда, выбор листов там бесполезен,
+-- а 13 брендов из 23 в справочнике 1С отсутствуют вовсе — это не экономия, это отделение
+-- работы от мусора. К разбору уходит ПЕРЕСЕЧЕНИЕ отмеченных листов и отмеченных брендов.
+--
+-- СТРОКА НА БРЕНД, а не строка через запятую, как `sheets`: у бренда помимо имени ТРИ
+-- значения — флажок, марка 1С и скидка от розницы, — и в одно текстовое поле они не лягут.
+--
+-- Ключ — ХЕШ формата без поставщика, ровно как у `sheets_for`/`set_sheets_by_signature`:
+-- скелеты двух поставщиков могут совпасть, и тогда выбор у них общий. Решение то же, что
+-- для листов, и расходиться с ним здесь нельзя.
+CREATE TABLE IF NOT EXISTS signature_mark (
+    signature  TEXT NOT NULL,              -- хеш формата
+    brand      TEXT NOT NULL,              -- как написано в файле; показываем это
+    brand_key  TEXT NOT NULL,              -- scope.normalize — по нему сверяем
+    parse      INTEGER NOT NULL DEFAULT 0, -- флажок админа; 0 = не разбираем
+    tm_code    TEXT,                       -- код марки в 1С (Справочники.Производители)
+    tm_name    TEXT,                       -- имя марки — для показа
+    discount   REAL,                       -- % скидки от розницы
+    rows       INTEGER NOT NULL DEFAULT 0, -- строк в ПОСЛЕДНЕМ файле формата
+    seen_at    TEXT NOT NULL,
+    PRIMARY KEY (signature, brand_key)
+);
+CREATE INDEX IF NOT EXISTS ix_signature_mark ON signature_mark (signature);
 """
+
+
+#: Типы доращиваемых колонок `supplier_signature`. Таблица старше их всех, и у работающей
+#: базы колонок нет — без `ALTER TABLE` при старте все запросы к сигнатурам упали бы разом.
+COLUMN_KINDS = {"sheets": "TEXT", "sheet_list": "TEXT",
+                "brand_col": "INTEGER", "eur_rate": "REAL"}
 
 
 def _now() -> str:
@@ -98,6 +128,23 @@ class Signature:
     sheets: str = ""
     #: Все листы последнего файла этого формата — из чего выбирать.
     sheet_list: str = ""
+
+
+@dataclass(frozen=True)
+class SignatureMark:
+    """Один бренд формата: что видно в файле и что решил админ.
+
+    `rows` = 0 значит «в последнем файле этого бренда не было». Запись при этом остаётся,
+    потому что вместе с ней остаются флажок, марка и скидка, — а поставщик вернёт бренд
+    следующим файлом.
+    """
+    brand: str
+    brand_key: str
+    parse: bool = False
+    tm_code: str = ""
+    tm_name: str = ""
+    discount: float | None = None
+    rows: int = 0
 
 
 @dataclass(frozen=True)
@@ -131,10 +178,13 @@ class SupplierStore:
             # дописывания все запросы к сигнатурам упали бы разом.
             cur = await db.execute("PRAGMA table_info(supplier_signature)")
             have = {row[1] for row in await cur.fetchall()}
-            for column in ("sheets", "sheet_list"):
+            # `brand_col` — в какой колонке листа стоит бренд (находит код, помним у
+            # формата); `eur_rate` — последний курс евро, он же подсказка новому прайсу.
+            for column in ("sheets", "sheet_list", "brand_col", "eur_rate"):
                 if have and column not in have:
                     await db.execute(
-                        f"ALTER TABLE supplier_signature ADD COLUMN {column} TEXT")
+                        f"ALTER TABLE supplier_signature ADD COLUMN {column} "
+                        + COLUMN_KINDS[column])
             await db.commit()
 
     # ------------------------------------------------------------ поставщики
@@ -347,6 +397,144 @@ class SupplierStore:
                     return value.strip()
         return ""
 
+    # ----------------------------------------------------------------- бренды
+
+    async def remember_marks(self, signature: str, found) -> int:
+        """Запомнить состав брендов формата: `found` = [(бренд, строк, код ТМ, имя ТМ)].
+
+        **РЕШЕНИЕ АДМИНА ПЕРЕЖИВАЕТ НОВЫЙ ФАЙЛ.** Приём зовёт это на каждом прайсе, и
+        затирать флажок, марку или скидку было бы худшим из возможного: админ расставил их
+        руками, а файл того же формата приходит каждый месяц.
+
+        **НОВЫЙ БРЕНД ПРИЕЗЖАЕТ НЕОТМЕЧЕННЫМ.** Обратное умолчание значило бы, что
+        появившийся в прайсе бренд молча уедет в разбор — за токены и с задачами по товарам,
+        которых магазин может не возить.
+
+        **ИСЧЕЗНУВШИЙ БРЕНД НЕ УДАЛЯЕМ, а ставим ему `rows = 0`.** Удалив, потеряли бы и
+        флажок, и скидку, и привязку к марке, — а поставщик вернёт бренд следующим файлом.
+        Ноль строк при этом ВИДЕН админу: «бренда больше нет в файле» это новость.
+
+        Предложенный код марки пишется, ТОЛЬКО если своего ещё нет: догадка кода не вправе
+        переписывать выбор человека.
+        """
+        now = _now()
+        found = list(found or ())
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("UPDATE signature_mark SET rows = 0 WHERE signature = ?",
+                             (signature,))
+            for brand, rows, tm_code, tm_name in found:
+                key = normalize(brand)
+                if not key:
+                    continue
+                await db.execute(
+                    "INSERT INTO signature_mark (signature, brand, brand_key, parse, "
+                    "tm_code, tm_name, rows, seen_at) VALUES (?, ?, ?, 0, ?, ?, ?, ?) "
+                    "ON CONFLICT (signature, brand_key) DO UPDATE SET "
+                    "brand = excluded.brand, rows = excluded.rows, "
+                    "seen_at = excluded.seen_at, "
+                    "tm_code = CASE WHEN COALESCE(signature_mark.tm_code, '') = '' "
+                    "    THEN excluded.tm_code ELSE signature_mark.tm_code END, "
+                    "tm_name = CASE WHEN COALESCE(signature_mark.tm_code, '') = '' "
+                    "    THEN excluded.tm_name ELSE signature_mark.tm_name END",
+                    (signature, brand, key, tm_code or "", tm_name or "",
+                     int(rows or 0), now))
+            await db.commit()
+        return len(found)
+
+    async def marks_for(self, signature: str) -> list[SignatureMark]:
+        """Бренды формата, в порядке файла (`rowid` — он же порядок первой вставки).
+
+        Алфавитный был бы хуже: админ ищет бренд глазами там, где он стоит в книге, — та же
+        причина, по которой листы в форме идут порядком вкладок.
+        """
+        if not signature:
+            return []
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT brand, brand_key, parse, COALESCE(tm_code, ''), "
+                "COALESCE(tm_name, ''), discount, rows FROM signature_mark "
+                "WHERE signature = ? ORDER BY rowid", (signature,))
+            return [SignatureMark(brand=row[0], brand_key=row[1], parse=bool(row[2]),
+                                  tm_code=row[3], tm_name=row[4], discount=row[5],
+                                  rows=row[6])
+                    for row in await cur.fetchall()]
+
+    async def marks_wanted(self, signature: str) -> list[str]:
+        """Только отмеченные бренды — тем, кому нужен фильтр, а не вся таблица."""
+        return [m.brand for m in await self.marks_for(signature) if m.parse]
+
+    async def set_marks_by_signature(self, signature: str, rows) -> int:
+        """Применить решение админа: `rows` = [{brand, parse, tm_code, tm_name, discount}].
+
+        Адресуемся ХЕШОМ — так формат знает форма 1С. Бренды, которых в присланном наборе
+        нет, НЕ ТРОГАЕМ: форма показывает состав последнего файла, и команда не обязана
+        нести то, чего админ в ней не видел.
+        """
+        if not signature:
+            return 0
+        touched = 0
+        async with aiosqlite.connect(self._db_path) as db:
+            for row in rows or ():
+                key = normalize(str(row.get("brand") or ""))
+                if not key:
+                    continue
+                cur = await db.execute(
+                    "UPDATE signature_mark SET parse = ?, tm_code = ?, tm_name = ?, "
+                    "discount = ? WHERE signature = ? AND brand_key = ?",
+                    (1 if row.get("parse") else 0,
+                     str(row.get("tm_code") or ""), str(row.get("tm_name") or ""),
+                     row.get("discount"), signature, key))
+                touched += cur.rowcount
+            await db.commit()
+        return touched
+
+    async def set_signature_brand_col(self, signature: str, column) -> bool:
+        """В какой колонке листа стоит бренд. None — колонки нет, выбор брендов недоступен."""
+        if not signature:
+            return False
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE supplier_signature SET brand_col = ? WHERE signature = ?",
+                (column, signature))
+            await db.commit()
+        return cur.rowcount > 0
+
+    async def brand_col_for(self, signature: str):
+        """Колонка бренда у формата либо None."""
+        if not signature:
+            return None
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT brand_col FROM supplier_signature "
+                "WHERE signature = ? AND brand_col IS NOT NULL ORDER BY id", (signature,))
+            row = await cur.fetchone()
+        return int(row[0]) if row else None
+
+    async def set_eur_rate(self, signature: str, rate) -> bool:
+        """Последний курс евро у формата — ПОДСКАЗКА новому прайсу, а не его курс.
+
+        Курс меняется каждый день, и считать по прошлому значило бы записать в 1С цену,
+        которой нет; у прайса курс свой. Здесь — только то, что подставить в форму.
+        """
+        if not signature:
+            return False
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE supplier_signature SET eur_rate = ? WHERE signature = ?",
+                (rate, signature))
+            await db.commit()
+        return cur.rowcount > 0
+
+    async def eur_rate_for(self, signature: str):
+        if not signature:
+            return None
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT eur_rate FROM supplier_signature "
+                "WHERE signature = ? AND eur_rate IS NOT NULL ORDER BY id", (signature,))
+            row = await cur.fetchone()
+        return float(row[0]) if row else None
+
     async def move_signature(self, signature_id: int, supplier_id: int) -> bool:
         """Перепривязать сигнатуру к другому поставщику (§2.3).
 
@@ -433,6 +621,16 @@ class SupplierStore:
                 await db.execute(
                     "UPDATE supplier_signature SET signature = ? WHERE id = ?",
                     (new, signature_id))
+
+            # БРЕНДЫ ПЕРЕЕЗЖАЮТ ВМЕСТЕ С ХЕШОМ. Их таблица ключуется ХЕШОМ, а не номером
+            # записи, — и, оставшись под старым, выбор админа (флажки, марки, скидки)
+            # осиротел бы молча: ровно так уже терялся выбор листов.
+            #
+            # OR REPLACE: под новым хешом бренды могли появиться раньше (два формата
+            # свелись к одному), и тогда побеждают они — они посчитаны новым правилом.
+            await db.execute(
+                "UPDATE OR REPLACE signature_mark SET signature = ? WHERE signature = ?",
+                (new, old))
             await db.commit()
             return True
 

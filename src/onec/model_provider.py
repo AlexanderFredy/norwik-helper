@@ -296,7 +296,8 @@ class OnecProvider(Listener):
         # Признак снимаем ТОЛЬКО ПОСЛЕ успешной отправки: исключение оставит его поднятым,
         # и следующий оборот повторит попытку.
         await asyncio.to_thread(self._onec.set_model_state, snapshot,
-                                await self.sheets_snapshot())
+                                await self.sheets_snapshot(),
+                                await self.marks_snapshot())
         self._dirty = False
 
     async def snapshot(self) -> list[dict]:
@@ -320,6 +321,10 @@ class OnecProvider(Listener):
                 # листов двойным щелчком по имени файла. Иначе пришлось бы искать формат
                 # по имени файла, а имена меняются каждый месяц.
                 "signature": sp.signature or "",
+                # КУРС ЕВРО ЭТОГО ПРАЙСА: форма брендов показывает его и даёт поправить.
+                # Пустой означает «не задан», и цены по валютным колонкам тогда не
+                # считаются вовсе — записать в 1С цифру по пустому курсу необратимо.
+                "eur_rate": sp.eur_rate,
                 "status": price.status.value,
                 "ready": price.ready,
                 "has_newer": price.has_newer,
@@ -381,6 +386,61 @@ class OnecProvider(Listener):
                     "order": number,
                     "parse": (name.strip().lower() in chosen
                               or sheet_key(name) in chosen_loose),
+                })
+        return out
+
+    async def marks_snapshot(self) -> list[dict]:
+        """Бренды форматов с флажками, марками и скидками — зеркало формы брендов.
+
+        СТРОКА НА БРЕНД, как и у листов: в форме это таблица с флажком, и 1С применяет
+        снимок разницей, построчно.
+
+        **Бренд, которого в последнем файле не было, тоже едет** — со `rows = 0`. Он
+        остался в справочнике вместе с флажком, маркой и скидкой, потому что поставщик
+        вернёт его следующим файлом; а ноль строк в форме и есть та новость, что бренда
+        больше нет в прайсе. Скрыв его, мы потеряли бы и новость, и возможность снять с
+        него флажок.
+
+        Порядок — из файла (`marks_for` отдаёт по порядку первой встречи), не алфавитный:
+        админ ищет бренд глазами там, где он стоит в книге.
+        """
+        if self._suppliers is None:
+            return []
+
+        out: list[dict] = []
+        try:
+            signatures = await self._suppliers.list_signatures()
+        except Exception:                               # noqa: BLE001
+            logger.warning("Не удалось прочитать форматы прайсов", exc_info=True)
+            return []
+
+        for sig in signatures:
+            try:
+                marks = await self._suppliers.marks_for(sig.signature)
+            except Exception:                           # noqa: BLE001
+                logger.warning("Бренды формата %s не прочитались",
+                               sig.signature[:12], exc_info=True)
+                continue
+            if not marks:
+                # Брендов у формата не видели — показывать нечего, и пустая строка в
+                # таблице только мешала бы.
+                continue
+
+            supplier = await self._supplier_name(sig.supplier_id)
+            for number, mark in enumerate(marks, 1):
+                out.append({
+                    "signature": sig.signature,
+                    "supplier": supplier,
+                    "supplier_code": str(sig.supplier_id or ""),
+                    "brand": mark.brand,
+                    "order": number,
+                    "rows": mark.rows,
+                    "parse": mark.parse,
+                    # КОД марки, а не имя: в 1С колонка «Марка» — ссылка на
+                    # `Справочники.Производители`, и элемент там опознаётся по коду.
+                    "tm_code": mark.tm_code,
+                    "tm_name": mark.tm_name,
+                    "discount": mark.discount,
                 })
         return out
 

@@ -19,7 +19,8 @@ BSL = Path(__file__).resolve().parent.parent / "specs" / "1c" / "set-model-state
 #: ломаться, когда появится третья сущность без проверки, а не молча её пропускать.
 PAIRS = (("ОбразецПрайса", "ЗначенияПрайса"),
          ("ОбразецЗадачи", "ЗначенияЗадачи"),
-         ("ОбразецЛиста", "ЗначенияЛиста"))
+         ("ОбразецЛиста", "ЗначенияЛиста"),
+         ("ОбразецБренда", "ЗначенияБренда"))
 
 
 def body(text: str, name: str) -> str:
@@ -126,7 +127,8 @@ class CommandPayloadTest(unittest.TestCase):
     переменной, которой в этой же процедуре присвоили `Новый Структура`.
     """
 
-    FORMS = ("model-form-module.bsl", "model-sheets-form-module.bsl")
+    FORMS = ("model-form-module.bsl", "model-sheets-form-module.bsl",
+             "model-brands-form-module.bsl")
 
     CALL = re.compile(r"ПоставитьКоманду\(\s*([^)]*?)\)", re.S)
 

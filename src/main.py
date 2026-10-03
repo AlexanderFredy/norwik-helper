@@ -170,6 +170,29 @@ async def main() -> None:
         # каждый лишний стоит и токенов, и кругов цикла.
         only_sheets = await supplier_store.sheets_for(signature)
 
+        # БРЕНДЫ ВНУТРИ ЛИСТА — второе указание админа (решение 03.10.2026). Выбор листов
+        # не помогает прайсу, у которого лист один: у «Остатков» одна вкладка на 1286 строк
+        # и 23 бренда, 88 тыс. токенов за полный разбор, и 13 брендов из 23 в справочнике
+        # 1С отсутствуют вовсе. К разбору уходит ПЕРЕСЕЧЕНИЕ отмеченного.
+        #
+        # Состав брендов пересобираем ЗДЕСЬ ЖЕ, на каждом разборе: только здесь есть и файл,
+        # и справочник марок 1С для подсказки. Решение админа при этом не затирается —
+        # `remember_marks` хранит флажки, марки и скидки, а новые бренды приезжают
+        # неотмеченными.
+        from src.model.brand_intake import remember as remember_brands
+
+        only_marks = None
+        try:
+            marks = await asyncio.to_thread(onec.selling_tm) if onec else []
+            summary = await remember_brands(supplier_store, signature, content,
+                                            filename, marks)
+            if summary["brands"]:
+                only_marks = await supplier_store.marks_wanted(signature)
+        except Exception:                               # noqa: BLE001
+            # Бренды не собрались — это не повод не собирать задачи: работаем как прежде,
+            # по листам. Молча этого не оставляем, но и прогон не роняем.
+            logger.warning("Бренды формата %s не собраны", signature[:12], exc_info=True)
+
         async def note(text):
             """Что разобрали и что пропустили — сообщением админу. Отдельно от задач:
             по их списку не видно, обошли прайс целиком или треть его."""
@@ -194,7 +217,8 @@ async def main() -> None:
                            scope=[c["category"] for c in await pricing_store.list_scope()],
                            known_columns=known_columns,
                            remember_columns=remember_columns,
-                           only_sheets=only_sheets, note=note)
+                           only_sheets=only_sheets, only_marks=only_marks,
+                           note=note)
 
     async def run_task(price, task, content, guard):
         """Выполнение задачи агентом (§6.2) — С НАСТОЯЩЕЙ ЗАПИСЬЮ в 1С.

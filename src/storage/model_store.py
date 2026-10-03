@@ -145,6 +145,9 @@ class ModelStore:
                 ("lock_acquired_at", "TEXT"),
                 ("lock_expires_at", "TEXT"),
                 ("lock_working", "INTEGER NOT NULL DEFAULT 1"),
+                # Курс евро этого прайса: у «Остатков» цены в валюте, и без курса их
+                # не перевести. Колонка дорастает, потому что таблица старше решения.
+                ("eur_rate", "REAL"),
             ):
                 if have and column not in have:
                     await db.execute(f"ALTER TABLE price ADD COLUMN {column} {ddl}")
@@ -161,8 +164,8 @@ class ModelStore:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
                 "SELECT id, supplier_id, file_id, file_path, filename, signature, "
-                "received_at, price_date, status, created_at, newer_id FROM price "
-                "ORDER BY created_at, id")
+                "received_at, price_date, status, created_at, newer_id, eur_rate "
+                "FROM price ORDER BY created_at, id")
             rows = await cur.fetchall()
 
             marks: dict[int, list[TradeMark]] = {}
@@ -189,6 +192,7 @@ class ModelStore:
                     supplier_id=row[1], file_id=row[2], file_path=row[3],
                     filename=row[4] or "", signature=row[5] or "",
                     received_at=row[6], price_date=row[7],
+                    eur_rate=row[11],
                     trade_marks=marks.get(row[0], [])),
                 status=PriceStatus(row[8]), created_at=row[9], newer_id=row[10],
                 tasks=tasks.get(row[0], []))
@@ -206,11 +210,11 @@ class ModelStore:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
                 "INSERT INTO price (supplier_id, file_id, file_path, filename, signature, "
-                "received_at, price_date, status, created_at, newer_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "received_at, price_date, status, created_at, newer_id, eur_rate) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (sp.supplier_id, sp.file_id, sp.file_path, sp.filename, sp.signature,
                  sp.received_at, sp.price_date, price.status.value, price.created_at,
-                 price.newer_id))
+                 price.newer_id, sp.eur_rate))
             price.id = cur.lastrowid
             await self._write_marks(db, price)
             for task in price.tasks:
@@ -359,6 +363,14 @@ class ModelStore:
                                    (price_id,))
             row = await cur.fetchone()
         return row[0] if row else 0
+
+    async def set_eur_rate(self, price_id: int, rate) -> bool:
+        """Курс евро этого прайса. Задаёт админ формой; считать по нему будет код."""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute("UPDATE price SET eur_rate = ? WHERE id = ?",
+                                   (rate, price_id))
+            await db.commit()
+        return cur.rowcount > 0
 
     async def rehash_signature(self, old: str, new: str) -> int:
         """Перевесить принятые прайсы со старого хеша формата на новый.

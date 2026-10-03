@@ -211,6 +211,8 @@ class PriceListService:
             return await self._rename_supplier(command)
         if kind == CommandKind.SET_SIGNATURE_SHEETS:
             return await self._set_signature_sheets(command)
+        if kind == CommandKind.SET_SIGNATURE_MARKS:
+            return await self._set_signature_marks(command)
 
         logger.warning("Неизвестная команда: %s", kind)
 
@@ -246,6 +248,59 @@ class PriceListService:
             EventKind.PRICE_STATUS,
             text=(f"Формат {signature[:12]}: разбираем листы — {sheets}." if sheets
                   else f"Формат {signature[:12]}: листы не отмечены, разбирать нечего.")))
+
+    async def _set_signature_marks(self, command: Command) -> None:
+        """Какие БРЕНДЫ разбирать внутри листа, чья это марка в 1С и скидка от розницы.
+
+        Второй список у того же формата (решение админа 03.10.2026). К разбору уходит
+        ПЕРЕСЕЧЕНИЕ отмеченных листов и отмеченных брендов: у «Остатков» лист один на 1286
+        строк и 23 бренда, и выбор листов там не разделяет ничего.
+
+        **ЗАДАЧИ ЗДЕСЬ НЕ ПЕРЕСОБИРАЮТСЯ** — ровно как с листами: флажков админ ставит
+        несколько, а прогон нужен один, после последнего.
+
+        Курс евро едет вместе с флажками, потому что задаётся той же формой, но ложится
+        НЕ К ФОРМАТУ, а к прайсу: курс меняется каждый день, и считать цены по прошлому
+        значило бы записать в 1С цифру, которой нет. У формата хранится только последний —
+        как подсказка следующему прайсу.
+        """
+        data = command.payload or {}
+        signature = str(data.get("signature") or "").strip()
+        if not signature:
+            return await self._reject(command, "не передана сигнатура формата")
+
+        rows = data.get("marks")
+        if not isinstance(rows, (list, tuple)):
+            return await self._reject(command, "не передан список брендов")
+
+        touched = await self._suppliers.set_marks_by_signature(signature, rows)
+
+        rate = data.get("rate")
+        if rate not in (None, "", 0):
+            await self._suppliers.set_eur_rate(signature, float(rate))
+            price = self.price(command.price_id) if command.price_id else None
+            if price is not None:
+                price.supplier_price.eur_rate = float(rate)
+                await self._store.set_eur_rate(price.id, float(rate))
+
+        wanted = [str(r.get("brand")) for r in rows if r.get("brand") and r.get("parse")]
+
+        # Зеркало обязано узнать: иначе флажки в форме вернутся к прежним при следующем
+        # обновлении, и админ решит, что сохранение не сработало.
+        await self.events.publish(Event(
+            EventKind.PRICE_STATUS, price_id=command.price_id,
+            text=(f"Формат {signature[:12]}: разбираем бренды — {', '.join(wanted)}."
+                  if wanted else
+                  f"Формат {signature[:12]}: бренды не отмечены, разбирать нечего.")))
+
+        if not touched and rows:
+            # Ни одна строка не совпала — состав брендов у формата другой. Молчать нельзя:
+            # админ нажал сохранить и ждёт, что выбор применился.
+            await self.events.publish(Event(
+                EventKind.PRICE_STATUS, price_id=command.price_id,
+                text=(f"Формат {signature[:12]}: ни один из присланных брендов не найден "
+                      "в справочнике — похоже, состав файла изменился. Откройте «Бренды» "
+                      "заново.")))
 
     # ------------------------------------------------------------------ задачи
 

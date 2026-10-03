@@ -37,6 +37,7 @@ from src.model.task import PriceTask
 from src.model import price_check
 from src.price_tool.items import build_name
 from src.price_tool.parser import parse_price_table, render_preview
+from src.price_tool.brands import brands_in, find_brand_column, only_brands
 from src.price_tool.signature import sheet_key
 from src.price_tool.scope import in_scope, normalize
 
@@ -253,7 +254,8 @@ class TaskBuilderTools:
     def __init__(self, content: bytes, filename: str, onec=None,
                  elsewhere: dict | None = None, scope=None,
                  known_columns: dict | None = None,
-                 only_sheets: str | None = None) -> None:
+                 only_sheets: str | None = None,
+                 only_marks: list | None = None) -> None:
         self._content = content
         self._filename = filename
         self._onec = onec
@@ -281,11 +283,29 @@ class TaskBuilderTools:
         # отмечено» приезжает сюда пустой строкой, а не отсутствием параметра.
         self._only = (None if only_sheets is None
                       else [n.strip() for n in only_sheets.split(",") if n.strip()])
+        # ВТОРОЕ УКАЗАНИЕ АДМИНА: какие БРЕНДЫ разбирать внутри листа (решение 03.10.2026).
+        # Выбор листов не помогает прайсу, у которого лист один: у «Остатков» одна вкладка
+        # на 1286 строк и 23 бренда — 88 тыс. токенов за полный разбор, причём 13 брендов из
+        # 23 в справочнике 1С отсутствуют вовсе, то есть больше половины файла не работа, а
+        # мусор. К разбору уходит ПЕРЕСЕЧЕНИЕ отмеченных листов и отмеченных брендов.
+        #
+        # `None` и пустой список — РАЗНОЕ, ровно как у листов:
+        #   None — брендами никто не управляет (колонки бренда в формате нет), разбираем всё;
+        #   []   — выбор ЕСТЬ и он пуст: ни один бренд не отмечен, разбирать нечего.
+        self._marks = (None if only_marks is None
+                       else [str(n).strip() for n in only_marks if str(n).strip()])
         # Что в итоге разобрали и что пропустили — для отчёта админу. Считает КОД: он
         # знает это точно, а пересказ модели однажды разойдётся с правдой.
         self.parsed_sheets: list[str] = []
         self.skipped_sheets: list[str] = []
         self.unknown_sheets: list[str] = []
+        # То же по брендам: что оставили, что отсекли, и сколько строк из скольких уцелело.
+        # Число строк важно само по себе — им измеряется и экономия, и правдоподобие: если
+        # уцелело ноль, разбирать нечего, и молчать об этом нельзя.
+        self.parsed_marks: list[str] = []
+        self.skipped_marks: list[str] = []
+        self.kept_rows = 0
+        self.whole_rows = 0
         # Листы, которые агент РЕАЛЬНО прочитал. «Проанализировал» — это про них, а не про
         # те, что ему предложили: лист можно было не открыть вовсе, и админ должен видеть
         # разницу между «исключил я» и «агент сам не стал смотреть».
@@ -336,8 +356,59 @@ class TaskBuilderTools:
             except Exception:                           # noqa: BLE001
                 logger.warning("Не разобрался прайс %s", self._filename, exc_info=True)
                 every = []
-            self._sheets = self._pick(every)
+            self._sheets = self._narrow(self._pick(every))
         return self._sheets
+
+    def _narrow(self, chosen: list) -> list:
+        """Оставить в отмеченных листах строки отмеченных БРЕНДОВ (решение 03.10.2026).
+
+        **СУЖАЕМ ЗДЕСЬ, А НЕ В `_read`**, и это важно по двум причинам. Первая: `_read`
+        отдаёт лист через `render_preview`, и если фильтровать там, то нумерация строк и
+        листание `from_row` считались бы по НЕотфильтрованному листу — агент дочитывал бы
+        «с строки 500» и получал чужие бренды. Отфильтровав раньше, мы не меняем в чтении
+        ничего: у нового листа своя нумерация с единицы. Вторая: только здесь видно, что
+        после сужения не осталось ни строки, — а это законный исход, о котором обязан узнать
+        админ, и узнать ДО того, как мы позовём модель.
+
+        **Лист без колонки бренда проходит как есть.** У прайса бывает служебная вкладка без
+        брендов вовсе, и выбросить её молча значило бы спрятать часть файла по признаку,
+        которого в ней нет.
+        """
+        if self._marks is None:
+            return chosen
+
+        if not self._marks:
+            self.pick_problem = "бренды не отмечены"
+            self.skipped_marks = []
+            return []
+
+        out = []
+        for sheet in chosen:
+            spot = find_brand_column(sheet)
+            if spot is None:
+                out.append(sheet)
+                continue
+
+            whole = brands_in(sheet, spot)
+            self.whole_rows += sum(rows for _, rows in whole)
+            for brand, rows in whole:
+                keep = normalize(brand) in {normalize(n) for n in self._marks}
+                side = self.parsed_marks if keep else self.skipped_marks
+                if brand not in side:
+                    side.append(brand)
+                if keep:
+                    self.kept_rows += rows
+
+            out.append(only_brands(sheet, spot, self._marks))
+
+        # ПЕРЕСЕЧЕНИЕ ПУСТО — это не поломка файла и не «расхождений нет». Бренды отмечены,
+        # листы отмечены, а общего у них ничего: поставщик переименовал бренд либо отмеченные
+        # бренды лежат на другом листе. Выдать это за «работы нет» нельзя.
+        if self.whole_rows and not self.kept_rows:
+            self.pick_problem = "ни одного отмеченного бренда нет в отмеченных листах"
+            return []
+
+        return out
 
     def _pick(self, every: list) -> list:
         """Оставить листы, отмеченные админом.
@@ -416,6 +487,13 @@ class TaskBuilderTools:
 
     def _read(self, inp: dict) -> str:
         if not self.sheets:
+            # РАЗНЫЕ ПРИЧИНЫ — РАЗНЫЕ ОТВЕТЫ. «Файл не разобрался» про целый файл, у
+            # которого просто не выбрали, что смотреть, — это ложь, и агент на ней заведёт
+            # задачи «по имени файла». Штатно он сюда не попадает (`build` не зовёт модель,
+            # когда `pick_problem` стоит), но инструмент обязан отвечать правду и в обход.
+            if self.pick_problem:
+                return (f"Разбирать нечего: {self.pick_problem}. Файл цел, выбор не сделан "
+                        "или устарел — задачи не заводи, об этом скажет отчёт админу.")
             return ("Файл не разобрался. Заводи задачи по тому, что известно из имени "
                     "файла, и скажи об этом в описании.")
         wanted = (inp.get("sheet") or "").strip().lower()
@@ -437,8 +515,26 @@ class TaskBuilderTools:
             self.read_sheets.append(sheet.name)
         head = (f"Листы: {', '.join(s.name for s in self.sheets)}\n"
                 f"=== Лист: {sheet.name} === (со строки {start})\n")
-        return head + self._remembered(sheet.name) \
+        return head + self._brand_note() + self._remembered(sheet.name) \
             + render_preview(sheet, max_rows=MAX_SHEET_ROWS, start=start)
+
+    def _brand_note(self) -> str:
+        """Сказать агенту, что лист показан НЕ ЦЕЛИКОМ.
+
+        Без этой строки он решит, что видит прайс полностью, и напишет в задаче неверное
+        основание: «в прайсе 9 декоров» вместо «в показанной части 9». Та же причина, по
+        которой `render_preview` помечает обрезку по строкам, — только здесь отсечено не
+        начало и не хвост, а бренды, которых админ не отмечал.
+        """
+        if self._marks is None or not self.skipped_marks:
+            return ""
+        hidden = ", ".join(self.skipped_marks[:6])
+        more = (f" и ещё {len(self.skipped_marks) - 6}"
+                if len(self.skipped_marks) > 6 else "")
+        return (f"ЛИСТ ПОКАЗАН НЕ ЦЕЛИКОМ: по указанию админа разбираем только бренды "
+                f"{', '.join(self.parsed_marks)} — {self.kept_rows} строк из "
+                f"{self.whole_rows}. Скрыты: {hidden}{more}. Не делай выводов о прайсе "
+                f"целиком и не предлагай работу по скрытым брендам.\n")
 
     def _remembered(self, sheet: str) -> str:
         """Напоминание о том, какие колонки уже выбраны для этого формата.
@@ -1947,6 +2043,18 @@ def sheets_report(tools) -> str:
                 "В прайсе есть листы: " + ", ".join(tools.skipped_sheets) + ".\n"
                 "Отметьте нужные (двойной щелчок по имени файла в форме 1С) и нажмите "
                 "«Обновить задачи».")
+    if tools.pick_problem == "бренды не отмечены":
+        return ("Бренды не отмечены — задачи не собирал.\n"
+                "В этом формате товары размечены брендами, и разбирать их все незачем: "
+                "у таких прайсов половина брендов обычно к магазину не относится.\n"
+                "Откройте «Бренды» в форме 1С, отметьте нужные и нажмите "
+                "«Обновить задачи».")
+    if tools.pick_problem == "ни одного отмеченного бренда нет в отмеченных листах":
+        return ("Пересечение пусто — задачи не собирал.\n"
+                "Отмеченных брендов в отмеченных листах нет ни одной строки.\n"
+                "В листах есть: " + ", ".join(tools.skipped_marks[:12]) + ".\n"
+                "Похоже, поставщик переименовал бренды либо они лежат на листе, который "
+                "не отмечен: проверьте оба списка.")
     if tools.pick_problem:
         return ("Ни один отмеченный лист не найден в файле — задачи не собирал.\n"
                 "Отмечены: " + ", ".join(tools.unknown_sheets) + ".\n"
@@ -1975,6 +2083,20 @@ def sheets_report(tools) -> str:
         lines.append("⚠️ Отмечены листы, которых в файле нет: "
                      + ", ".join(tools.unknown_sheets)
                      + ". Остальные отмеченные нашлись и разобраны.")
+
+    # БРЕНДЫ — ТРЕТЬЯ ГРУППА ПО ТОЙ ЖЕ ПРИЧИНЕ, что и листы. Бренд, появившийся в новом
+    # файле и не отмеченный, выпадает из работы МОЛЧА: задач по нему нет, а почему — не
+    # видно. Поэтому называем и то, что разобрали, и то, что скрыли, и чем это измеряется в
+    # строках: по числу строк видно, велика ли отброшенная часть.
+    if tools.parsed_marks:
+        lines.append(f"Разобраны бренды ({tools.kept_rows} строк из {tools.whole_rows}): "
+                     + ", ".join(tools.parsed_marks) + ".")
+    if tools.skipped_marks:
+        hidden = tools.skipped_marks[:12]
+        tail = (f" и ещё {len(tools.skipped_marks) - 12}"
+                if len(tools.skipped_marks) > 12 else "")
+        lines.append("Бренды не отмечены и в разбор не входили: "
+                     + ", ".join(hidden) + tail + ".")
     return "\n".join(lines)
 
 
@@ -1983,6 +2105,7 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
                 elsewhere: dict | None = None,
                 remember=None, scope=None, known_columns=None,
                 remember_columns=None, only_sheets: str | None = None,
+                only_marks: list | None = None,
                 note=None) -> tuple[list[PriceTask], str]:
     """Прогон формирования задач. Возвращает (задачи, короткий ответ агента).
 
@@ -1995,7 +2118,7 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
     """
     tools = TaskBuilderTools(content, filename, onec=onec, elsewhere=elsewhere,
                              scope=scope, known_columns=known_columns,
-                             only_sheets=only_sheets)
+                             only_sheets=only_sheets, only_marks=only_marks)
     task = f"Прайс «{filename}». Составь список задач по нему."
 
     # РАЗБИРАТЬ НЕЧЕГО — МОДЕЛЬ НЕ ЗОВЁМ ВОВСЕ. Ради этого вся затея и нужна: прогон по

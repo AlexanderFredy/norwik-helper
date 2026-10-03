@@ -38,8 +38,12 @@ class FakeOnec:
         self.states.append(list(items))
         return {"updated": len(items), "results": []}
 
-    def set_model_state(self, prices, sheets=None):
+    def set_model_state(self, prices, sheets=None, marks=None):
+        # Подпись двойника обязана совпадать с настоящей: разойдись она — вызов упал бы
+        # внутри провайдера, а тот гасит исключения, и тест падал бы в другом месте.
         self.snapshots.append(prices)
+        self.sheets = sheets
+        self.marks = marks
         return {"version": len(self.snapshots), "prices": len(prices), "changed": 1}
 
 
@@ -172,7 +176,7 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         onec = FakeOnec()
         broken = []
 
-        def fail(prices, sheets=None):
+        def fail(prices, sheets=None, marks=None):
             broken.append(prices)
             raise RuntimeError("сеть моргнула")
 
@@ -308,7 +312,7 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         """
         onec = FakeOnec([command()])
         order = []
-        onec.set_model_state = (lambda prices, sheets=None:
+        onec.set_model_state = (lambda prices, sheets=None, marks=None:
                                 order.append("снимок") or {"version": 1})
         onec.agent_commands_state = lambda items: order.append(
             "судьба:" + items[0]["state"]) or {"updated": len(items)}
@@ -344,7 +348,7 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
             def agent_commands_state(self, items):
                 raise RuntimeError("1С недоступна")
 
-            def set_model_state(self, prices, sheets=None):
+            def set_model_state(self, prices, sheets=None, marks=None):
                 raise RuntimeError("1С недоступна")
 
         provider = self.make(Dead())

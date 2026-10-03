@@ -30,6 +30,10 @@ class SupplierPrice:
     received_at: str | None = None
     price_date: str | None = None
     signature: str = ""
+    #: Курс евро ДЛЯ ЭТОГО ПРАЙСА (решение админа 03.10.2026). У прайса, а не у формата:
+    #: курс меняется каждый день, и посчитать цены по прошлому значило бы записать в 1С
+    #: цифру, которой нет. У формата хранится последний введённый — как подсказка форме.
+    eur_rate: float | None = None
     trade_marks: list[TradeMark] = field(default_factory=list)
 
     def __post_init__(self) -> None:

@@ -388,6 +388,88 @@ async def cmd_signature_sheets(message: Message, command: CommandObject,
         "молча разобрать ноль листов значило бы выдать «работы нет».")
 
 
+@router.message(Command("signature_marks"))
+async def cmd_signature_marks(message: Message, command: CommandObject,
+                              supplier_store: SupplierStore, is_admin: bool,
+                              model=None) -> None:
+    """Какие БРЕНДЫ разбирать внутри листов этого формата (решение админа 03.10.2026).
+
+    Основной путь — форма «Бренды» в 1С: там и флажки, и привязка к марке, и скидка. Эта
+    команда нужна для двух случаев, и оба настоящие: пока форма не выложена, отмечать
+    бренды больше нечем, а когда выложена — списком удобно СМОТРЕТЬ состав файла, не
+    переключаясь в 1С.
+
+    Отмечаем НОМЕРАМИ из показанного списка, а не именами: ярлыки вида
+    «FLORIM-Luxury (Rex)» и «Italon Керамический гранит» набирать руками — верный способ
+    промахнуться, а промах здесь означает разбор не того бренда.
+    """
+    if not is_admin:
+        return await _deny(message)
+
+    parts = (command.args or "").strip().split(maxsplit=1)
+    every = await supplier_store.list_signatures()
+    target = _pick(every, parts[0]) if parts else None
+    if target is None:
+        await message.answer(
+            "Нужен номер из /signatures:\n"
+            "/signature_marks 2 — показать бренды формата\n"
+            "/signature_marks 2 1,4,7 — отметить к разбору первый, четвёртый и седьмой\n"
+            "/signature_marks 2 - — снять все отметки")
+        return
+
+    label = view.signature_label(target)
+    marks = await supplier_store.marks_for(target.signature)
+    if not marks:
+        await message.answer(
+            f"Формат «{label}»: брендов не видели.\n"
+            "Либо прайс этого формата ещё не приходил, либо товары в нём не размечены "
+            "колонкой бренда — тогда разбор идёт по листам, как обычно.")
+        return
+
+    if len(parts) == 1:
+        lines = [f"Формат «{label}», брендов {len(marks)}:"]
+        for number, mark in enumerate(marks, 1):
+            flag = "✅" if mark.parse else "☐"
+            tail = f" → {mark.tm_name}" if mark.tm_name else " → марки в 1С нет"
+            gone = "" if mark.rows else "  (в последнем файле нет)"
+            lines.append(f"{number}. {flag} {mark.brand} — {mark.rows} поз.{tail}{gone}")
+        lines.append("")
+        lines.append(f"Отметить: /signature_marks {parts[0]} 1,4,7")
+        lines.append(f"Снять все: /signature_marks {parts[0]} -")
+        lines.append("Марку и скидку задают в форме «Бренды» в 1С.")
+        await message.answer("\n".join(lines))
+        return
+
+    arg = parts[1].strip()
+    if arg == "-":
+        chosen: set[int] = set()
+    else:
+        try:
+            chosen = {int(n) for n in arg.replace(" ", "").split(",") if n}
+        except ValueError:
+            await message.answer("Номера через запятую: /signature_marks "
+                                 f"{parts[0]} 1,4,7")
+            return
+
+    rows = [{"brand": mark.brand, "parse": number in chosen,
+             "tm_code": mark.tm_code, "tm_name": mark.tm_name,
+             "discount": mark.discount}
+            for number, mark in enumerate(marks, 1)]
+    await supplier_store.set_marks_by_signature(target.signature, rows)
+
+    wanted = [r["brand"] for r in rows if r["parse"]]
+    await _mirrors_know(model)
+    if not wanted:
+        await message.answer(f"Формат «{label}»: отметки сняты. Разбирать нечего — "
+                             "«Обновить задачи» даст пустой список.")
+        return
+    await message.answer(
+        f"Формат «{label}»: разбираем бренды — {', '.join(wanted)}.\n\n"
+        "К разбору уходит ПЕРЕСЕЧЕНИЕ отмеченных листов и отмеченных брендов: если "
+        "отмеченный бренд лежит на неотмеченном листе, он не попадёт, и агент скажет об "
+        "этом в отчёте.")
+
+
 # ------------------------------------------------------------ дайджест по фото
 
 # Имя команды — как его задал админ (30.09.2026). Правильное написание принимается вторым:

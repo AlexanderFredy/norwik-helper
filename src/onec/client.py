@@ -756,7 +756,8 @@ class OnecClient:
         return self._post_json("/get-products/agent-commands-state", {"commands": items})
 
     def set_model_state(self, prices: list[dict],
-                        sheets: list[dict] | None = None) -> dict:
+                        sheets: list[dict] | None = None,
+                        marks: list[dict] | None = None) -> dict:
         """Положить в 1С ПОЛНЫЙ снимок состояния модели (§3.3).
 
         Целиком, а не приращениями: снимок мал (десятки строк) и самоисцеляющийся —
@@ -776,6 +777,10 @@ class OnecClient:
         # стирать выбор админа, а снимок без форматов — должен.
         if sheets is not None:
             payload["sheets"] = sheets
+        # БРЕНДЫ — третий такой же блок (решение админа 03.10.2026). Правило то же:
+        # отсутствующий ключ не трогает зеркало, пустой список его вычищает.
+        if marks is not None:
+            payload["marks"] = marks
         return self._post_json("/get-products/set-model-state", payload)
 
     def by_tm_all(self, tm_code: str | None, size: int | None = None, max_pages: int = 500,
