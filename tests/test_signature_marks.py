@@ -134,11 +134,19 @@ class StoreTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.store.marks_wanted("hash-2"), ["ABK"])
         self.assertEqual(await self.store.marks_for("hash-1"), [])
 
-    async def test_brand_column_and_rate_are_remembered(self):
+    async def test_brand_column_and_currency_are_remembered(self):
+        """Валюта одна на прайс, но ПОСЛЕДНЯЯ введённая живёт у формата — как подсказка
+        форме: курс меняется каждый день, и считать по прошлому нельзя."""
         await self.store.set_signature_brand_col("hash-1", 5)
-        await self.store.set_eur_rate("hash-1", 98.4321)
+        await self.store.set_last_currency("hash-1", "978", "EUR", 98.4321)
         self.assertEqual(await self.store.brand_col_for("hash-1"), 5)
-        self.assertEqual(await self.store.eur_rate_for("hash-1"), 98.4321)
+        self.assertEqual(await self.store.last_currency("hash-1"),
+                         {"code": "978", "name": "EUR", "rate": 98.4321})
+
+    async def test_without_a_currency_it_is_roubles(self):
+        """Не указана — считаем рублём, как раньше."""
+        self.assertEqual(await self.store.last_currency("hash-1"),
+                         {"code": "", "name": "", "rate": None})
 
     async def test_unknown_signature_gives_nothing(self):
         self.assertEqual(await self.store.marks_for("нет-такого"), [])
@@ -253,11 +261,13 @@ class CommandTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows["ABK"].discount, 17.5)
         self.assertFalse(rows["VitrA"].parse)
 
-    async def test_rate_is_remembered_for_the_format(self):
-        """У формата — ПОСЛЕДНИЙ курс, как подсказка форме. Курс самого прайса ставится
-        отдельно, потому что меняется каждый день."""
-        await self.send({"signature": "hash-1", "marks": [], "rate": 98.5})
-        self.assertEqual(await self.store.eur_rate_for("hash-1"), 98.5)
+    async def test_currency_and_rate_travel_together(self):
+        """Курс без валюты выглядит заданным, а чего он курс — неизвестно: держать их
+        врозь нельзя. Код валюты — по международному классификатору."""
+        await self.send({"signature": "hash-1", "marks": [],
+                         "currency": "978", "currency_name": "EUR", "rate": 98.5})
+        self.assertEqual(await self.store.last_currency("hash-1"),
+                         {"code": "978", "name": "EUR", "rate": 98.5})
 
     async def test_unknown_signature_is_refused(self):
         await self.send({"signature": "нет-такого", "marks": [{"brand": "ABK"}]})

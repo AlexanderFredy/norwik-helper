@@ -160,8 +160,8 @@ TOOLS = [
             "закупка, где РРЦ (номер колонки с единицы либо кусок заголовка). Достаточно "
             "одного раза на лист.\n"
             "ЗАКУПКИ В ПРАЙСЕ МОЖЕТ НЕ БЫТЬ ВОВСЕ — только розница. Тогда НЕ называй "
-            "розницу закупкой: передай её как `retail` (рублёвую) и `retail_eur` "
-            "(валютную). Закупку посчитает код по скидке дилера и курсу.\n"
+            "розницу закупкой: передай её как `retail` (рублёвую) и `retail_cur` "
+            "(в валюте прайса). Закупку посчитает код по скидке дилера и курсу.\n"
             "2) Цена ОДНА НА КОЛЛЕКЦИЮ (так пишут часто: цифры стоят в строке коллекции, "
             "у остальных декоров ячейки пустые): передай `prices` — {purchase, rrc}.\n"
             "Сравнивает код и отвечает полем `цены`: что расходится, сколько позиций уже "
@@ -200,7 +200,7 @@ TOOLS = [
                         # Закупки в прайсе может не быть вовсе — тогда называй РОЗНИЦУ, а
                         # закупку посчитает код по скидке дилера и курсу валюты.
                         "retail": {"type": ["string", "integer"]},
-                        "retail_eur": {"type": ["string", "integer"]},
+                        "retail_cur": {"type": ["string", "integer"]},
                         "sheet": {"type": "string"},
                     },
                     "additionalProperties": False,
@@ -266,7 +266,7 @@ class TaskBuilderTools:
                  only_sheets: str | None = None,
                  only_marks: list | None = None,
                  discounts: dict | None = None,
-                 eur_rate: float | None = None) -> None:
+                 currency: dict | None = None) -> None:
         self._content = content
         self._filename = filename
         self._onec = onec
@@ -310,7 +310,8 @@ class TaskBuilderTools:
         # Ключи скидок нормализованы (`scope.normalize`), как и имена брендов.
         self._discounts = {normalize(k): v for k, v in (discounts or {}).items()
                            if normalize(k)}
-        self._eur_rate = eur_rate
+        # ВАЛЮТА ПРАЙСА С КУРСОМ: {"code", "name", "rate"}. Пусто — рубль, как раньше.
+        self._currency = dict(currency or {})
         # Что в итоге разобрали и что пропустили — для отчёта админу. Считает КОД: он
         # знает это точно, а пересказ модели однажды разойдётся с правдой.
         self.parsed_sheets: list[str] = []
@@ -550,14 +551,16 @@ class TaskBuilderTools:
         if not shape.retail_only:
             return ""
 
+        terms = self._terms(self._single_discount())
+        money = terms.money if terms.currency else "валюте прайса"
+
         note = ("ЗАКУПОЧНЫХ ЦЕН В ЭТОМ ПРАЙСЕ НЕТ — только розница поставщика. НЕ называй "
                 "розницу закупкой: в `price_columns` передай её как `retail` (рублёвую)"
-                + (" и `retail_eur` (в евро)" if shape.euro else "")
+                + (f" и `retail_cur` (в {money})" if shape.currency else "")
                 + ". Закупку посчитает код: розница минус скидка дилера"
-                + (" и по курсу валюты" if shape.euro else "") + ".")
+                + (f" и по курсу {money}" if shape.currency else "") + ".")
 
-        terms = dealer_price.Terms(discount=self._single_discount(), rate=self._eur_rate)
-        gap = dealer_price.missing(terms, currency=shape.euro)
+        gap = dealer_price.missing(terms, currency=shape.currency)
         if gap:
             note += (" Внимание: " + gap
                      + " Пока условий нет, задачу по ценам не заводи вовсе.")
@@ -1391,6 +1394,13 @@ class TaskBuilderTools:
         self._remember_prices(from_price)
         return price_check.report(price_check.compare(found, from_price))
 
+    def _terms(self, discount):
+        """Условия пересчёта с валютой прайса. Валюта одна на прайс, скидка — у бренда."""
+        return dealer_price.Terms(discount=discount,
+                                  rate=self._currency.get("rate"),
+                                  currency=self._currency.get("code") or "",
+                                  currency_name=self._currency.get("name") or "")
+
     def _terms_reader(self, sheet):
         """Функция «строка → условия пересчёта» для ОДНОГО листа.
 
@@ -1406,14 +1416,12 @@ class TaskBuilderTools:
         Обход идёт по файлу сверху вниз (так читает `prices_from_rows`), и этого довольно.
         """
         spot = find_brand_column(sheet)
-        rate = self._eur_rate
 
         if spot is None:
             # Брендов в листе нет. Единственную заданную скидку применить можно — она
             # относится к формату целиком; несколько разных привязать не к чему.
             only = {value for value in self._discounts.values() if value}
-            single = dealer_price.Terms(
-                discount=only.pop() if len(only) == 1 else None, rate=rate)
+            single = self._terms(only.pop() if len(only) == 1 else None)
             return lambda row: single
 
         last = {"brand": ""}
@@ -1423,8 +1431,7 @@ class TaskBuilderTools:
                      if len(row) > spot.column else "")
             if value:
                 last["brand"] = value
-            return dealer_price.Terms(
-                discount=self._discounts.get(normalize(last["brand"])), rate=rate)
+            return self._terms(self._discounts.get(normalize(last["brand"])))
 
         return read
 
@@ -1435,9 +1442,9 @@ class TaskBuilderTools:
         одного без скидки, чтобы сказать об этом заранее — иначе его позиции молча выпали бы
         из сверки как «цены нет в прайсе», и причина осталась бы неизвестной.
         """
-        currency = cols.retail is None and cols.retail_eur is not None
-        if currency and not dealer_price.Terms(rate=self._eur_rate).has_rate:
-            return dealer_price.missing(dealer_price.Terms(), currency=True)
+        currency = cols.retail is None and cols.retail_cur is not None
+        if currency and not self._terms(None).has_currency:
+            return dealer_price.missing(self._terms(None), currency=True)
 
         spot = find_brand_column(sheet)
         if spot is None:
@@ -1445,8 +1452,8 @@ class TaskBuilderTools:
             return dealer_price.missing(terms, currency=currency)
 
         without = [brand for brand, _ in brands_in(sheet, spot)
-                   if not dealer_price.Terms(
-                       discount=self._discounts.get(normalize(brand))).has_discount]
+                   if not self._terms(
+                       self._discounts.get(normalize(brand))).has_discount]
         if not without:
             return ""
         return ("скидка дилера не задана у брендов: " + ", ".join(without[:8])
@@ -2236,7 +2243,7 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
                 remember=None, scope=None, known_columns=None,
                 remember_columns=None, only_sheets: str | None = None,
                 only_marks: list | None = None,
-                discounts: dict | None = None, eur_rate: float | None = None,
+                discounts: dict | None = None, currency: dict | None = None,
                 note=None) -> tuple[list[PriceTask], str]:
     """Прогон формирования задач. Возвращает (задачи, короткий ответ агента).
 
@@ -2250,7 +2257,7 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
     tools = TaskBuilderTools(content, filename, onec=onec, elsewhere=elsewhere,
                              scope=scope, known_columns=known_columns,
                              only_sheets=only_sheets, only_marks=only_marks,
-                             discounts=discounts, eur_rate=eur_rate)
+                             discounts=discounts, currency=currency)
     task = f"Прайс «{filename}». Составь список задач по нему."
 
     # РАЗБИРАТЬ НЕЧЕГО — МОДЕЛЬ НЕ ЗОВЁМ ВОВСЕ. Ради этого вся затея и нужна: прогон по

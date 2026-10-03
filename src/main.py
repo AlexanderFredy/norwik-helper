@@ -230,7 +230,9 @@ async def main() -> None:
                            remember_columns=remember_columns,
                            only_sheets=only_sheets, only_marks=only_marks,
                            discounts=discounts,
-                           eur_rate=price.supplier_price.eur_rate,
+                           currency={"code": price.supplier_price.currency_code,
+                                     "name": price.supplier_price.currency_name,
+                                     "rate": price.supplier_price.rate},
                            note=note)
 
     async def run_task(price, task, content, guard):
@@ -263,7 +265,9 @@ async def main() -> None:
             mine = next((m for m in marks if m.tm_code and m.tm_code == code), None)
             if mine is not None:
                 terms = Terms(discount=mine.discount,
-                              rate=price.supplier_price.eur_rate)
+                              rate=price.supplier_price.rate,
+                              currency=price.supplier_price.currency_code,
+                              currency_name=price.supplier_price.currency_name)
         except Exception:                               # noqa: BLE001
             logger.warning("Условия пересчёта цен не прочитаны", exc_info=True)
 

@@ -41,7 +41,7 @@ LABEL = {"purchase": "закупка", "rrc": "РРЦ"}
 #: Колонки-ИСТОЧНИКИ: из них цена ВЫЧИСЛЯЕТСЯ, а не берётся как есть. Нужны прайсам без
 #: закупки (решение админа 03.10.2026): дилеру дают скидку процентом от розницы, своим на
 #: каждую марку, а валютную цену приводят курсом.
-SOURCES = ("retail", "retail_eur")
+SOURCES = ("retail", "retail_cur")
 
 # Мусор, который бывает в ценовой ячейке: валюта, единица, неразрывные пробелы.
 _CLEAN = re.compile(r"[^\d,.\-]")
@@ -51,27 +51,30 @@ _CLEAN = re.compile(r"[^\d,.\-]")
 class Columns:
     """Разрешённые номера колонок (с нуля). `article` обязателен, цены — нет.
 
-    `retail` и `retail_eur` — РОЗНИЦА поставщика (решение админа 03.10.2026). У части
-    прайсов закупки нет вовсе, и закупку считает код: розница минус скидка дилера, валютная
-    — ещё и по курсу (`model/dealer_price.py`). Это ИСТОЧНИК, а не вид цены: сверяются и
-    пишутся по-прежнему только закупка и РРЦ.
+    `retail` и `retail_cur` — РОЗНИЦА поставщика (решение админа 03.10.2026): в рублях и в
+    ВАЛЮТЕ ПРАЙСА соответственно. У части прайсов закупки нет вовсе, и закупку считает код:
+    розница минус скидка дилера, валютная — ещё и по курсу (`model/dealer_price.py`). Это
+    ИСТОЧНИК, а не вид цены: сверяются и пишутся по-прежнему только закупка и РРЦ.
+
+    Валюта у прайса ОДНА и указывается человеком, поэтому колонка и называется «в валюте», а
+    не «в евро»: евро тут не единственный случай.
     """
     article: int
     purchase: int | None = None
     rrc: int | None = None
     retail: int | None = None
-    retail_eur: int | None = None
+    retail_cur: int | None = None
 
     @property
     def any_price(self) -> bool:
         return any(value is not None for value in
-                   (self.purchase, self.rrc, self.retail, self.retail_eur))
+                   (self.purchase, self.rrc, self.retail, self.retail_cur))
 
     @property
     def from_retail(self) -> bool:
         """Цены придётся считать из розницы: прямых колонок нет."""
         return (self.purchase is None and self.rrc is None
-                and (self.retail is not None or self.retail_eur is not None))
+                and (self.retail is not None or self.retail_cur is not None))
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,12 @@ def resolve_columns(rows, spec: dict) -> Columns | str:
     Принимается и номер (с единицы, как человек считает), и кусок заголовка: модель видит
     лист табами, без буквенных имён колонок, и заголовок для неё надёжнее счёта.
     """
+    # `retail_eur` принимается как СТАРОЕ имя `retail_cur`: валюта стала настраиваемой
+    # (03.10.2026), а запомненный маппинг колонок живёт у сигнатуры и переживает выкладку.
+    spec = dict(spec or {})
+    if spec.get("retail_cur") in (None, "") and spec.get("retail_eur") not in (None, ""):
+        spec["retail_cur"] = spec.pop("retail_eur")
+
     got: dict[str, int | None] = {}
     for key in ("article", *KINDS, *SOURCES):
         raw = spec.get(key)
@@ -130,7 +139,7 @@ def resolve_columns(rows, spec: dict) -> Columns | str:
     if got["article"] is None:
         return "В price_columns обязателен article: сверка идёт по артикулу."
     cols = Columns(article=got["article"], purchase=got["purchase"], rrc=got["rrc"],
-                   retail=got["retail"], retail_eur=got["retail_eur"])
+                   retail=got["retail"], retail_cur=got["retail_cur"])
     if not cols.any_price:
         return "В price_columns нет ни одной ценовой колонки — сверять нечего."
     return cols
@@ -204,7 +213,7 @@ def _from_retail(row, cols: Columns, terms_for) -> dict:
     if terms_for is None:
         return {}
 
-    for at, currency in ((cols.retail, False), (cols.retail_eur, True)):
+    for at, currency in ((cols.retail, False), (cols.retail_cur, True)):
         if at is None or len(row) <= at:
             continue
         value = to_decimal(row[at])

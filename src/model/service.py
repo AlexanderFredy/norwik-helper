@@ -275,13 +275,23 @@ class PriceListService:
 
         touched = await self._suppliers.set_marks_by_signature(signature, rows)
 
+        # ВАЛЮТА С КУРСОМ ЕДУТ ВМЕСТЕ и ложатся к ПРАЙСУ. Валюта одна на прайс, курс
+        # относится именно к ней, и держать их врозь нельзя: число без валюты выглядит
+        # заданным, а чего оно курс — неизвестно. Не указана валюта — считаем рублём, как
+        # раньше, и курс тогда ни на что не влияет.
+        code = str(data.get("currency") or "").strip()
+        name = str(data.get("currency_name") or "").strip()
         rate = data.get("rate")
-        if rate not in (None, "", 0):
-            await self._suppliers.set_eur_rate(signature, float(rate))
+        rate = float(rate) if rate not in (None, "", 0) else None
+
+        if code or rate is not None:
+            await self._suppliers.set_last_currency(signature, code, name, rate)
             price = self.price(command.price_id) if command.price_id else None
             if price is not None:
-                price.supplier_price.eur_rate = float(rate)
-                await self._store.set_eur_rate(price.id, float(rate))
+                price.supplier_price.currency_code = code
+                price.supplier_price.currency_name = name
+                price.supplier_price.rate = rate
+                await self._store.set_currency(price.id, code, name, rate)
 
         wanted = [str(r.get("brand")) for r in rows if r.get("brand") and r.get("parse")]
 

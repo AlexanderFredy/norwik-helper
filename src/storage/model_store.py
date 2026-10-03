@@ -145,9 +145,12 @@ class ModelStore:
                 ("lock_acquired_at", "TEXT"),
                 ("lock_expires_at", "TEXT"),
                 ("lock_working", "INTEGER NOT NULL DEFAULT 1"),
-                # Курс евро этого прайса: у «Остатков» цены в валюте, и без курса их
-                # не перевести. Колонка дорастает, потому что таблица старше решения.
-                ("eur_rate", "REAL"),
+                # ВАЛЮТА ПРАЙСА И ЕЁ КУРС (решение админа 03.10.2026): одна на прайс,
+                # указывает человек, код — по международному классификатору. Не указана —
+                # считаем рублём. Колонки дорастают: таблица старше решения.
+                ("currency_code", "TEXT"),
+                ("currency_name", "TEXT"),
+                ("rate", "REAL"),
             ):
                 if have and column not in have:
                     await db.execute(f"ALTER TABLE price ADD COLUMN {column} {ddl}")
@@ -164,7 +167,8 @@ class ModelStore:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
                 "SELECT id, supplier_id, file_id, file_path, filename, signature, "
-                "received_at, price_date, status, created_at, newer_id, eur_rate "
+                "received_at, price_date, status, created_at, newer_id, "
+                "COALESCE(currency_code, ''), COALESCE(currency_name, ''), rate "
                 "FROM price ORDER BY created_at, id")
             rows = await cur.fetchall()
 
@@ -192,7 +196,7 @@ class ModelStore:
                     supplier_id=row[1], file_id=row[2], file_path=row[3],
                     filename=row[4] or "", signature=row[5] or "",
                     received_at=row[6], price_date=row[7],
-                    eur_rate=row[11],
+                    currency_code=row[11], currency_name=row[12], rate=row[13],
                     trade_marks=marks.get(row[0], [])),
                 status=PriceStatus(row[8]), created_at=row[9], newer_id=row[10],
                 tasks=tasks.get(row[0], []))
@@ -210,11 +214,12 @@ class ModelStore:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
                 "INSERT INTO price (supplier_id, file_id, file_path, filename, signature, "
-                "received_at, price_date, status, created_at, newer_id, eur_rate) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "received_at, price_date, status, created_at, newer_id, "
+                "currency_code, currency_name, rate) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (sp.supplier_id, sp.file_id, sp.file_path, sp.filename, sp.signature,
                  sp.received_at, sp.price_date, price.status.value, price.created_at,
-                 price.newer_id, sp.eur_rate))
+                 price.newer_id, sp.currency_code, sp.currency_name, sp.rate))
             price.id = cur.lastrowid
             await self._write_marks(db, price)
             for task in price.tasks:
@@ -364,11 +369,18 @@ class ModelStore:
             row = await cur.fetchone()
         return row[0] if row else 0
 
-    async def set_eur_rate(self, price_id: int, rate) -> bool:
-        """Курс евро этого прайса. Задаёт админ формой; считать по нему будет код."""
+    async def set_currency(self, price_id: int, code: str = "", name: str = "",
+                           rate=None) -> bool:
+        """Валюта прайса и её курс. Задаёт админ формой; считать по ним будет код.
+
+        Пишутся ВМЕСТЕ: курс без валюты выглядит заданным, а чего он курс — неизвестно, и
+        по такому числу однажды посчитали бы цену не в той валюте.
+        """
         async with aiosqlite.connect(self._db_path) as db:
-            cur = await db.execute("UPDATE price SET eur_rate = ? WHERE id = ?",
-                                   (rate, price_id))
+            cur = await db.execute(
+                "UPDATE price SET currency_code = ?, currency_name = ?, rate = ? "
+                "WHERE id = ?",
+                (str(code or "").strip(), str(name or "").strip(), rate, price_id))
             await db.commit()
         return cur.rowcount > 0
 

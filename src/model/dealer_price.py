@@ -39,15 +39,28 @@ _PURCHASE = re.compile(r"закуп|опт|дилер|dealer|wholesale", re.I)
 #: «Розничная цена в рублях» — там «розничн», и шаблон «розниц» её не находил (поймано на
 #: живом файле 03.10.2026, до того признак молча считал прайс обычным).
 _RETAIL = re.compile(r"розн|retail|ррц|мрц|rrp", re.I)
-#: Что означает валюту. Евро — единственная валюта, встреченная живьём.
-_EURO = re.compile(r"евро|eur|€", re.I)
+#: Что означает цену в ВАЛЮТЕ. Какая именно валюта — решает не шапка, а указанная у прайса
+#: (правка админа 03.10.2026): евро тут не единственный случай, бывают доллары и юани, и
+#: шапка их всё равно не различает надёжно — «$» ставят и рядом с рублёвой ценой.
+_CURRENCY = re.compile(r"евро|eur|€|usd|долл|\$|юан|cny|¥|валют", re.I)
 
 
 @dataclass(frozen=True)
 class Terms:
-    """Чем розница превращается в закупку. Ноль и None — одно и то же: «не задано»."""
+    """Чем розница превращается в закупку. Ноль и None — одно и то же: «не задано».
+
+    **ВАЛЮТА — ОДНА НА ПРАЙС** (правка админа 03.10.2026), и указывает её человек, а не
+    шапка файла: `currency` — код по международному классификатору («978» EUR, «840» USD),
+    `currency_name` — как её показать. Не указана — считаем рублём, как раньше: тогда
+    валютных колонок у прайса нет и курс не нужен вовсе.
+
+    `rate` относится ИМЕННО К ЭТОЙ валюте. Держать курс без валюты бессмысленно: по числу
+    98,43 нельзя сказать, чего оно курс.
+    """
     discount: float | None = None
     rate: float | None = None
+    currency: str = ""
+    currency_name: str = ""
 
     @property
     def has_discount(self) -> bool:
@@ -57,13 +70,24 @@ class Terms:
     def has_rate(self) -> bool:
         return bool(self.rate) and float(self.rate) > 0
 
+    @property
+    def has_currency(self) -> bool:
+        """Валюта указана И у неё есть курс — только тогда валютную цену можно привести."""
+        return bool(str(self.currency or "").strip()) and self.has_rate
+
+    @property
+    def money(self) -> str:
+        """Чем показывать валюту в текстах: имя, иначе код, иначе «валюта»."""
+        return (str(self.currency_name or "").strip()
+                or str(self.currency or "").strip() or "валюта")
+
 
 @dataclass(frozen=True)
 class Shape:
     """Что за цены в шапке листа. Нужна, чтобы СКАЗАТЬ модели, как их называть."""
     purchase: bool = False
     retail: bool = False
-    euro: bool = False
+    currency: bool = False
 
     @property
     def retail_only(self) -> bool:
@@ -80,7 +104,7 @@ def shape(rows, depth: int = 20) -> Shape:
     text = " ".join(str(cell or "") for row in rows[:depth] for cell in row)
     return Shape(purchase=bool(_PURCHASE.search(text)),
                  retail=bool(_RETAIL.search(text)),
-                 euro=bool(_EURO.search(text)))
+                 currency=bool(_CURRENCY.search(text)))
 
 
 def missing(terms: Terms, currency: bool = False) -> str:
@@ -92,8 +116,10 @@ def missing(terms: Terms, currency: bool = False) -> str:
     gaps = []
     if not terms.has_discount:
         gaps.append("скидка дилера от розницы (% у бренда)")
-    if currency and not terms.has_rate:
-        gaps.append("курс валюты у прайса")
+    if currency and not str(terms.currency or "").strip():
+        gaps.append("валюта прайса (её код по классификатору: 978 EUR, 840 USD)")
+    elif currency and not terms.has_rate:
+        gaps.append(f"курс {terms.money} у прайса")
     if not gaps:
         return ""
     return ("не задано: " + "; ".join(gaps)
@@ -117,7 +143,9 @@ def from_retail(retail, terms: Terms, currency: bool = False) -> dict:
         return {}
 
     if currency:
-        if not terms.has_rate:
+        # ВАЛЮТА БЕЗ КУРСА И КУРС БЕЗ ВАЛЮТЫ — одинаково «считать нечем». Второе хуже
+        # первого: число без валюты выглядит заданным, а чего оно курс — неизвестно.
+        if not terms.has_currency:
             return {}
         value = value * Decimal(str(terms.rate))
 
@@ -137,8 +165,8 @@ def explain(terms: Terms, currency: bool = False) -> str:
     if not terms.has_discount:
         return ""
     parts = [f"закупка = розница − {_num(terms.discount)}%"]
-    if currency and terms.has_rate:
-        parts.append(f"розница в валюте по курсу {_num(terms.rate)}")
+    if currency and terms.has_currency:
+        parts.append(f"розница в {terms.money} по курсу {_num(terms.rate)}")
     return "; ".join(parts)
 
 

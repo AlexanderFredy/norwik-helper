@@ -100,7 +100,8 @@ CREATE INDEX IF NOT EXISTS ix_signature_mark ON signature_mark (signature);
 #: Типы доращиваемых колонок `supplier_signature`. Таблица старше их всех, и у работающей
 #: базы колонок нет — без `ALTER TABLE` при старте все запросы к сигнатурам упали бы разом.
 COLUMN_KINDS = {"sheets": "TEXT", "sheet_list": "TEXT",
-                "brand_col": "INTEGER", "eur_rate": "REAL"}
+                "brand_col": "INTEGER", "rate": "REAL",
+                "currency_code": "TEXT", "currency_name": "TEXT"}
 
 
 def _now() -> str:
@@ -179,8 +180,10 @@ class SupplierStore:
             cur = await db.execute("PRAGMA table_info(supplier_signature)")
             have = {row[1] for row in await cur.fetchall()}
             # `brand_col` — в какой колонке листа стоит бренд (находит код, помним у
-            # формата); `eur_rate` — последний курс евро, он же подсказка новому прайсу.
-            for column in ("sheets", "sheet_list", "brand_col", "eur_rate"):
+            # формата); валюта с курсом — ПОСЛЕДНИЕ введённые, как подсказка новому прайсу
+            # (сами они принадлежат прайсу: курс меняется каждый день).
+            for column in ("sheets", "sheet_list", "brand_col", "rate",
+                           "currency_code", "currency_name"):
                 if have and column not in have:
                     await db.execute(
                         f"ALTER TABLE supplier_signature ADD COLUMN {column} "
@@ -510,30 +513,41 @@ class SupplierStore:
             row = await cur.fetchone()
         return int(row[0]) if row else None
 
-    async def set_eur_rate(self, signature: str, rate) -> bool:
-        """Последний курс евро у формата — ПОДСКАЗКА новому прайсу, а не его курс.
+    async def set_last_currency(self, signature: str, code: str = "", name: str = "",
+                                rate=None) -> bool:
+        """Последняя валюта и её курс у формата — ПОДСКАЗКА новому прайсу, а не его курс.
 
-        Курс меняется каждый день, и считать по прошлому значило бы записать в 1С цену,
-        которой нет; у прайса курс свой. Здесь — только то, что подставить в форму.
+        Валюта одна на прайс и указывается человеком (решение админа 03.10.2026), курс
+        относится именно к ней. Меняется курс каждый день, поэтому считать по прошлому
+        нельзя: у прайса он свой. Здесь лежит только то, что подставить в форму.
+
+        Код — по международному классификатору («978» EUR, «840» USD): по нему же 1С ищет
+        элемент `Справочники.Валюта`, а имя хранится для показа.
         """
         if not signature:
             return False
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "UPDATE supplier_signature SET eur_rate = ? WHERE signature = ?",
-                (rate, signature))
+                "UPDATE supplier_signature SET currency_code = ?, currency_name = ?, "
+                "rate = ? WHERE signature = ?",
+                (str(code or "").strip(), str(name or "").strip(), rate, signature))
             await db.commit()
         return cur.rowcount > 0
 
-    async def eur_rate_for(self, signature: str):
+    async def last_currency(self, signature: str) -> dict:
+        """Валюта и курс, введённые последними. Пустой код — считаем рублём, как раньше."""
+        empty = {"code": "", "name": "", "rate": None}
         if not signature:
-            return None
+            return empty
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT eur_rate FROM supplier_signature "
-                "WHERE signature = ? AND eur_rate IS NOT NULL ORDER BY id", (signature,))
-            row = await cur.fetchone()
-        return float(row[0]) if row else None
+                "SELECT COALESCE(currency_code, ''), COALESCE(currency_name, ''), rate "
+                "FROM supplier_signature WHERE signature = ? ORDER BY id", (signature,))
+            for code, name, rate in await cur.fetchall():
+                if code or rate is not None:
+                    return {"code": code, "name": name,
+                            "rate": float(rate) if rate is not None else None}
+        return empty
 
     async def move_signature(self, signature_id: int, supplier_id: int) -> bool:
         """Перепривязать сигнатуру к другому поставщику (§2.3).

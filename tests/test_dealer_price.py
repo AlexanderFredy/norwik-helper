@@ -19,6 +19,10 @@ from src.model.task_builder import TaskBuilderTools
 from src.price_tool.parser import Sheet
 
 
+#: Валюта прайса: код по международному классификатору и её курс.
+EUR = Terms(discount=10, rate=98.4321, currency="978", currency_name="EUR")
+
+
 class FormulaTest(unittest.TestCase):
 
     def test_discount_from_retail(self):
@@ -27,7 +31,7 @@ class FormulaTest(unittest.TestCase):
 
     def test_currency_goes_through_the_rate(self):
         """49,59 EUR × 98,4321 × 0,9 = 4393,12 — сверено с боевым файлом."""
-        got = from_retail(49.59, Terms(discount=10, rate=98.4321), currency=True)
+        got = from_retail(49.59, EUR, currency=True)
         self.assertEqual(got["purchase"], Decimal("4393.12"))
         self.assertEqual(got["rrc"], Decimal("4881.25"))
 
@@ -48,27 +52,43 @@ class FormulaTest(unittest.TestCase):
         self.assertEqual(from_retail(1000, Terms(discount=-5)), {})
 
     def test_currency_without_a_rate_is_refused(self):
-        self.assertEqual(from_retail(10, Terms(discount=17.5), currency=True), {})
+        self.assertEqual(from_retail(10, Terms(discount=17.5, currency="978"),
+                                     currency=True), {})
+
+    def test_rate_without_a_currency_is_refused(self):
+        """Хуже отсутствия: число выглядит заданным, а чего оно курс — неизвестно, и по
+        нему однажды посчитали бы цену не в той валюте."""
+        self.assertEqual(from_retail(10, Terms(discount=17.5, rate=98), currency=True), {})
 
     def test_zero_rate_means_not_set(self):
-        self.assertEqual(from_retail(10, Terms(discount=17.5, rate=0), currency=True), {})
+        self.assertEqual(from_retail(10, Terms(discount=17.5, currency="978", rate=0),
+                                     currency=True), {})
 
     def test_no_price_no_result(self):
         self.assertEqual(from_retail(None, Terms(discount=10)), {})
         self.assertEqual(from_retail(0, Terms(discount=10)), {})
 
-    def test_missing_names_both_gaps(self):
+    def test_missing_names_the_currency_itself(self):
+        """Валюта у прайса одна и указывает её человек: не указана — говорим именно это,
+        а не про курс, которого не к чему приложить."""
         text = missing(Terms(), currency=True)
         self.assertIn("скидка", text)
-        self.assertIn("курс", text)
+        self.assertIn("валюта прайса", text)
         self.assertEqual(missing(Terms(discount=10)), "")
+
+    def test_missing_names_the_rate_of_that_currency(self):
+        text = missing(Terms(discount=10, currency="840", currency_name="USD"),
+                       currency=True)
+        self.assertIn("курс USD", text)
 
     def test_explain_is_checkable_by_eye(self):
         """Закупки в прайсе не стоит, и без этой строки происхождение цифры неизвестно
         никому, включая админа через месяц."""
-        text = explain(Terms(discount=17.5, rate=98.4321), currency=True)
+        text = explain(Terms(discount=17.5, rate=98.4321, currency="978",
+                             currency_name="EUR"), currency=True)
         self.assertIn("17,5%", text)
         self.assertIn("98,4321", text)
+        self.assertIn("EUR", text)
 
 
 class ShapeTest(unittest.TestCase):
@@ -77,7 +97,13 @@ class ShapeTest(unittest.TestCase):
         rows = [["Прайс-лист"], ["Розничная цена в рублях", "Розничная цена в евро"]]
         got = shape(rows)
         self.assertTrue(got.retail_only)
-        self.assertTrue(got.euro)
+        self.assertTrue(got.currency)
+
+    def test_other_currencies_are_recognised_too(self):
+        """Евро не единственный случай: бывают доллары и юани (правка админа 03.10.2026)."""
+        self.assertTrue(shape([["Цена, USD"]]).currency)
+        self.assertTrue(shape([["Цена CNY"]]).currency)
+        self.assertFalse(shape([["Цена, руб."]]).currency)
 
     def test_root_is_rozn_not_roznic(self):
         """Поймано на живом файле: колонка зовётся «Розничная», и шаблон «розниц» её не
@@ -115,6 +141,12 @@ class ComparisonTest(unittest.TestCase):
         self.assertNotIsInstance(got, str, got)
         return got
 
+    def test_old_name_of_the_currency_column_is_accepted(self):
+        """`retail_eur` — прежнее имя: запомненный маппинг колонок живёт у сигнатуры и
+        переживает выкладку, а валюта стала настраиваемой."""
+        cols = self.cols(HEAD, article=1, retail_eur=4)
+        self.assertEqual(cols.retail_cur, 3)
+
     def test_retail_columns_are_accepted(self):
         cols = self.cols(HEAD, article=1, retail=3)
         self.assertTrue(cols.from_retail)
@@ -149,7 +181,7 @@ class ComparisonTest(unittest.TestCase):
         """Для рублёвой не нужен курс — то есть меньше того, что может быть не задано."""
         book = sheet(["4938", "ABK", "1000", "10"])
         tools = TaskBuilderTools(b"x", "x.xls", discounts={"ABK": 10})
-        cols = self.cols(book.rows, article=1, retail=3, retail_eur=4)
+        cols = self.cols(book.rows, article=1, retail=3, retail_cur=4)
         got = price_check.prices_from_rows(book.rows, cols, tools._terms_reader(book))
         self.assertEqual(got["4938"]["rrc"], Decimal("1000.00"))
 
@@ -212,10 +244,16 @@ class WriteTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("purchase", inp)
 
     def test_currency_without_a_rate_refuses(self):
-        inp = {"retail_eur": 10}
-        gap = self.tools(Terms(discount=10))._to_purchase(inp)
-        self.assertIn("курс", gap)
+        inp = {"retail_cur": 10}
+        gap = self.tools(Terms(discount=10, currency="978",
+                               currency_name="EUR"))._to_purchase(inp)
+        self.assertIn("курс EUR", gap)
         self.assertNotIn("purchase", inp)
+
+    def test_old_currency_key_still_converts(self):
+        inp = {"retail_eur": 10}
+        self.assertEqual(self.tools(EUR)._to_purchase(inp), "")
+        self.assertEqual(inp["purchase"], 885.89)
 
     def test_ordinary_price_is_untouched(self):
         inp = {"purchase": 1000, "rrc": 1500}
@@ -249,7 +287,7 @@ class BriefTest(unittest.TestCase):
         return task_brief(price, task, terms)
 
     def test_terms_are_stated(self):
-        text = self.brief(Terms(discount=17.5))
+        text = self.brief(Terms(discount=17.5))  # рубли: валюта не указана
         self.assertIn("закупка = розница − 17,5%", text)
         self.assertIn("retail", text)
 

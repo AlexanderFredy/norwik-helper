@@ -248,7 +248,7 @@ TOOLS = [
             "декор в разных цветах) либо items[{ref, purchase, rrc}] по товарам (КЕРАМИКА: "
             "в одной папке настенная, напольная, декор, бордюр — у каждого своя цена).\n"
             "ЗАКУПКИ В ПРАЙСЕ МОЖЕТ НЕ БЫТЬ ВОВСЕ — только розница поставщика. Тогда "
-            "передавай её как retail (рубли) либо retail_eur (валюта) и НЕ называй "
+            "передавай её как retail (рубли) либо retail_cur (валюта прайса) и НЕ называй "
             "розницу закупкой: закупку посчитает код по скидке дилера и курсу. Условий "
             "нет — цены не запишутся, и инструмент скажет, чего не хватает.\n"
             "Изменения меньше 2% отбрасываются сами."),
@@ -265,9 +265,9 @@ TOOLS = [
                 "retail": {"type": "number",
                            "description": "РОЗНИЦА поставщика в рублях — когда закупки в "
                                           "прайсе нет. Закупку посчитает код"},
-                "retail_eur": {"type": "number",
-                               "description": "розница поставщика в валюте; код приведёт "
-                                              "её курсом"},
+                "retail_cur": {"type": "number",
+                               "description": "розница поставщика в ВАЛЮТЕ ПРАЙСА; код "
+                                              "приведёт её курсом"},
                 "items": {
                     "type": "array",
                     "description": "цены по товарам: [{ref, purchase, rrc}]",
@@ -277,7 +277,7 @@ TOOLS = [
                                        "purchase": {"type": "number"},
                                        "rrc": {"type": "number"},
                                        "retail": {"type": "number"},
-                                       "retail_eur": {"type": "number"}},
+                                       "retail_cur": {"type": "number"}},
                     },
                 },
             },
@@ -574,16 +574,22 @@ class TaskTools:
         значит в прайсе она есть, и пересчитывать нечего.
         """
         spots = [inp] + [row for row in (inp.get("items") or []) if isinstance(row, dict)]
+        for spot in spots:
+            # `retail_eur` — старое имя: валюта стала настраиваемой (03.10.2026), а задание
+            # модели могло быть собрано до выкладки. Принять дешевле, чем потерять цену.
+            if spot.get("retail_cur") is None and spot.get("retail_eur") is not None:
+                spot["retail_cur"] = spot.pop("retail_eur")
+
         wants = [spot for spot in spots
                  if spot.get("purchase") is None
                  and (spot.get("retail") is not None
-                      or spot.get("retail_eur") is not None)]
+                      or spot.get("retail_cur") is not None)]
         if not wants:
             return ""
 
         terms = self._terms or dealer_price.Terms()
         currency = any(spot.get("retail") is None
-                       and spot.get("retail_eur") is not None for spot in wants)
+                       and spot.get("retail_cur") is not None for spot in wants)
         gap = dealer_price.missing(terms, currency=currency)
         if gap:
             return ("Цены НЕ записаны: " + gap
@@ -593,7 +599,7 @@ class TaskTools:
         for spot in wants:
             value, in_currency = ((spot.get("retail"), False)
                                   if spot.get("retail") is not None
-                                  else (spot.get("retail_eur"), True))
+                                  else (spot.get("retail_cur"), True))
             got = dealer_price.from_retail(value, terms, currency=in_currency)
             if not got:
                 continue
@@ -1447,7 +1453,7 @@ def task_brief(price, task, terms=None) -> str:
     # Админу эта строка тоже нужна: закупка в прайсе не стоит, и без неё происхождение
     # цифры неизвестно никому.
     if terms is not None:
-        line = dealer_price.explain(terms, currency=bool(getattr(terms, "rate", None)))
+        line = dealer_price.explain(terms, currency=terms.has_currency)
         if line:
             lines.append(f"Цены считаются из розницы: {line}. Передавай в write_prices "
                          f"РОЗНИЦУ (retail либо retail_eur) — пересчёт сделает код.")
