@@ -62,6 +62,31 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(run, [first, second, third])
         self.assertEqual(rejected, [])
 
+    def test_batch_order_is_the_one_the_initiator_asked_for(self):
+        """Одно нажатие — ОДНА метка времени (бой 03.10.2026).
+
+        `ТекущаяДата()` в 1С имеет секундную точность, поэтому у всех команд пачки
+        `Создана` одинакова. Ничью разрешал номер в очереди агента, то есть порядок, в
+        котором строки вернула 1С, а она упорядочивает по `Идентификатор` — случайному
+        GUID: админ выделил задачи и увидел «со второй по последнюю, первая в конце».
+        """
+        same = at_s(1)
+        third = cmd(task=30, at=same, seq=3)
+        first = cmd(task=10, at=same, seq=1)
+        second = cmd(task=20, at=same, seq=2)
+        # Номера в очереди намеренно против порядка пачки: раньше решали они.
+        third.id, first.id, second.id = 1, 2, 3
+
+        self.assertEqual([c.task_id for c in order_batch([third, first, second])],
+                         [10, 20, 30])
+
+    def test_without_a_stated_order_the_queue_number_decides(self):
+        """`seq` = 0 — порядка никто не называл (одиночное нажатие, Telegram): для таких
+        команд поведение прежнее, иначе правка меняла бы то, о чём не просили."""
+        a, b = cmd(task=1, at=at_s(1)), cmd(task=2, at=at_s(1))
+        a.id, b.id = 9, 4
+        self.assertEqual([c.id for c in order_batch([a, b])], [4, 9])
+
     def test_two_commands_on_the_same_task_still_compete(self):
         """Схлопывание в очереди такого не оставляет, но команды из РАЗНЫХ визуалов
         схлопнуться могут не успеть: объект один, решение должно быть одно."""
@@ -388,6 +413,19 @@ class EndToEndTest(unittest.IsolatedAsyncioTestCase):
         groups = group_by_actor(await self.q.take())
 
         self.assertEqual([actor for actor, _ in groups], ["admin-2", "admin-1"])
+
+    async def test_batch_order_survives_the_queue(self):
+        """Номер в пачке живёт в НАГРУЗКЕ, и это должно пережить круг через базу: оттуда
+        команда приходит собранной из колонок, и поле, которого в таблице нет, обнулилось
+        бы молча — вместе с порядком."""
+        same = at_s(1)
+        for task, seq in ((30, 3), (10, 1), (20, 2)):
+            await self.q.put(cmd(task=task, at=same, seq=seq, source="1c"))
+
+        taken = order_batch(await self.q.take())
+
+        self.assertEqual([c.seq for c in taken], [1, 2, 3])
+        self.assertEqual([c.task_id for c in taken], [10, 20, 30])
 
     async def test_one_admin_many_tasks_all_run(self):
         """Случай админа 03.10.2026: выделил несколько задач, нажал «Выполнить» один раз."""
