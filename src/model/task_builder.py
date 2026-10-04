@@ -395,14 +395,24 @@ class TaskBuilderTools:
         if self._marks is None:
             return chosen
 
+        # ВЫБОР БРЕНДОВ ОТНОСИТСЯ ТОЛЬКО К ЛИСТАМ, ГДЕ БРЕНД ЕСТЬ КОЛОНКОЙ (04.10.2026).
+        # Колонка — свойство ЛИСТА, а не формата: у FLOOR SERVICE её нет на «КЛЕЙ»,
+        # «ИЗМЕНЕНИЯ» и «Скидки розница», и у четырёх форматов из пяти её нет ни на одном
+        # листе вовсе. Без этой проверки пустой список брендов (а он пуст у всех, пока
+        # админ не расставил флажки) остановил бы разбор ЦЕЛИКОМ — у форматов, где
+        # отмечать нечего в принципе. Нет колонки ни в одном отмеченном листе — выбор
+        # брендов к ним не относится, работаем как раньше.
+        spots = [(sheet, find_brand_column(sheet)) for sheet in chosen]
+        if not any(spot is not None for _, spot in spots):
+            return chosen
+
         if not self._marks:
             self.pick_problem = "бренды не отмечены"
             self.skipped_marks = []
             return []
 
         out = []
-        for sheet in chosen:
-            spot = find_brand_column(sheet)
+        for sheet, spot in spots:
             if spot is None:
                 out.append(sheet)
                 continue

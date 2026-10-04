@@ -453,6 +453,200 @@ class ReportTest(unittest.TestCase):
         self.assertIn("Пересечение пусто", got)
         self.assertIn("ABK", got)
 
+class NarrowTest(unittest.TestCase):
+    """Фильтр строк по брендам — и ГРАНИЦЫ его применения.
+
+    Выбор брендов относится только к листам, где бренд выделен КОЛОНКОЙ. У FLOOR SERVICE
+    колонка «Производитель» стоит на служебных вкладках («АКЦИИ», «ПОДЛОЖКА И ПЛИНТУС»), а
+    админ отмечает «ЛАМИНАТ», где её нет вовсе: без этой границы пустой список брендов
+    остановил бы разбор ЦЕЛИКОМ — задачи по ламинату перестали бы собираться из-за брендов,
+    которых в отмеченном листе не бывает (04.10.2026).
+    """
+
+    def tools(self, marks, sheets):
+        from src.model.task_builder import TaskBuilderTools
+
+        t = TaskBuilderTools(b"x", "Остатки.xls", only_marks=marks)
+        t._sheets = t._narrow(list(sheets))
+        return t
+
+    @staticmethod
+    def with_brands(name="TDSheet"):
+        from src.price_tool.parser import Sheet
+
+        return Sheet(name=name, rows=[
+            ["Фабрика", "Бренд", "Артикул"],
+            ["ABK", "ABK", "4938"],
+            ["VitrA", "VitrA", "K9470"],
+        ])
+
+    @staticmethod
+    def without_brands(name="ЛАМИНАТ"):
+        from src.price_tool.parser import Sheet
+
+        return Sheet(name=name, rows=[["Артикул", "Цена"], ["A1", "100"]])
+
+    def test_ticked_brands_leave_only_their_rows(self):
+        t = self.tools(["ABK"], [self.with_brands()])
+        self.assertEqual([r[1] for r in t.sheets[0].rows[1:]], ["ABK"])
+        self.assertEqual(t.kept_rows, 1)
+        self.assertEqual(t.whole_rows, 2)
+
+    def test_sheet_without_a_brand_column_passes_untouched(self):
+        t = self.tools(["ABK"], [self.without_brands()])
+        self.assertEqual([s.name for s in t.sheets], ["ЛАМИНАТ"])
+        self.assertEqual(len(t.sheets[0].rows), 2)
+        self.assertEqual(t.pick_problem, "")
+
+    def test_empty_choice_does_not_block_sheets_without_brands(self):
+        """РЕГРЕССИЯ. Пустой выбор брендов — это «не отмечено ни одного», и у формата с
+        брендами он законно останавливает разбор. Но у ЛИСТА БЕЗ КОЛОНКИ бренда отмечать
+        нечего, и остановка означала бы потерю всей работы по этому листу."""
+        t = self.tools([], [self.without_brands()])
+        self.assertEqual([s.name for s in t.sheets], ["ЛАМИНАТ"])
+        self.assertEqual(t.pick_problem, "")
+
+    def test_empty_choice_does_block_when_a_column_is_there(self):
+        t = self.tools([], [self.with_brands()])
+        self.assertEqual(t.sheets, [])
+        self.assertEqual(t.pick_problem, "бренды не отмечены")
+
+    def test_one_sheet_with_a_column_makes_the_choice_apply(self):
+        """Колонка хоть на одном отмеченном листе — выбор действует: лист без колонки
+        проходит как есть, лист с колонкой фильтруется."""
+        t = self.tools(["VitrA"], [self.without_brands(), self.with_brands()])
+        self.assertEqual([s.name for s in t.sheets], ["ЛАМИНАТ", "TDSheet"])
+        self.assertEqual([r[1] for r in t.sheets[1].rows[1:]], ["VitrA"])
+
+    def test_nobody_manages_brands_means_no_filter(self):
+        t = self.tools(None, [self.with_brands()])
+        self.assertEqual(len(t.sheets[0].rows), 3)
+
+
+class BackfillTest(unittest.IsolatedAsyncioTestCase):
+    """Дозаполнение брендов у форматов, заведённых до появления этой памяти.
+
+    Бренды собираются на приёме прайса, и у пяти уже заведённых форматов список остался
+    пустым: форма открывалась с пустым правым списком, и видно было только то, что выбирать
+    не из чего (вопрос админа 04.10.2026). Та же починка, что у листов.
+    """
+
+    WITH_BRANDS = [["Фабрика", "Бренд", "Артикул"],
+                   ["ABK", "ABK", "4938"],
+                   ["ABK", "ABK", "4939"],
+                   ["VitrA", "VitrA", "K9470"]]
+
+    async def asyncSetUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.root = Path(self._dir.name)
+        self.store = SupplierStore(self.root / "t.db")
+        await self.store.init()
+        supplier = await self.store.add_supplier("Плиткаторг")
+        self.sig = await self.store.add_signature(supplier.id, "hash-1",
+                                                  sample_name="Остатки.xlsx")
+
+    async def asyncTearDown(self):
+        self._dir.cleanup()
+
+    def workbook(self, rows, name="Остатки.xlsx"):
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        for row in rows:
+            wb.active.append(row)
+        path = self.root / name
+        wb.save(path)
+        return path
+
+    async def add_file(self, path, received_at="2026-09-01T00:00:00"):
+        return await self.store.add_price_file(self.sig.id, path.name, str(path),
+                                              received_at=received_at)
+
+    async def run_fill(self, marks=MARKS):
+        from src.model.brand_backfill import fill_brand_lists
+
+        return await fill_brand_lists(self.store, marks)
+
+    async def test_brands_are_read_from_the_file(self):
+        await self.add_file(self.workbook(self.WITH_BRANDS))
+        self.assertEqual(await self.run_fill(), 1)
+
+        rows = await self.store.marks_for("hash-1")
+        self.assertEqual([(m.brand, m.rows) for m in rows], [("ABK", 2), ("VitrA", 1)])
+        self.assertEqual(await self.store.brand_col_for("hash-1"), 1)
+
+    async def test_marks_are_proposed_from_the_1c_catalogue(self):
+        await self.add_file(self.workbook(self.WITH_BRANDS))
+        await self.run_fill()
+        rows = {m.brand: m.tm_code for m in await self.store.marks_for("hash-1")}
+        self.assertEqual(rows, {"ABK": "000000265", "VitrA": "000000285"})
+
+    async def test_without_1c_the_list_is_still_filled(self):
+        """Список брендов нужен сам по себе: по нему админ ставит флажки, а марку он
+        выставит в форме. Недоступная 1С не повод оставить формат пустым."""
+        await self.add_file(self.workbook(self.WITH_BRANDS))
+        self.assertEqual(await self.run_fill(marks=[]), 1)
+        rows = await self.store.marks_for("hash-1")
+        self.assertEqual([m.brand for m in rows], ["ABK", "VitrA"])
+        self.assertEqual([m.tm_code for m in rows], ["", ""])
+
+    async def test_brands_arrive_unticked(self):
+        await self.add_file(self.workbook(self.WITH_BRANDS))
+        await self.run_fill()
+        self.assertEqual(await self.store.marks_wanted("hash-1"), [])
+
+    async def test_a_format_without_a_brand_column_is_looked_at_once(self):
+        """Исход «колонки нет» ТОЖЕ запоминается: иначе четыре формата из пяти разбирались
+        бы заново при каждом перезапуске бота."""
+        await self.add_file(self.workbook([["Артикул", "Цена"], ["A1", 100]]))
+        self.assertEqual(await self.run_fill(), 1)
+        self.assertEqual(await self.store.marks_for("hash-1"), [])
+        self.assertTrue(await self.store.brand_scanned("hash-1"))
+        self.assertIsNone(await self.store.brand_col_for("hash-1"))
+        self.assertEqual(await self.run_fill(), 0)
+
+    async def test_existing_list_is_not_touched(self):
+        """Свежий приём главнее починки, а решение админа главнее обоих."""
+        await self.store.remember_marks("hash-1", [("ABK", 7, "000000265", "ABK")])
+        await self.store.set_marks_by_signature(
+            "hash-1", [{"brand": "ABK", "parse": True, "tm_code": "000000265",
+                        "tm_name": "ABK", "discount": 17.5}])
+        await self.store.set_signature_brand_col("hash-1", 1)
+        await self.add_file(self.workbook(self.WITH_BRANDS))
+
+        self.assertEqual(await self.run_fill(), 0)
+        rows = await self.store.marks_for("hash-1")
+        self.assertEqual([(m.brand, m.rows, m.discount) for m in rows],
+                         [("ABK", 7, 17.5)])
+
+    async def test_newest_file_wins(self):
+        await self.add_file(self.workbook([["Бренд", "Артикул"], ["Dogma", "1"]],
+                                          name="старый.xlsx"),
+                            received_at="2026-01-01T00:00:00")
+        await self.add_file(self.workbook(self.WITH_BRANDS),
+                            received_at="2026-09-09T00:00:00")
+        await self.run_fill()
+        self.assertEqual([m.brand for m in await self.store.marks_for("hash-1")],
+                         ["ABK", "VitrA"])
+
+    async def test_missing_file_is_skipped_without_a_crash(self):
+        await self.store.add_price_file(self.sig.id, "нет.xlsx",
+                                        str(self.root / "нет.xlsx"))
+        self.assertEqual(await self.run_fill(), 0)
+        self.assertFalse(await self.store.brand_scanned("hash-1"))
+
+    async def test_format_without_files_is_skipped(self):
+        self.assertEqual(await self.run_fill(), 0)
+
+    async def test_the_same_hash_at_two_suppliers_is_read_once(self):
+        """Бренды лежат по ХЕШУ, а хеш бывает у двух поставщиков: второй проход был бы
+        разбором того же файла впустую."""
+        other = await self.store.add_supplier("Второй")
+        twin = await self.store.add_signature(other.id, "hash-1")
+        await self.add_file(self.workbook(self.WITH_BRANDS))
+        await self.store.add_price_file(twin.id, "копия.xlsx",
+                                        str(self.root / "Остатки.xlsx"))
+        self.assertEqual(await self.run_fill(), 1)
 
 if __name__ == "__main__":
     unittest.main()

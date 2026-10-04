@@ -141,6 +141,44 @@ class FilterTest(unittest.TestCase):
         бы агенту о том, что он читает."""
         self.assertEqual(only_brands(FILE, self.spot(), ["ABK"]).name, "TDSheet")
 
+class RepeatedHeaderTest(unittest.TestCase):
+    """ПОВТОРЁННАЯ ШАПКА — НЕ БРЕНД (поймано на боевом файле FLOOR SERVICE 04.10.2026).
+
+    Поставщик размечает разделы листа, повторяя строку заголовков («АКЦИИ», «ПОДЛОЖКА И
+    ПЛИНТУС»), и слово «Производитель» приезжало в список брендов наравне с Kronotex: админ
+    видел в форме бренд, которого не существует, а отметив его — отфильтровал бы лист по
+    строкам-разделителям. Отличить можно ровно так: это и есть одно из тех слов, по которым
+    колонка была найдена.
+    """
+
+    SHEET = sheet(
+        ["Kronotex", "Kronotex", "Exquisit", "4786", "4786", "Ламинат Дуб"],
+        ["", "", "Dynamic", "1234", "1234", "Ламинат Клён"],
+        ["Производитель", "Производитель", "Коллекция", "Артикул", "Код", "Номенклатура"],
+        ["Kronopol", "Kronopol", "Aurum", "5550", "5550", "Ламинат Ясень"],
+    )
+
+    def setUp(self):
+        self.spot = find_brand_column(self.SHEET)
+
+    def test_header_word_is_not_listed_as_a_brand(self):
+        self.assertEqual([b for b, _ in brands_in(self.SHEET, self.spot)],
+                         ["Kronotex", "Kronopol"])
+
+    def test_the_header_row_does_not_inherit_the_brand_above(self):
+        """Строка-разделитель не принадлежит ни одному бренду: приписав её верхнему, мы
+        отдали бы модели заголовок как товар Kronotex."""
+        kept = only_brands(self.SHEET, self.spot, ["Kronotex"]).rows
+        self.assertEqual([r[2] for r in kept[self.spot.header_rows:]],
+                         ["Exquisit", "Dynamic"])
+
+    def test_rows_after_the_repeat_belong_to_their_own_brand(self):
+        kept = only_brands(self.SHEET, self.spot, ["Kronopol"]).rows
+        self.assertEqual([r[2] for r in kept[self.spot.header_rows:]], ["Aurum"])
+
+    def test_counts_do_not_include_the_repeat(self):
+        self.assertEqual(dict(brands_in(self.SHEET, self.spot)),
+                         {"Kronotex": 2, "Kronopol": 1})
 
 if __name__ == "__main__":
     unittest.main()

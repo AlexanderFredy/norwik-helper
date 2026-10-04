@@ -128,6 +128,22 @@ async def main() -> None:
     else:
         logger.warning("ONEC_BASE_URL/ONEC_TOKEN не заданы — обновление цен недоступно")
 
+    # БРЕНДЫ ФОРМАТОВ дозаполняем так же и по той же причине, только ПОСЛЕ создания клиента
+    # 1С: марку кодом лишь ПРЕДЛАГАЕМ, а справочник марок живёт там. Нет 1С — список брендов
+    # всё равно соберётся, просто без предложенных марок (их выставит админ в форме).
+    from src.model.brand_backfill import fill_brand_lists
+
+    try:
+        known_marks = await asyncio.to_thread(onec.selling_tm) if onec else []
+    except Exception:                                   # noqa: BLE001
+        logger.warning("Справочник марок не прочитался — бренды дозаполним без марок",
+                       exc_info=True)
+        known_marks = []
+
+    with_brands = await fill_brand_lists(supplier_store, known_marks)
+    if with_brands:
+        logger.info("Бренды форматов дозаполнены: %d", with_brands)
+
     mail = MailClient(
         config.mail_host, config.mail_port, config.mail_user, config.mail_password
     )

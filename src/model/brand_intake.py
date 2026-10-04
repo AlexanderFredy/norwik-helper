@@ -113,6 +113,10 @@ async def remember(suppliers, signature: str, content: bytes, filename: str,
     """
     column, found = collect(content, filename)
     if not found:
+        # ОТМЕТКА «СМОТРЕЛИ, БРЕНДОВ НЕТ» — чтобы дозаполнение при старте не разбирало этот
+        # файл заново при каждом перезапуске бота.
+        await suppliers.set_signature_brand_col(
+            signature, getattr(suppliers, "NO_BRAND_COLUMN", -1))
         return {"brands": 0, "column": None, "wanted": 0, "without_tm": 0}
 
     guessed = propose_marks([brand for brand, _ in found], marks or [])

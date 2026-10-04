@@ -491,8 +491,13 @@ class SupplierStore:
             await db.commit()
         return touched
 
+    #: «Смотрели файл, колонки бренда в нём нет». Отличать это от «не смотрели вовсе»
+    #: обязательно: иначе дозаполнение при старте перечитывало бы файлы форматов без
+    #: брендов КАЖДЫЙ запуск — а их большинство (четыре формата из пяти, 04.10.2026).
+    NO_BRAND_COLUMN = -1
+
     async def set_signature_brand_col(self, signature: str, column) -> bool:
-        """В какой колонке листа стоит бренд. None — колонки нет, выбор брендов недоступен."""
+        """В какой колонке листа стоит бренд. `NO_BRAND_COLUMN` — смотрели, её нет."""
         if not signature:
             return False
         async with aiosqlite.connect(self._db_path) as db:
@@ -503,7 +508,24 @@ class SupplierStore:
         return cur.rowcount > 0
 
     async def brand_col_for(self, signature: str):
-        """Колонка бренда у формата либо None."""
+        """Колонка бренда у формата либо None.
+
+        Отметка «смотрели, колонки нет» отдаётся как None: для того, кто спрашивает про
+        колонку, это один и тот же ответ, а отрицательный индекс, утёкший в разбор, резал
+        бы лист по последней колонке.
+        """
+        value = await self._brand_col_raw(signature)
+        return None if value is None or value < 0 else value
+
+    async def brand_scanned(self, signature: str) -> bool:
+        """Смотрели ли файл этого формата на бренды — включая исход «колонки нет».
+
+        Нужно ровно дозаполнению при старте: оно обязано пройти каждый формат ОДИН раз, а
+        не разбирать книгу заново при каждом перезапуске бота.
+        """
+        return await self._brand_col_raw(signature) is not None
+
+    async def _brand_col_raw(self, signature: str):
         if not signature:
             return None
         async with aiosqlite.connect(self._db_path) as db:
