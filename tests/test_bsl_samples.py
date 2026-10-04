@@ -183,6 +183,33 @@ class PlatformFunctionsTest(unittest.TestCase):
                     f"свою (образцы: СоединитьСтроки в model-form-module.bsl, "
                     f"РазделитьСтроку в properties.bsl).")
 
+class TableValueTypeTest(unittest.TestCase):
+    """У значения из строки таблицы формы НЕ спрашивают свойства ссылки (бой 04.10.2026).
+
+    Админ поставил прайсу евро, и форма перестала открываться: «Поле объекта не обнаружено
+    (Код)». Колонка `Валюта` в таблице прайсов объявлена СТРОКОЙ, а регистр хранит ссылку на
+    справочник, и платформа молча привела одно к другому при заполнении строки. Тип колонки —
+    свойство конфигурации, и падать из-за него форма не должна: сперва проверяем тип, потом
+    спрашиваем свойство.
+    """
+
+    FORM = BSL.parent / "model-form-module.bsl"
+    FORMAT_FORM = BSL.parent / "model-format-form-module.bsl"
+
+    def test_the_currency_code_is_taken_through_a_guard(self):
+        text = self.FORM.read_text(encoding="utf-8")
+        self.assertNotIn("Текущий.Валюта.Код", text,
+                         "свойство ссылки спрашивается у значения, которое может быть "
+                         "строкой — форма упадёт при открытии")
+        self.assertIn("КодВалюты(Текущий.Валюта)", text)
+        self.assertIn('ТипЗнч(Значение) = Тип("Строка")', text)
+
+    def test_the_receiving_form_finds_the_currency_both_ways(self):
+        """Строка бывает кодом («978») и представлением («Евро»). Искать только по коду —
+        значит молча открыть форму с пустой валютой и заставить выбирать её заново."""
+        text = self.FORMAT_FORM.read_text(encoding="utf-8")
+        self.assertIn("НайтиПоКоду", text)
+        self.assertIn("НайтиПоНаименованию", text)
 
 if __name__ == "__main__":
     unittest.main()
