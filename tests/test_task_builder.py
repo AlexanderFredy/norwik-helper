@@ -1506,6 +1506,77 @@ class ServiceFallbackTest(unittest.IsolatedAsyncioTestCase):
         tasks = model.prices[0].tasks
         self.assertEqual([t.description for t in tasks], ["настоящая задача"])
 
+class CollectionCodeTest(unittest.TestCase):
+    """Код ПАПКИ коллекции кладётся в адрес задачи при сборке (решение админа 04.10.2026).
+
+    По нему исполнитель сужает выгрузку 1С, а `_collection_folder` находит папку для
+    переноса в снятые. До этого код был заполнен у ОДНОЙ задачи из 165, и оба механизма
+    работали по именам — а они расходятся штатно.
+    """
+
+    class Item:
+        def __init__(self, ref, collection, folder, prop_code="", dead=False):
+            self.ref, self.name, self.article = ref, ref, ""
+            self.collection = collection
+            self.collection_ref = folder        # код ПАПКИ
+            self.collection_code = prop_code    # код ЗНАЧЕНИЯ свойства «Коллекция»
+            self.not_exported = dead
+            self.size = self.product_type = self.unit = ""
+            self.properties = []
+
+    def tools(self, items, tm_name="Classen / Классен"):
+        from src.model.task_builder import TaskBuilderTools
+
+        t = TaskBuilderTools(b"x", "прайс.xlsx")
+        t._items_cache["000000104"] = items
+        t._tm_names["000000104"] = tm_name
+        return t
+
+    def test_code_comes_from_the_live_positions(self):
+        t = self.tools([self.Item("r1", "Visiogrande", "YO-00024127"),
+                        self.Item("r2", "Visiogrande", "YO-00024127"),
+                        self.Item("r3", "Naturale", "YO-00031000")])
+        self.assertEqual(t._collection_code("000000104", "Visiogrande"), "YO-00024127")
+        self.assertEqual(t._collection_code("000000104", "Naturale"), "YO-00031000")
+
+    def test_the_folder_code_is_taken_not_the_property_code(self):
+        """РЕГРЕССИЯ. `collection_ref` — код ПАПКИ, `collection_code` — код значения
+        свойства «Коллекция». Перепутать их легко, а путаница тиха: сравнение просто
+        никогда не совпадёт, и сужение молча откатится на всю марку."""
+        t = self.tools([self.Item("r1", "Visiogrande", "YO-00024127",
+                                  prop_code="СВОЙСТВО-77")])
+        self.assertEqual(t._collection_code("000000104", "Visiogrande"), "YO-00024127")
+
+    def test_size_tail_and_mark_prefix_do_not_break_it(self):
+        t = self.tools([self.Item("r1", "Классик 600x238x12", "YO-5")])
+        self.assertEqual(t._collection_code("000000104", "Классик"), "YO-5")
+
+        t = self.tools([self.Item("r1", "Spark", "YO-9")], tm_name="Westerhof / Вестерхоф")
+        self.assertEqual(t._collection_code("000000104", "Westerhof Spark"), "YO-9")
+
+    def test_two_folders_mean_no_code(self):
+        """Два кода у одной коллекции — значит мы поняли её неверно либо папок правда две.
+        Записав один наугад, мы отправили бы по нему и сужение выгрузки, и перенос в
+        снятые."""
+        t = self.tools([self.Item("r1", "Visiogrande", "YO-1"),
+                        self.Item("r2", "Visiogrande", "YO-2")])
+        self.assertEqual(t._collection_code("000000104", "Visiogrande"), "")
+
+    def test_discontinued_positions_do_not_decide(self):
+        t = self.tools([self.Item("r1", "Visiogrande", "YO-1"),
+                        self.Item("r2", "Visiogrande", "YO-СНЯТЫЕ", dead=True)])
+        self.assertEqual(t._collection_code("000000104", "Visiogrande"), "YO-1")
+
+    def test_without_a_dump_the_code_is_empty(self):
+        """Ни одного лишнего запроса: берём только то, что уже в кеше прогона."""
+        from src.model.task_builder import TaskBuilderTools
+
+        t = TaskBuilderTools(b"x", "прайс.xlsx")
+        self.assertEqual(t._collection_code("000000104", "Visiogrande"), "")
+
+    def test_an_unknown_collection_gives_nothing(self):
+        t = self.tools([self.Item("r1", "Naturale", "YO-2")])
+        self.assertEqual(t._collection_code("000000104", "Миллениум Про"), "")
 
 if __name__ == "__main__":
     unittest.main()

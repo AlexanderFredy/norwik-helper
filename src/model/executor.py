@@ -707,10 +707,14 @@ class TaskTools:
         if subject is None or not items:
             return items, ""
 
+        # КОД В АДРЕСЕ ЗАДАЧИ — ЭТО КОД ПАПКИ (`collection_ref`), а не код значения свойства
+        # «Коллекция» (`collection_code`). Их легко перепутать, и путаница тиха: сравнение
+        # просто никогда не совпадёт, сужение молча откатится на всю марку. С папкой же
+        # сверяется и `_collection_folder`, и её кладёт `_add_discontinued_candidates`.
         code = (getattr(subject, "code", "") or "").strip()
         if code:
             by_code = [i for i in items
-                       if (getattr(i, "collection_code", "") or "").strip() == code]
+                       if (getattr(i, "collection_ref", "") or "").strip() == code]
             if by_code:
                 return by_code, (f"показана коллекция задачи по коду {code} "
                                  f"({len(by_code)} поз.) — вся марка нужна редко, но если "

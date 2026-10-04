@@ -913,6 +913,36 @@ class TaskBuilderTools:
                     return " ".join(text.split())[:120]
         return ""
 
+    def _collection_code(self, tm_code: str, collection: str) -> str:
+        """Код ПАПКИ коллекции в 1С — по живым позициям, которые уже лежат в выгрузке.
+
+        **СПРАШИВАЕМ У ПОЗИЦИЙ, А НЕ У ИМЁН.** У каждой живой позиции стоит
+        `collection_ref` — код её папки; это ответ из базы, а не догадка по похожести имён.
+        Тем же источником чинился `_collection_folder` после боя 02.10.2026, когда у Classen
+        нашлись три папки со словом Visiogrande и задача по живой коллекции ответила «папка
+        не нашлась».
+
+        **НИ ОДНОГО ЛИШНЕГО ЗАПРОСА.** Берём только то, что УЖЕ в кеше прогона: выгрузка
+        попадает туда от сверки, которая и так идёт перед заведением задачи. Нет её — код
+        остаётся пустым, и всё работает как раньше.
+
+        **ПОЗИЦИИ В РАЗНЫХ ПАПКАХ — ЗНАЧИТ КОДА НЕТ.** Два кода у одной коллекции означают,
+        что мы поняли её неверно либо папок правда две; записав один наугад, мы отправили бы
+        по нему и сужение выгрузки, и перенос в снятые.
+        """
+        items = self._items_cache.get(tm_code) or ()
+        if not items or not collection:
+            return ""
+
+        tm_name = self._tm_names.get(tm_code, "")
+        keys = _collection_keys(collection, tm_name)
+        codes = {(getattr(i, "collection_ref", "") or "").strip()
+                 for i in items
+                 if not i.not_exported
+                 and (getattr(i, "collection_ref", "") or "").strip()
+                 and _collection_keys(collection_of(i), tm_name) & keys}
+        return codes.pop() if len(codes) == 1 else ""
+
     def mark_coverage(self, tm_code: str) -> tuple[int, int]:
         """Сколько ЖИВЫХ коллекций марки закрыл этот прайс и сколько их всего.
 
@@ -1724,7 +1754,13 @@ class TaskBuilderTools:
             kind_of = TaskSubject.ITEM
             description = (inp.get("description") or "").strip()
         else:
-            subject = Ref.make(names=[collection])
+            # КОД ПАПКИ КЛАДЁМ СРАЗУ, если он известен из выгрузки (решение админа
+            # 04.10.2026). По нему исполнитель сужает выгрузку 1С до коллекции задачи, а
+            # `_collection_folder` находит папку для переноса в снятые без сопоставления
+            # имён. Пустой код — законный исход: выгрузки по марке могло не быть вовсе,
+            # имена расходятся, позиций коллекции может не быть ещё ни одной.
+            subject = Ref.make(code=self._collection_code(mark.code, collection),
+                               names=[collection])
             kind_of = TaskSubject.COLLECTION
             description = (inp.get("description") or "").strip()
 

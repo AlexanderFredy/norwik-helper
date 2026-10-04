@@ -928,8 +928,9 @@ class NarrowDumpTest(unittest.IsolatedAsyncioTestCase):
     class Item:
         def __init__(self, ref, collection, code="", name="", article=""):
             self.ref, self.name, self.article = ref, name or ref, article
-            self.collection, self.collection_code = collection, code
-            self.collection_ref = code
+            self.collection = collection
+            self.collection_ref = code              # код ПАПКИ — им и адресуются задачи
+            self.collection_code = f"свойство-{code}"   # код значения свойства «Коллекция»
             self.size = self.product_type = self.unit = ""
             self.alt_units = []
             self.purchase = self.retail = self.rrc = None
@@ -987,6 +988,19 @@ class NarrowDumpTest(unittest.IsolatedAsyncioTestCase):
                           tm_name="Westerhof / Вестерхоф")
         got = await self.ask(tools)
         self.assertEqual(got.count('"ref"'), 1)
+
+    async def test_the_folder_code_is_used_not_the_property_code(self):
+        """РЕГРЕССИЯ. `collection_ref` — код ПАПКИ, `collection_code` — код значения
+        свойства «Коллекция». Сравнение не с тем полем не совпало бы никогда, и сужение
+        молча откатывалось бы на всю марку."""
+        rows = [self.Item("r1", "Что-то", code="YO-7"),
+                self.Item("r2", "Visiogrande", code="YO-1")]
+        tools = self.make(self.ref("Visiogrande", code="свойство-YO-1"), rows)
+        got = await self.ask(tools)
+        # Код свойства не совпал ни с одной папкой — сужаем по имени, как при пустом коде.
+        self.assertNotIn("по коду", got)
+        self.assertIn('"r2"', got)
+        self.assertNotIn('"r1"', got)
 
     async def test_the_code_wins_over_the_name(self):
         rows = [self.Item("r1", "Как-то иначе", code="YO-7"),
