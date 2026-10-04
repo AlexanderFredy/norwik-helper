@@ -128,22 +128,6 @@ async def main() -> None:
     else:
         logger.warning("ONEC_BASE_URL/ONEC_TOKEN не заданы — обновление цен недоступно")
 
-    # БРЕНДЫ ФОРМАТОВ дозаполняем так же и по той же причине, только ПОСЛЕ создания клиента
-    # 1С: марку кодом лишь ПРЕДЛАГАЕМ, а справочник марок живёт там. Нет 1С — список брендов
-    # всё равно соберётся, просто без предложенных марок (их выставит админ в форме).
-    from src.model.brand_backfill import fill_brand_lists
-
-    try:
-        known_marks = await asyncio.to_thread(onec.selling_tm) if onec else []
-    except Exception:                                   # noqa: BLE001
-        logger.warning("Справочник марок не прочитался — бренды дозаполним без марок",
-                       exc_info=True)
-        known_marks = []
-
-    with_brands = await fill_brand_lists(supplier_store, known_marks)
-    if with_brands:
-        logger.info("Бренды форматов дозаполнены: %d", with_brands)
-
     mail = MailClient(
         config.mail_host, config.mail_port, config.mail_user, config.mail_password
     )
@@ -156,6 +140,28 @@ async def main() -> None:
         # добавляют обработчики — только они знают, чей это вызов и по какому прайсу.
         on_usage=pricing_store.record_usage,
     )
+
+    # БРЕНДЫ ФОРМАТОВ дозаполняем из файлов на диске — как листы, и по той же причине:
+    # собираются они на приёме прайса, и у форматов, заведённых раньше, список пуст, а форма
+    # открывается с пустой таблицей. Стоит это ПОСЛЕ оркестратора и клиента 1С: марку кодом
+    # лишь ПРЕДЛАГАЕМ (справочник марок в 1С), а бренд-картинку читает модель. Нет ни того,
+    # ни другого — список всё равно соберётся, просто без предложенных марок и без логотипов.
+    from src.model.brand_backfill import fill_brand_lists
+    from src.model.logo_intake import name_logos
+
+    try:
+        known_marks = await asyncio.to_thread(onec.selling_tm) if onec else []
+    except Exception:                                   # noqa: BLE001
+        logger.warning("Справочник марок не прочитался — бренды дозаполним без марок",
+                       exc_info=True)
+        known_marks = []
+
+    async def read_logos(signature, content, filename):
+        return await name_logos(orchestrator, supplier_store, signature, content, filename)
+
+    with_brands = await fill_brand_lists(supplier_store, known_marks, read_logos)
+    if with_brands:
+        logger.info("Бренды форматов дозаполнены: %d", with_brands)
 
     async def build_tasks(content, filename, price):
         """Список задач составляет агент (§6.1). Метки расхода — как у прайсового
@@ -196,12 +202,24 @@ async def main() -> None:
         # `remember_marks` хранит флажки, марки и скидки, а новые бренды приезжают
         # неотмеченными.
         from src.model.brand_intake import remember as remember_brands
+        from src.model.logo_intake import name_logos
+
+        # БРЕНД БЫВАЕТ КАРТИНКОЙ (решение админа 04.10.2026). Код знает, в какой СТРОКЕ
+        # лежит баннер, а имя на нём читает модель — один раз на логотип, дальше по хешу
+        # картинки из памяти, то есть следующий файл того же поставщика бесплатен. Читаем
+        # ДО состава брендов: список и фильтр обязаны видеть одну и ту же разметку.
+        logos = {}
+        try:
+            logos = await name_logos(orchestrator, supplier_store, signature,
+                                     content, filename)
+        except Exception:                               # noqa: BLE001
+            logger.warning("Логотипы прайса %s не прочитаны", filename, exc_info=True)
 
         only_marks = None
         try:
             marks = await asyncio.to_thread(onec.selling_tm) if onec else []
             summary = await remember_brands(supplier_store, signature, content,
-                                            filename, marks)
+                                            filename, marks, logos)
             if summary["brands"]:
                 only_marks = await supplier_store.marks_wanted(signature)
         except Exception:                               # noqa: BLE001
@@ -245,7 +263,7 @@ async def main() -> None:
                            known_columns=known_columns,
                            remember_columns=remember_columns,
                            only_sheets=only_sheets, only_marks=only_marks,
-                           discounts=discounts,
+                           discounts=discounts, logos=logos,
                            currency={"code": price.supplier_price.currency_code,
                                      "name": price.supplier_price.currency_name,
                                      "rate": price.supplier_price.rate},

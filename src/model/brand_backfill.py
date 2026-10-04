@@ -36,11 +36,14 @@ logger = logging.getLogger(__name__)
 LIMIT = 50
 
 
-async def fill_brand_lists(suppliers, marks=None, limit: int = LIMIT) -> int:
+async def fill_brand_lists(suppliers, marks=None, logos=None,
+                           limit: int = LIMIT) -> int:
     """Пройти форматы, у которых бренды ещё не смотрели, и прочитать их из файлов.
 
     `marks` — справочник марок 1С (`onec.selling_tm()`), нужен только для предложения
-    привязки. Возвращает, сколько форматов заполнили.
+    привязки. `logos(сигнатура, содержимое, имя файла)` — чтение имён на баннерах
+    (`logo_intake.name_logos`); без него формат с брендами-картинками просто не даст списка,
+    и это лучше, чем выдумать его. Возвращает, сколько форматов заполнили.
     """
     from src.model.brand_intake import remember
 
@@ -73,9 +76,18 @@ async def fill_brand_lists(suppliers, marks=None, limit: int = LIMIT) -> int:
         if not path.is_file():
             continue
 
+        content = path.read_bytes()
+        found_logos = {}
+        if logos is not None:
+            try:
+                found_logos = await logos(sig.signature, content, newest.filename)
+            except Exception:                           # noqa: BLE001
+                logger.warning("Логотипы формата %s не прочитаны", sig.signature[:12],
+                               exc_info=True)
+
         try:
-            summary = await remember(suppliers, sig.signature, path.read_bytes(),
-                                     newest.filename, marks)
+            summary = await remember(suppliers, sig.signature, content,
+                                     newest.filename, marks, found_logos)
         except Exception:                               # noqa: BLE001
             logger.warning("Прайс %s не разобрался — бренды формата %s не заполнены",
                            newest.filename, sig.signature[:12], exc_info=True)

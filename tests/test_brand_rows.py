@@ -1,0 +1,390 @@
+"""Детекция строк бренда тремя способами: колонка, разделитель, картинка (04.10.2026).
+
+**ГЛАВНЫЕ ТЕСТЫ ЗДЕСЬ ОТРИЦАТЕЛЬНЫЕ.** Правило «одинокая ячейка = раздел» на боевых мелких
+форматах даёт мусор: у Most Floor так выглядят ТОВАРЫ (цены стоят одной строкой на
+коллекцию), у Линдервуда верхним уровнем становится примечание «Важно: цены включают…».
+Список «брендов», собранный из товаров, хуже отсутствующего — по нему РЕЖУТ файл. Поэтому
+каждый порог проверяется отдельно, а раскладки взяты с боя.
+
+Размеры листов в тестах синтетические, но пороги настоящие: лист меньше `SECTION_MIN_ROWS`
+отсекается размером, поэтому ложные раскладки раздуваются до тысячи строк — иначе они
+проходили бы проверку по причине, которую мы не тестируем.
+"""
+import unittest
+from unittest.mock import patch
+
+from src.price_tool.brand_rows import (BY_COLUMN, BY_IMAGE, BY_SECTION,
+                                       SECTION_MIN_ROWS, brand_map, brand_per_raw_row,
+                                       brands_in_rows, find_sections, only_brand_rows,
+                                       rows_cost)
+from src.price_tool.parser import Sheet
+
+HEAD = [
+    ["Оптовый отдел", "", "", "", "", "", "", "", 'ООО "Артисан-Проект"'],
+    ["Прайс-лист на 26.08.2026"],
+    ["Код", "Заводской код", "Вид", "Размер", "В упаковке", "Ед.изм.", "Наименование",
+     "Розн", "Опт"],
+]
+
+
+def artisana(brands=5, colls=2, items=4) -> Sheet:
+    """Раскладка Артисаны: бренд в колонке 0, коллекция в колонке 1, товар — густая строка."""
+    rows = [list(r) for r in HEAD]
+    for b in range(brands):
+        rows.append([f"Бренд {b}"])
+        for c in range(colls):
+            rows.append(["", f"Коллекция {b}-{c}"])
+            for i in range(items):
+                rows.append([f"+{b}{c}{i}", f"A{b}{c}{i}", "Плитка", "20x20", "1",
+                             "кв.м.", f"Декор {i}", "1140", "950"])
+    # Доращиваем до порога размера: он отсекает мелкие форматы, и тестировать надо не его.
+    while len(rows) < SECTION_MIN_ROWS:
+        rows.append(["+9", "A9", "Плитка", "20x20", "1", "кв.м.", "Хвост", "1", "2"])
+    return Sheet(name="Price", rows=rows)
+
+
+class SectionTest(unittest.TestCase):
+    """Горизонтальный разделитель — боевая раскладка Артисаны."""
+
+    def setUp(self):
+        self.sheet = artisana()
+        self.spot = find_sections(self.sheet)
+
+    def test_mode_and_brand_column(self):
+        self.assertIsNotNone(self.spot)
+        self.assertEqual(self.spot.mode, BY_SECTION)
+        self.assertEqual(self.spot.column, 0)
+
+    def test_brands_are_the_top_level_only(self):
+        """Коллекции в список НЕ идут: детализация до них админу не нужна (его решение)."""
+        self.assertEqual([b for b, _ in brands_in_rows(self.spot)],
+                         [f"Бренд {n}" for n in range(5)])
+
+    def test_rows_counted_are_items_not_separators(self):
+        """Счёт строк — по товарам: завышенный обесценил бы оценку расхода."""
+        self.assertEqual(dict(brands_in_rows(self.spot))["Бренд 0"], 8)
+
+    def test_header_is_everything_above_the_first_brand(self):
+        """У Артисаны две строки заголовков и контакты выше — модель должна видеть их все."""
+        self.assertEqual(self.spot.header_rows, len(HEAD))
+
+    def test_collection_rows_travel_with_the_brand(self):
+        """Без строки «Коллекция» модель не узнает, к какой коллекции позиция: задачи
+        адресуются парой (марка, коллекция)."""
+        kept = only_brand_rows(self.sheet, self.spot, ["Бренд 1"]).rows
+        self.assertEqual(kept[:len(HEAD)], [list(r) for r in HEAD])
+        tail = kept[len(HEAD):]
+        self.assertEqual(tail[0], ["Бренд 1"])
+        self.assertIn(["", "Коллекция 1-0"], tail)
+        self.assertNotIn(["", "Коллекция 0-0"], tail)
+        # 1 разделитель бренда + 2 коллекции + 8 товаров
+        self.assertEqual(len(tail), 11)
+
+    def test_cost_counts_items_and_chars(self):
+        lines, chars = rows_cost(self.sheet, self.spot, ["Бренд 2"])
+        self.assertEqual(lines, 8)
+        self.assertGreater(chars, 0)
+
+    def test_nothing_wanted_gives_the_header_alone(self):
+        self.assertEqual(len(only_brand_rows(self.sheet, self.spot, []).rows), len(HEAD))
+
+
+class SectionGuardTest(unittest.TestCase):
+    """Пороги доказательств. Каждый проверяется отдельно: сработает один — промолчит весь."""
+
+    def test_small_sheet_is_not_touched(self):
+        """Мелкий формат отсекается размером — именно он разделяет боевые случаи."""
+        small = artisana()
+        small = Sheet(name="Прайс", rows=small.rows[:50])
+        self.assertIsNone(find_sections(small))
+
+    def test_items_as_lonely_cells_are_not_brands(self):
+        """РАСКЛАДКА MOST FLOOR: цены стоят одной строкой на коллекцию, и сами товары
+        выглядят одинокими ячейками — 86 строк из 107. Признать их брендами значило бы
+        нарезать файл по названиям декоров."""
+        rows = [list(r) for r in HEAD]
+        for n in range(SECTION_MIN_ROWS):
+            rows.append([f"Коллекция {n} - 8 декоров"] if n % 9 == 0
+                        else [f"{3310 + n} Декор"])
+        self.assertIsNone(find_sections(Sheet(name="Ламинат", rows=rows)))
+
+    def test_a_note_is_not_a_brand(self):
+        """РАСКЛАДКА ЛИНДЕРВУДА: в колонке 0 всего две одинокие ячейки, и одна из них —
+        «Важно: цены включают в себя стоимость доставки…»."""
+        rows = [list(r) for r in HEAD]
+        rows.append(["ПОДЛОЖКА ЛИСТОВАЯ 3 мм"])
+        for n in range(SECTION_MIN_ROWS):
+            rows.append(["", f"Ламинат — 8 мм 33 класс {n}"] if n % 12 == 0
+                        else ["A1", "код", "Пол", "190x1290", "2", "кв.м.", "Дуб", "1", "2"])
+        rows.append(["Важно:  цены включают в себя стоимость доставки"])
+        self.assertIsNone(find_sections(Sheet(name="Прайс Москва", rows=rows)))
+
+    def test_few_sections_are_not_a_list_of_brands(self):
+        self.assertIsNone(find_sections(artisana(brands=3)))
+
+    def test_section_without_items_is_dropped(self):
+        """Раздел, под которым нет ни одной товарной строки, — оформление, а не бренд."""
+        sheet = artisana()
+        rows = list(sheet.rows)
+        rows.insert(len(HEAD), ["ЦЕНА 1* — наша доставка по Москве"])
+        spot = find_sections(Sheet(name="Price", rows=rows))
+        self.assertIsNotNone(spot)
+        self.assertNotIn("ЦЕНА 1* — наша доставка по Москве",
+                         [b for b, _ in brands_in_rows(spot)])
+
+    def test_junk_in_a_far_column_does_not_become_the_brand_level(self):
+        """У FLOOR SERVICE одинокие ячейки встречаются в колонке 26 («0.35»). Уровнем
+        бренда считается САМАЯ ЛЕВАЯ колонка разделов, и мусор справа её не подменяет."""
+        sheet = artisana()
+        rows = list(sheet.rows)
+        rows.insert(len(HEAD) + 1, [""] * 26 + ["0.35"])
+        spot = find_sections(Sheet(name="Price", rows=rows))
+        self.assertIsNotNone(spot)
+        self.assertEqual(spot.column, 0)
+
+
+class ColumnModeTest(unittest.TestCase):
+    """Колонка остаётся первым и главным способом: признак стоит в каждой строке."""
+
+    SHEET = Sheet(name="TDSheet", rows=[
+        ["Фабрика", "Бренд", "Артикул"],
+        ["ABK", "ABK", "4938"],
+        ["", "", "4939"],
+        ["VitrA", "VitrA", "K9470"],
+    ])
+
+    def test_column_wins_and_carries_merged_cells(self):
+        spot = brand_map(self.SHEET)
+        self.assertEqual(spot.mode, BY_COLUMN)
+        self.assertEqual(dict(brands_in_rows(spot)), {"ABK": 2, "VitrA": 1})
+
+    def test_filter_keeps_the_header(self):
+        spot = brand_map(self.SHEET)
+        kept = only_brand_rows(self.SHEET, spot, ["VitrA"])
+        self.assertEqual(kept.rows[0][1], "Бренд")
+        self.assertEqual([r[1] for r in kept.rows[1:]], ["VitrA"])
+
+    def test_sheet_without_any_sign_is_silent(self):
+        plain = Sheet(name="КЛЕЙ", rows=[["Артикул", "Цена"], ["A1", "100"]])
+        self.assertIsNone(brand_map(plain))
+
+
+class ImageModeTest(unittest.TestCase):
+    """Баннер картинкой: код знает строку, имя приносит `logo_intake`.
+
+    Раскладка как в жизни: баннер висит над ПУСТОЙ строкой — картинка плавает над листом и
+    своей ячейки не занимает. Отсюда и главная ловушка этого режима: якоря приходят в сырых
+    номерах строк книги, а фильтр считает непустые.
+    """
+
+    SHEET = Sheet(name="Ламинат", rows=[
+        ["Прайс"],                       # сырая 1, непустая 1
+        ["Артикул", "Цена", "Упаковка"],  # сырая 2, непустая 2 — шапка
+        [],                              # сырая 3 — под ней баннер Kronotex
+        ["A1", "100", "2"],              # сырая 4, непустая 3
+        ["A2", "110", "2"],              # сырая 5, непустая 4
+        [],                              # сырая 6 — под ней баннер Classen
+        ["B1", "200", "2"],              # сырая 7, непустая 5
+    ])
+    ANCHORS = {"Ламинат": {3: "Kronotex", 6: "Classen"}}
+
+    def test_two_anchors_split_the_sheet(self):
+        spot = brand_map(self.SHEET, self.ANCHORS)
+        self.assertEqual(spot.mode, BY_IMAGE)
+        self.assertEqual(dict(brands_in_rows(spot)), {"Kronotex": 2, "Classen": 1})
+        self.assertEqual(spot.header_rows, 2)
+
+    def test_rows_are_numbered_as_the_filter_counts_them(self):
+        """РЕГРЕССИЯ. Якоря — сырые номера строк книги (их же использует `mark_images`), а
+        `rows` обязаны быть в нумерации непустых: иначе пустая строка под баннером сдвигает
+        бренды вверх на число пустых строк, и позиции достаются ЧУЖОМУ бренду."""
+        spot = brand_map(self.SHEET, self.ANCHORS)
+        self.assertEqual(spot.rows, ((3, "Kronotex"), (4, "Kronotex"), (5, "Classen")))
+
+    def test_filter_keeps_the_header_and_only_the_brand(self):
+        spot = brand_map(self.SHEET, self.ANCHORS)
+        kept = only_brand_rows(self.SHEET, spot, ["Classen"])
+        self.assertEqual(kept.rows, [["Прайс"], ["Артикул", "Цена", "Упаковка"],
+                                     ["B1", "200", "2"]])
+
+    def test_an_anchor_row_with_data_is_not_lost(self):
+        """Якорь может попасть и на обычную строку прайса. Выбросив её как «разделитель», мы
+        потеряли бы позицию; бренд начинается С НЕЁ."""
+        spot = brand_map(self.SHEET, {"Ламинат": {4: "Kronotex", 7: "Classen"}})
+        self.assertEqual(dict(brands_in_rows(spot)), {"Kronotex": 2, "Classen": 1})
+
+    def test_one_anchor_separates_nothing(self):
+        """У Монарха 93 картинки привязаны ВСЕ к строке 1, у Most Floor и FLOOR SERVICE по
+        одной на лист — это шапка. Один якорь дал бы список из одной записи и ложное
+        чувство, что выбор работает (замер 04.10.2026)."""
+        self.assertIsNone(brand_map(self.SHEET, {"Ламинат": {1: "Most Floor"}}))
+
+    def test_anchors_of_another_sheet_are_ignored(self):
+        self.assertIsNone(brand_map(self.SHEET, {"SPC": {3: "Kronotex", 6: "Classen"}}))
+
+
+class RawRowTest(unittest.TestCase):
+    """Бренд строки по ПОЛОЖЕНИЮ — так его спрашивают цены (`prices_from_rows`)."""
+
+    def test_every_raw_row_gets_its_owner(self):
+        sheet = artisana(brands=5, colls=1, items=2)
+        spot = find_sections(sheet)
+        owners = brand_per_raw_row(sheet, spot)
+        self.assertEqual(len(owners), len(sheet.rows))
+        self.assertEqual(owners[:len(HEAD)], [""] * len(HEAD))
+        self.assertEqual(owners[len(HEAD)], "Бренд 0")
+        self.assertEqual(owners[len(HEAD) + 2], "Бренд 0")
+
+    def test_empty_rows_belong_to_nobody(self):
+        sheet = artisana(brands=5, colls=1, items=2)
+        rows = list(sheet.rows)
+        rows.insert(len(HEAD) + 1, [])
+        sheet = Sheet(name="Price", rows=rows)
+        owners = brand_per_raw_row(sheet, find_sections(sheet))
+        self.assertEqual(owners[len(HEAD) + 1], "")
+
+
+class LogoNamingTest(unittest.IsolatedAsyncioTestCase):
+    """Имя на логотипе спрашивается один раз и помнится по хешу картинки."""
+
+    class Orchestrator:
+        def __init__(self, answer):
+            self.answer = answer
+            self.calls = 0
+
+        async def handle_turn(self, messages, **kw):
+            self.calls += 1
+            self.seen = messages
+            return self.answer, messages
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self._dir = tempfile.TemporaryDirectory()
+        self.root = Path(self._dir.name)
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    async def store(self):
+        from src.storage.suppliers import SupplierStore
+
+        store = SupplierStore(self.root / "t.db")
+        await store.init()
+        supplier = await store.add_supplier("Артисан")
+        await store.add_signature(supplier.id, "hash-1")
+        return store
+
+    @staticmethod
+    def images(**sheets):
+        return lambda content: {name: [(row, data, "image/png")
+                                       for row, data in rows.items()]
+                                for name, rows in sheets.items()}
+
+    async def test_names_are_read_once_and_remembered(self):
+        from src.model.logo_intake import image_hash, name_logos
+
+        store = await self.store()
+        agent = self.Orchestrator('[{"n": 1, "brand": "Kronotex"}]')
+        images = self.images(Ламинат={3: b"logo-bytes"})
+
+        with patch("src.price_tool.parser.extract_images", images):
+            got = await name_logos(agent, store, "hash-1", b"x", "прайс.xlsx")
+            self.assertEqual(got, {"Ламинат": {3: "Kronotex"}})
+            self.assertEqual(agent.calls, 1)
+
+            again = await name_logos(agent, store, "hash-1", b"x", "прайс.xlsx")
+
+        self.assertEqual(again, {"Ламинат": {3: "Kronotex"}})
+        self.assertEqual(agent.calls, 1, "второй файл того же формата обязан быть бесплатным")
+        self.assertEqual(await store.logos_for("hash-1"),
+                         {image_hash(b"logo-bytes"): "Kronotex"})
+
+    async def test_not_a_logo_is_remembered_too(self):
+        """Фото товара и рамки встречаются чаще логотипов; не запомнив ответ «это не
+        логотип», мы спрашивали бы о них в каждом прогоне."""
+        from src.model.logo_intake import name_logos
+
+        store = await self.store()
+        agent = self.Orchestrator('[{"n": 1, "brand": ""}]')
+        images = self.images(Ламинат={3: b"frame"})
+
+        with patch("src.price_tool.parser.extract_images", images):
+            self.assertEqual(await name_logos(agent, store, "hash-1", b"x", "п.xlsx"), {})
+            await name_logos(agent, store, "hash-1", b"x", "п.xlsx")
+
+        self.assertEqual(agent.calls, 1)
+        self.assertEqual(list((await store.logos_for("hash-1")).values()), [""])
+
+    async def test_broken_answer_names_nothing(self):
+        from src.model.logo_intake import name_logos
+
+        store = await self.store()
+        agent = self.Orchestrator("не могу разобрать картинки")
+        with patch("src.price_tool.parser.extract_images",
+                   self.images(Ламинат={3: b"logo"})):
+            self.assertEqual(await name_logos(agent, store, "hash-1", b"x", "п.xlsx"), {})
+
+    async def test_a_crowd_of_pictures_is_not_asked_about(self):
+        """У Монарха 93 картинки на листе — это фото товаров, а не разделители. Платить за
+        вопрос о них незачем."""
+        from src.model.logo_intake import MAX_LOGOS, name_logos
+
+        store = await self.store()
+        agent = self.Orchestrator("[]")
+        many = {row: f"pic-{row}".encode() for row in range(1, MAX_LOGOS + 5)}
+        with patch("src.price_tool.parser.extract_images", self.images(Лист=many)):
+            self.assertEqual(await name_logos(agent, store, "hash-1", b"x", "п.xlsx"), {})
+        self.assertEqual(agent.calls, 0)
+
+    async def test_logo_names_survive_a_hash_recompute(self):
+        from src.model.logo_intake import image_hash
+        from src.storage.suppliers import SupplierStore
+
+        store = SupplierStore(self.root / "r.db")
+        await store.init()
+        supplier = await store.add_supplier("Артисан")
+        sig = await store.add_signature(supplier.id, "старый")
+        await store.remember_logos("старый", [(image_hash(b"logo"), "Kronotex")])
+
+        await store.rehash_signature(sig.id, "новый")
+        self.assertEqual(await store.logos_for("новый"),
+                         {image_hash(b"logo"): "Kronotex"})
+        self.assertEqual(await store.logos_for("старый"), {})
+
+
+class BudgetTest(unittest.TestCase):
+    """Предохранитель: отмеченное сверх предела не уезжает модели молча."""
+
+    def tools(self, marks, sheet):
+        from src.model.task_builder import TaskBuilderTools
+
+        t = TaskBuilderTools(b"x", "Price.xls", only_marks=marks)
+        t._sheets = t._narrow([sheet])
+        return t
+
+    def test_too_much_refuses_with_an_estimate(self):
+        from src.model.task_builder import BIG_BRAND_ROWS
+
+        sheet = artisana(brands=5, colls=2, items=(BIG_BRAND_ROWS // 2) + 1)
+        t = self.tools(["Бренд 0"], sheet)
+        self.assertEqual(t.sheets, [])
+        self.assertIn("отмечено слишком много", t.pick_problem)
+        self.assertIn("токенов", t.pick_problem)
+        self.assertGreater(t.kept_rows, BIG_BRAND_ROWS)
+
+    def test_a_modest_choice_goes_through(self):
+        t = self.tools(["Бренд 0"], artisana())
+        self.assertEqual([s.name for s in t.sheets], ["Price"])
+        self.assertEqual(t.kept_rows, 8)
+        self.assertEqual(t.pick_problem, "")
+        self.assertEqual(t.brand_modes, {"Price": BY_SECTION})
+
+    def test_unticked_brands_are_named_for_the_report(self):
+        t = self.tools(["Бренд 0"], artisana())
+        self.assertEqual(t.skipped_marks, [f"Бренд {n}" for n in range(1, 5)])
+
+
+if __name__ == "__main__":
+    unittest.main()

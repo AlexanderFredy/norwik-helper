@@ -52,13 +52,13 @@ def main() -> int:
     sheets = parse_price_table(content, path.name) or []
     print(f"Листов: {len(sheets)}")
 
-    column, found = collect(content, path.name)
+    column, found, mode = collect(content, path.name)
     if not found:
-        print("Колонка бренда не найдена — выбор брендов по этому формату недоступен, "
+        print("Бренд в этом формате не обозначен — выбор брендов недоступен, "
               "разбор идёт по листам, как обычно.")
         return 0
 
-    print(f"Колонка бренда: {column}; брендов: {len(found)}; "
+    print(f"Способ детекции: {mode}; колонка бренда: {column}; брендов: {len(found)}; "
           f"строк с брендом: {sum(n for _, n in found)}")
 
     # Марки 1С — только если база настроена: прогон обязан работать и без неё.

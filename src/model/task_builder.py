@@ -39,13 +39,20 @@ from src.model import price_check
 from src.price_tool.items import build_name
 from src.price_tool.parser import (non_empty_rows, parse_price_table,
                                    render_preview)
-from src.price_tool.brands import brands_in, find_brand_column, only_brands
+from src.price_tool.brand_rows import (brand_map, brand_per_raw_row, brands_in_rows,
+                                       only_brand_rows, rows_cost)
 from src.price_tool.signature import sheet_key
 from src.price_tool.scope import in_scope, normalize
 
 logger = logging.getLogger(__name__)
 
 MAX_SHEET_ROWS = 200        # строк листа в один ответ инструмента
+#: Сколько ТОВАРНЫХ строк отмеченного разрешаем отдать модели без вопросов. Без детализации
+#: до коллекций (решение админа 04.10.2026) отметка бренда — это всё или ничего: у Артисаны
+#: одна Kerama это 6 702 строки ≈ 200 тыс. токенов ≈ $2 за ОДНУ загрузку таблицы, а история
+#: ручного цикла несёт её в каждый следующий запрос. 1 500 строк ≈ 40 тыс. токенов — та же
+#: мерка по смыслу, что `BIG_PRICE_ROWS` в прайсовом потоке: сверх неё решает человек.
+BIG_BRAND_ROWS = 1500
 MAX_TASKS = 200             # потолок на прогон: защита от разгона, а не рабочий предел
 
 
@@ -266,7 +273,8 @@ class TaskBuilderTools:
                  only_sheets: str | None = None,
                  only_marks: list | None = None,
                  discounts: dict | None = None,
-                 currency: dict | None = None) -> None:
+                 currency: dict | None = None,
+                 logos: dict | None = None) -> None:
         self._content = content
         self._filename = filename
         self._onec = onec
@@ -324,6 +332,19 @@ class TaskBuilderTools:
         self.skipped_marks: list[str] = []
         self.kept_rows = 0
         self.whole_rows = 0
+        # Знаков в отмеченном — по ним считается оценка в токенах для предохранителя.
+        self.picked_chars = 0
+        # Бренд → сколько у него товарных строк. Нужен отчёту при отказе по объёму: назвать
+        # «слишком много», не сказав, кто именно крупный, значит заставить админа гадать.
+        self.brand_sizes: dict[str, int] = {}
+        # Чем бренд обозначен в каждом листе: колонкой, разделителем или картинкой. Идёт в
+        # отчёт админу: по пустому списку брендов он должен понимать, откуда они берутся.
+        self.brand_modes: dict[str, str] = {}
+        # Строка картинки → бренд на ней, по листам. Код знает, ГДЕ баннер (`parser.
+        # image_anchor_rows`), а ЧЕЙ на нём логотип — читает модель один раз на логотип и
+        # помнит по его хешу. Сюда это приходит ГОТОВЫМ: внутри инструментов спрашивать
+        # модель неоткуда, да и платить за это каждому прогону незачем.
+        self._logos = dict(logos or {})
         # Листы, которые агент РЕАЛЬНО прочитал. «Проанализировал» — это про них, а не про
         # те, что ему предложили: лист можно было не открыть вовсе, и админ должен видеть
         # разницу между «исключил я» и «агент сам не стал смотреть».
@@ -388,21 +409,25 @@ class TaskBuilderTools:
         после сужения не осталось ни строки, — а это законный исход, о котором обязан узнать
         админ, и узнать ДО того, как мы позовём модель.
 
-        **Лист без колонки бренда проходит как есть.** У прайса бывает служебная вкладка без
-        брендов вовсе, и выбросить её молча значило бы спрятать часть файла по признаку,
-        которого в ней нет.
+        **Лист, где бренд не обозначен, проходит как есть.** У прайса бывает служебная
+        вкладка без брендов вовсе, и выбросить её молча значило бы спрятать часть файла по
+        признаку, которого в ней нет.
+
+        **Способов обозначить бренд три** (решение админа 04.10.2026): колонка,
+        горизонтальный разделитель, картинка-баннер. Выбирает между ними `brand_map`, и здесь
+        разницы между ними нет вовсе — строки уже розданы брендам.
         """
         if self._marks is None:
             return chosen
 
-        # ВЫБОР БРЕНДОВ ОТНОСИТСЯ ТОЛЬКО К ЛИСТАМ, ГДЕ БРЕНД ЕСТЬ КОЛОНКОЙ (04.10.2026).
-        # Колонка — свойство ЛИСТА, а не формата: у FLOOR SERVICE её нет на «КЛЕЙ»,
-        # «ИЗМЕНЕНИЯ» и «Скидки розница», и у четырёх форматов из пяти её нет ни на одном
-        # листе вовсе. Без этой проверки пустой список брендов (а он пуст у всех, пока
-        # админ не расставил флажки) остановил бы разбор ЦЕЛИКОМ — у форматов, где
-        # отмечать нечего в принципе. Нет колонки ни в одном отмеченном листе — выбор
-        # брендов к ним не относится, работаем как раньше.
-        spots = [(sheet, find_brand_column(sheet)) for sheet in chosen]
+        # ВЫБОР БРЕНДОВ ОТНОСИТСЯ ТОЛЬКО К ЛИСТАМ, ГДЕ БРЕНД ВООБЩЕ ОБОЗНАЧЕН (04.10.2026).
+        # Это свойство ЛИСТА, а не формата: у FLOOR SERVICE колонки нет на «КЛЕЙ»,
+        # «ИЗМЕНЕНИЯ» и «Скидки розница», а у четырёх форматов из пяти бренд не обозначен ни
+        # на одном листе. Без этой проверки пустой список брендов (а он пуст у всех, пока
+        # админ не расставил флажки) остановил бы разбор ЦЕЛИКОМ — у форматов, где отмечать
+        # нечего в принципе. Нет признака ни в одном отмеченном листе — выбор брендов к ним
+        # не относится, работаем как раньше.
+        spots = [(sheet, brand_map(sheet, self._logos)) for sheet in chosen]
         if not any(spot is not None for _, spot in spots):
             return chosen
 
@@ -417,23 +442,40 @@ class TaskBuilderTools:
                 out.append(sheet)
                 continue
 
-            whole = brands_in(sheet, spot)
+            whole = brands_in_rows(spot)
             self.whole_rows += sum(rows for _, rows in whole)
             for brand, rows in whole:
                 keep = normalize(brand) in {normalize(n) for n in self._marks}
+                if keep:
+                    self.brand_sizes[brand] = self.brand_sizes.get(brand, 0) + rows
                 side = self.parsed_marks if keep else self.skipped_marks
                 if brand not in side:
                     side.append(brand)
                 if keep:
                     self.kept_rows += rows
 
-            out.append(only_brands(sheet, spot, self._marks))
+            _, chars = rows_cost(sheet, spot, self._marks)
+            self.picked_chars += chars
+            self.brand_modes[sheet.name] = spot.mode
+            out.append(only_brand_rows(sheet, spot, self._marks))
 
         # ПЕРЕСЕЧЕНИЕ ПУСТО — это не поломка файла и не «расхождений нет». Бренды отмечены,
         # листы отмечены, а общего у них ничего: поставщик переименовал бренд либо отмеченные
         # бренды лежат на другом листе. Выдать это за «работы нет» нельзя.
         if self.whole_rows and not self.kept_rows:
             self.pick_problem = "ни одного отмеченного бренда нет в отмеченных листах"
+            return []
+
+        # ОТМЕЧЕНО СЛИШКОМ МНОГО — СПРАШИВАЕМ, А НЕ ПЛАТИМ. Коллекции не выбираются (решение
+        # админа), значит бренд берётся целиком, и у Артисаны одна Kerama это 6 702 строки
+        # ≈ 200 тыс. токенов ≈ $2 за одну загрузку; дальше история ручного цикла несёт их в
+        # каждый следующий запрос. Молчаливый перерасход — ровно то, против чего заводился
+        # весь механизм, поэтому модель не зовём вовсе, а называем цифры: решать, платить ли
+        # за такой разбор, не наше дело.
+        if self.kept_rows > BIG_BRAND_ROWS:
+            self.pick_problem = (
+                f"отмечено слишком много — {self.kept_rows} строк "
+                f"≈ {self.picked_chars // 4} токенов при пределе {BIG_BRAND_ROWS} строк")
             return []
 
         return out
@@ -1422,10 +1464,13 @@ class TaskBuilderTools:
         нет». Это важное свойство: записать в 1С цену, посчитанную по чужой скидке, было бы
         необратимо, а пропущенную позицию видно в отчёте.
 
-        Пустая ячейка бренда — объединённая с верхней, поэтому помним последнюю виденную.
-        Обход идёт по файлу сверху вниз (так читает `prices_from_rows`), и этого довольно.
+        **Строка знает свой бренд по ПОЛОЖЕНИЮ, а не по содержимому.** У колонки бренд
+        читался из ячейки, но обозначен он бывает и разделителем, и картинкой — там в самой
+        строке товара нет ничего. Поэтому бренды раздаёт `brand_per_raw_row`, а здесь
+        остаётся сопоставление по самому объекту строки: `prices_from_rows` ходит по тем же
+        спискам `sheet.rows`. Протяжка объединённых ячеек при этом уже учтена.
         """
-        spot = find_brand_column(sheet)
+        spot = brand_map(sheet, self._logos)
 
         if spot is None:
             # Брендов в листе нет. Единственную заданную скидку применить можно — она
@@ -1434,14 +1479,12 @@ class TaskBuilderTools:
             single = self._terms(only.pop() if len(only) == 1 else None)
             return lambda row: single
 
-        last = {"brand": ""}
+        owner = {id(row): brand
+                 for row, brand in zip(sheet.rows, brand_per_raw_row(sheet, spot))
+                 if brand}
 
         def read(row):
-            value = (str(row[spot.column] or "").strip()
-                     if len(row) > spot.column else "")
-            if value:
-                last["brand"] = value
-            return self._terms(self._discounts.get(normalize(last["brand"])))
+            return self._terms(self._discounts.get(normalize(owner.get(id(row), ""))))
 
         return read
 
@@ -1456,12 +1499,12 @@ class TaskBuilderTools:
         if currency and not self._terms(None).has_currency:
             return dealer_price.missing(self._terms(None), currency=True)
 
-        spot = find_brand_column(sheet)
+        spot = brand_map(sheet, self._logos)
         if spot is None:
             terms = self._terms_reader(sheet)([])
             return dealer_price.missing(terms, currency=currency)
 
-        without = [brand for brand, _ in brands_in(sheet, spot)
+        without = [brand for brand, _ in brands_in_rows(spot)
                    if not self._terms(
                        self._discounts.get(normalize(brand))).has_discount]
         if not without:
@@ -2196,6 +2239,22 @@ def sheets_report(tools) -> str:
                 "у таких прайсов половина брендов обычно к магазину не относится.\n"
                 "Откройте «Бренды» в форме 1С, отметьте нужные и нажмите "
                 "«Обновить задачи».")
+    # ОТКАЗ ПО ОБЪЁМУ ОБЯЗАН НАЗЫВАТЬ ЦИФРЫ И ДЕЙСТВИЕ. «Слишком много» без числа читается
+    # как сбой; с числом это выбор, который админ может сделать сам — снять флажок с
+    # крупного бренда. Цена названа в токенах и в деньгах: по ним и решают.
+    if tools.pick_problem.startswith("отмечено слишком много"):
+        big = sorted(((rows, brand) for brand, rows in tools.brand_sizes.items()),
+                     reverse=True)[:5]
+        return ("Отмечено слишком много — задачи не собирал.\n"
+                f"В выборе {tools.kept_rows} товарных строк "
+                f"≈ {tools.picked_chars // 4} токенов (~${tools.picked_chars / 4 * 1e-5:.2f} "
+                f"за одну загрузку таблицы, и дальше она едет в каждый запрос). "
+                f"Предел — {BIG_BRAND_ROWS} строк.\n"
+                + ("Крупнее всех: "
+                   + ", ".join(f"{brand} — {rows} строк" for rows, brand in big)
+                   + ".\n" if big else "")
+                + "Снимите флажки с крупных брендов в форме 1С и нажмите "
+                  "«Обновить задачи».")
     if tools.pick_problem == "ни одного отмеченного бренда нет в отмеченных листах":
         return ("Пересечение пусто — задачи не собирал.\n"
                 "Отмеченных брендов в отмеченных листах нет ни одной строки.\n"
@@ -2236,7 +2295,12 @@ def sheets_report(tools) -> str:
     # видно. Поэтому называем и то, что разобрали, и то, что скрыли, и чем это измеряется в
     # строках: по числу строк видно, велика ли отброшенная часть.
     if tools.parsed_marks:
-        lines.append(f"Разобраны бренды ({tools.kept_rows} строк из {tools.whole_rows}): "
+        # ЧЕМ бренд обозначен — тоже новость, и не праздная: способов три (колонка,
+        # горизонтальный разделитель, картинка-баннер), и по пустому либо странному списку
+        # админ должен понимать, откуда он взялся, а не считать его сбоем.
+        how = sorted({mode for mode in tools.brand_modes.values() if mode})
+        lines.append(f"Разобраны бренды ({tools.kept_rows} строк из {tools.whole_rows}"
+                     + (f", определены по: {', '.join(how)}" if how else "") + "): "
                      + ", ".join(tools.parsed_marks) + ".")
     if tools.skipped_marks:
         hidden = tools.skipped_marks[:12]
@@ -2254,6 +2318,7 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
                 remember_columns=None, only_sheets: str | None = None,
                 only_marks: list | None = None,
                 discounts: dict | None = None, currency: dict | None = None,
+                logos: dict | None = None,
                 note=None) -> tuple[list[PriceTask], str]:
     """Прогон формирования задач. Возвращает (задачи, короткий ответ агента).
 
@@ -2267,7 +2332,7 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
     tools = TaskBuilderTools(content, filename, onec=onec, elsewhere=elsewhere,
                              scope=scope, known_columns=known_columns,
                              only_sheets=only_sheets, only_marks=only_marks,
-                             discounts=discounts, currency=currency)
+                             discounts=discounts, currency=currency, logos=logos)
     task = f"Прайс «{filename}». Составь список задач по нему."
 
     # РАЗБИРАТЬ НЕЧЕГО — МОДЕЛЬ НЕ ЗОВЁМ ВОВСЕ. Ради этого вся затея и нужна: прогон по

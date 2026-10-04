@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 
-from src.price_tool.brands import brands_in, find_brand_column
+from src.price_tool.brand_rows import brand_map, brands_in_rows
 from src.price_tool.parser import parse_price_table
 from src.price_tool.scope import normalize
 
@@ -67,41 +67,45 @@ def propose_marks(brands, marks) -> dict[str, tuple[str, str]]:
     return out
 
 
-def collect(content: bytes, filename: str):
-    """Бренды файла: `(колонка, [(бренд, строк)])`. Колонка None — брендов в файле нет.
+def collect(content: bytes, filename: str, images=None):
+    """Бренды файла: `(колонка, [(бренд, строк)], способ)`. Колонка None — бренда нет.
 
-    Берутся ВСЕ листы, у которых колонка бренда есть: прайс бывает на несколько вкладок, и
-    бренд с двух листов — это один бренд с суммой строк. Колонку запоминаем первую
-    найденную — она нужна лишь для показа админу, а фильтр ищет её в каждом листе сам
-    (разбор занимает двадцать строк и ничего не стоит).
+    Берутся ВСЕ листы, где бренд вообще обозначен: прайс бывает на несколько вкладок, и
+    бренд с двух листов — это один бренд с суммой строк. Колонку и способ запоминаем по
+    ПЕРВОМУ листу, где нашли, — они нужны для показа админу, а фильтр ищет признак в каждом
+    листе сам (разбор занимает двадцать строк и ничего не стоит).
+
+    Способов три — колонка, горизонтальный разделитель, картинка-баннер (решение админа
+    04.10.2026); выбирает между ними `brand_map`, здесь остаётся сложение по листам.
     """
     try:
         sheets = parse_price_table(content, filename) or []
     except Exception:                                   # noqa: BLE001
         logger.warning("Бренды не собраны: %s не разобрался", filename, exc_info=True)
-        return None, []
+        return None, [], ""
 
     column = None
+    mode = ""
     counts: dict[str, int] = {}
     order: list[str] = []
     for sheet in sheets:
-        spot = find_brand_column(sheet)
+        spot = brand_map(sheet, images)
         if spot is None:
             continue
-        if column is None:
-            column = spot.column
-        for brand, rows in brands_in(sheet, spot):
+        if not mode:
+            column, mode = spot.column, spot.mode
+        for brand, rows in brands_in_rows(spot):
             key = normalize(brand)
             if key not in counts:
                 counts[key] = 0
                 order.append(brand)
             counts[key] += rows
 
-    return column, [(brand, counts[normalize(brand)]) for brand in order]
+    return column, [(brand, counts[normalize(brand)]) for brand in order], mode
 
 
 async def remember(suppliers, signature: str, content: bytes, filename: str,
-                   marks=None) -> dict:
+                   marks=None, images=None) -> dict:
     """Собрать бренды, предложить марки и сложить в справочник. Возвращает сводку.
 
     Сводка — для сообщения админу: сколько брендов в файле, сколько отмечено к разбору,
@@ -111,23 +115,24 @@ async def remember(suppliers, signature: str, content: bytes, filename: str,
     1С недоступна — бренды всё равно запоминаются, просто без предложенных марок: список
     нужен сам по себе, а марку админ выставит в форме.
     """
-    column, found = collect(content, filename)
+    column, found, mode = collect(content, filename, images)
     if not found:
         # ОТМЕТКА «СМОТРЕЛИ, БРЕНДОВ НЕТ» — чтобы дозаполнение при старте не разбирало этот
         # файл заново при каждом перезапуске бота.
         await suppliers.set_signature_brand_col(
             signature, getattr(suppliers, "NO_BRAND_COLUMN", -1))
-        return {"brands": 0, "column": None, "wanted": 0, "without_tm": 0}
+        return {"brands": 0, "column": None, "wanted": 0, "without_tm": 0, "mode": ""}
 
     guessed = propose_marks([brand for brand, _ in found], marks or [])
     await suppliers.remember_marks(
         signature,
         [(brand, rows, *guessed.get(brand, ("", ""))) for brand, rows in found])
-    await suppliers.set_signature_brand_col(signature, column)
+    await suppliers.set_signature_brand_col(signature, column, mode)
 
     rows = await suppliers.marks_for(signature)
     live = [m for m in rows if m.rows]
     return {"brands": len(live),
             "column": column,
+            "mode": mode,
             "wanted": sum(1 for m in live if m.parse),
             "without_tm": sum(1 for m in live if not m.tm_code)}

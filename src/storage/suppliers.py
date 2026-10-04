@@ -94,13 +94,31 @@ CREATE TABLE IF NOT EXISTS signature_mark (
     PRIMARY KEY (signature, brand_key)
 );
 CREATE INDEX IF NOT EXISTS ix_signature_mark ON signature_mark (signature);
+-- ЛОГОТИПЫ-РАЗДЕЛИТЕЛИ (решение админа 04.10.2026). Бренд бывает обозначен не словом, а
+-- картинкой: код знает, В КАКОЙ СТРОКЕ лежит баннер, но прочитать имя на нём может только
+-- модель. Спрашиваем ОДИН раз и помним по ХЕШУ КАРТИНКИ: следующий файл того же поставщика
+-- несёт те же логотипы, то есть стоит ноль вызовов.
+--
+-- Ключ — хеш, а НЕ номер строки: строки в новом файле сдвигаются, и запомненная раскладка
+-- молча приписала бы бренды чужим позициям (то же правило, по которому `price_layout`
+-- ключуется содержимым файла, а не сигнатурой).
+--
+-- Пустой `brand` — законное значение: «смотрели, бренда на картинке нет» (рамка, фото
+-- товара, значок акции). Без этой отметки мы спрашивали бы модель о ней в каждом прогоне.
+CREATE TABLE IF NOT EXISTS signature_logo (
+    signature  TEXT NOT NULL,
+    image_hash TEXT NOT NULL,
+    brand      TEXT NOT NULL DEFAULT '',
+    seen_at    TEXT NOT NULL,
+    PRIMARY KEY (signature, image_hash)
+);
 """
 
 
 #: Типы доращиваемых колонок `supplier_signature`. Таблица старше их всех, и у работающей
 #: базы колонок нет — без `ALTER TABLE` при старте все запросы к сигнатурам упали бы разом.
 COLUMN_KINDS = {"sheets": "TEXT", "sheet_list": "TEXT",
-                "brand_col": "INTEGER", "rate": "REAL",
+                "brand_col": "INTEGER", "brand_mode": "TEXT", "rate": "REAL",
                 "currency_code": "TEXT", "currency_name": "TEXT"}
 
 
@@ -182,7 +200,11 @@ class SupplierStore:
             # `brand_col` — в какой колонке листа стоит бренд (находит код, помним у
             # формата); валюта с курсом — ПОСЛЕДНИЕ введённые, как подсказка новому прайсу
             # (сами они принадлежат прайсу: курс меняется каждый день).
-            for column in ("sheets", "sheet_list", "brand_col", "rate",
+            # `brand_mode` — ЧЕМ бренд обозначен в этом формате: колонкой,
+            # горизонтальным разделителем или картинкой-баннером (решение админа
+            # 04.10.2026). Список брендов и фильтр строк обязаны считаться одинаково и на
+            # приёме, и при разборе, а форма — объяснять админу, откуда взялись бренды.
+            for column in ("sheets", "sheet_list", "brand_col", "brand_mode", "rate",
                            "currency_code", "currency_name"):
                 if have and column not in have:
                     await db.execute(
@@ -496,16 +518,34 @@ class SupplierStore:
     #: брендов КАЖДЫЙ запуск — а их большинство (четыре формата из пяти, 04.10.2026).
     NO_BRAND_COLUMN = -1
 
-    async def set_signature_brand_col(self, signature: str, column) -> bool:
-        """В какой колонке листа стоит бренд. `NO_BRAND_COLUMN` — смотрели, её нет."""
+    async def set_signature_brand_col(self, signature: str, column,
+                                      mode: str = "") -> bool:
+        """Чем обозначен бренд: колонка (номер) и способ. `NO_BRAND_COLUMN` — смотрели, нет.
+
+        У разделителей и картинок номера колонки нет, но отметка «смотрели» нужна та же —
+        иначе дозаполнение при старте перечитывало бы файл каждый запуск.
+        """
         if not signature:
             return False
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "UPDATE supplier_signature SET brand_col = ? WHERE signature = ?",
-                (column, signature))
+                "UPDATE supplier_signature SET brand_col = ?, brand_mode = ? "
+                "WHERE signature = ?", (column, (mode or "").strip(), signature))
             await db.commit()
         return cur.rowcount > 0
+
+    async def brand_mode_for(self, signature: str) -> str:
+        """Способ детекции бренда у формата: колонка / разделитель / картинка. Пусто — нет."""
+        if not signature:
+            return ""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT COALESCE(brand_mode, '') FROM supplier_signature "
+                "WHERE signature = ? ORDER BY id", (signature,))
+            for (value,) in await cur.fetchall():
+                if (value or "").strip():
+                    return value.strip()
+        return ""
 
     async def brand_col_for(self, signature: str):
         """Колонка бренда у формата либо None.
@@ -534,6 +574,43 @@ class SupplierStore:
                 "WHERE signature = ? AND brand_col IS NOT NULL ORDER BY id", (signature,))
             row = await cur.fetchone()
         return int(row[0]) if row else None
+
+    # --------------------------------------------------------------- логотипы
+
+    async def remember_logos(self, signature: str, found) -> int:
+        """Запомнить, что на логотипах: `found` = [(хеш картинки, бренд)].
+
+        Пустое имя — тоже ответ («это не логотип бренда»), и он обязан сохраниться: иначе
+        фото товара спрашивалось бы у модели при каждом прогоне.
+
+        Имя, УЖЕ записанное, не переписываем: его мог поправить человек, а повторный ответ
+        модели про ту же картинку ничего нового не несёт.
+        """
+        if not signature:
+            return 0
+        now = _now()
+        rows = list(found or ())
+        async with aiosqlite.connect(self._db_path) as db:
+            for image_hash, brand in rows:
+                key = str(image_hash or "").strip()
+                if not key:
+                    continue
+                await db.execute(
+                    "INSERT INTO signature_logo (signature, image_hash, brand, seen_at) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT (signature, image_hash) DO NOTHING",
+                    (signature, key, str(brand or "").strip(), now))
+            await db.commit()
+        return len(rows)
+
+    async def logos_for(self, signature: str) -> dict[str, str]:
+        """Хеш картинки → бренд на ней. Пустая строка значит «это не логотип бренда»."""
+        if not signature:
+            return {}
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT image_hash, COALESCE(brand, '') FROM signature_logo "
+                "WHERE signature = ?", (signature,))
+            return {row[0]: row[1] for row in await cur.fetchall()}
 
     async def set_last_currency(self, signature: str, code: str = "", name: str = "",
                                 rate=None) -> bool:
@@ -666,6 +743,11 @@ class SupplierStore:
             # свелись к одному), и тогда побеждают они — они посчитаны новым правилом.
             await db.execute(
                 "UPDATE OR REPLACE signature_mark SET signature = ? WHERE signature = ?",
+                (new, old))
+            # Имена логотипов — тоже по хешу формата, и терять их значило бы заново платить
+            # модели за чтение тех же картинок.
+            await db.execute(
+                "UPDATE OR REPLACE signature_logo SET signature = ? WHERE signature = ?",
                 (new, old))
             await db.commit()
             return True
