@@ -53,7 +53,16 @@ def image_anchor_rows(content: bytes) -> dict[str, list[int]]:
 
     Баннеры брендов часто вставляют картинкой, а не текстом — read_only их не видит,
     поэтому грузим книгу обычным режимом. Возвращает {имя_листа: [номера строк]}.
+
+    **СТАРЫЙ `.xls` ИДЁТ СВОИМ ПУТЁМ** (`xls_images`): openpyxl его не открывает вовсе, и
+    прайсы вроде Линдервуда, где бренд обозначен логотипом «Peli» на строке 5 и «LINDERWOOD»
+    на строке 63, выглядели файлами без единой картинки (04.10.2026).
     """
+    from src.price_tool.xls_images import is_xls, xls_anchor_rows
+
+    if is_xls(content):
+        return xls_anchor_rows(content)
+
     from openpyxl import load_workbook
 
     out: dict[str, list[int]] = {}
@@ -111,7 +120,13 @@ def extract_images(content: bytes) -> dict[str, list[tuple[int, bytes, str]]]:
     """Встроенные изображения по листам: {лист: [(строка_1based, байты, media_type)]}.
 
     Для проверки, что «баннер» — действительно название бренда (агент смотрит на картинку).
+    Старый `.xls` читается своим разбором — см. `image_anchor_rows`.
     """
+    from src.price_tool.xls_images import is_xls, xls_images
+
+    if is_xls(content):
+        return xls_images(content)
+
     from openpyxl import load_workbook
 
     out: dict[str, list[tuple[int, bytes, str]]] = {}

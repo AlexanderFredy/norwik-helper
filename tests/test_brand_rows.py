@@ -10,6 +10,7 @@
 отсекается размером, поэтому ложные раскладки раздуваются до тысячи строк — иначе они
 проходили бы проверку по причине, которую мы не тестируем.
 """
+import struct
 import unittest
 from unittest.mock import patch
 
@@ -633,6 +634,107 @@ class RuleVersionTest(unittest.IsolatedAsyncioTestCase):
         rows = {m.brand: (m.parse, m.discount) for m in await self.store.marks_for("hash-1")}
         self.assertEqual(rows["CLASSEN"], (True, 12.5))
         self.assertEqual(rows["ULTRAFLOOR"], (False, None))
+class XlsImagesTest(unittest.TestCase):
+    """Картинки из СТАРОГО `.xls` — то, чего не умеет openpyxl.
+
+    Боевой случай: прайс Линдервуда, логотип «Peli» на строке 5 и «LINDERWOOD» на 63. Файл
+    в тесты не кладём (он 4 МБ и лежит у админа), поэтому проверяется разбор — на собранных
+    вручную байтах формата.
+    """
+
+    @staticmethod
+    def anchor(row: int, column: int = 0) -> bytes:
+        """Запись ClientAnchor: тип 0xF010, длина 18, строка в четвёртом поле."""
+        return (b"\x00\x00\x10\xf0\x12\x00\x00\x00"
+                + struct.pack("<9H", 0, column, 0, row - 1, 0, column + 1, 0, row, 0))
+
+    @staticmethod
+    def opt(pib: int) -> bytes:
+        """Запись OPT с единственным свойством — ссылкой на картинку."""
+        body = struct.pack("<HI", 0x0104, pib)
+        return struct.pack("<HHI", (1 << 4) | 3, 0xF00B, len(body)) + body
+
+    def test_a_shape_takes_the_picture_named_above_it(self):
+        from src.price_tool.xls_images import _scan_shapes
+
+        glued = self.opt(2) + self.anchor(5) + self.opt(7) + self.anchor(63)
+        self.assertEqual(_scan_shapes(glued), [(5, 2), (63, 7)])
+
+    def test_an_anchor_without_a_picture_keeps_its_row(self):
+        from src.price_tool.xls_images import _scan_shapes
+
+        self.assertEqual(_scan_shapes(self.anchor(9)), [(9, 0)])
+
+    def test_scanning_survives_broken_nesting(self):
+        """РЕГРЕССИЯ. Обход контейнеров ломался на первой же неожиданной длине и терял
+        остаток буфера: на боевом файле так пропали 19 якорей из 27, и среди них обе марки.
+        Сканирование по заголовкам к этому безразлично."""
+        from src.price_tool.xls_images import _scan_shapes
+
+        broken = struct.pack("<HHI", 0x000F, 0xF003, 1 << 30)   # контейнер с дикой длиной
+        glued = broken + self.opt(3) + self.anchor(12)
+        self.assertEqual(_scan_shapes(glued), [(12, 3)])
+
+    def test_picture_is_cut_by_its_signature(self):
+        from src.price_tool.xls_images import _picture
+
+        png = b"\x89PNG\r\n\x1a\n" + b"nice"
+        self.assertEqual(_picture(b"\x00" * 17 + png), (png, "image/png"))
+        self.assertEqual(_picture(b"\x11" * 17 + b"\xff\xd8\xff" + b"x")[1], "image/jpeg")
+
+    def test_a_signature_deep_inside_is_not_a_header(self):
+        """Подпись формата встречается и в данных; заголовок блипа короткий, и дальше него
+        совпадение не считается."""
+        from src.price_tool.xls_images import _picture
+
+        self.assertEqual(_picture(b"\x00" * 500 + b"\x89PNG\r\n\x1a\n"), (b"", ""))
+
+    def test_other_formats_are_left_alone(self):
+        from src.price_tool.xls_images import is_xls, xls_images
+
+        self.assertFalse(is_xls(b"PK\x03\x04" + b"0" * 10))      # это .xlsx
+        self.assertFalse(is_xls(b"<html><body>"))                 # а это «эксель из HTML»
+        self.assertEqual(xls_images(b"PK\x03\x04" + b"0" * 10), {})
+
+    def test_a_broken_file_is_not_an_error(self):
+        """Отсутствие баннеров — самый обычный прайс, а не сбой."""
+        from src.price_tool.xls_images import xls_images
+
+        self.assertEqual(xls_images(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64), {})
+
+
+class HeaderLogoTest(unittest.TestCase):
+    """Логотип выше строки заголовков — шапка, а не разделитель (прайс Линдервуда)."""
+
+    SHEET = Sheet(name="Прайс Москва", rows=[
+        [],                                     # сырая 1 — над ней логотип поставщика
+        ["Коллекция", "Артикул", "Название"],   # сырая 2 — заголовки
+        [],                                     # сырая 3 — под ней логотип Peli
+        ["VN-511", "Ван Браун", "1 290"],
+        ["VN-512", "Ван Грей", "1 290"],
+        [],                                     # сырая 6 — под ней логотип LINDERWOOD
+        ["LQ-01", "Адана", "1 100"],
+    ])
+
+    def test_supplier_logo_does_not_eat_the_header(self):
+        """У Линдервуда логотип поставщика стоит выше заголовков. Приняв его за начало
+        блока, мы отдали бы ему строку с названиями колонок — и выбор другого бренда оставил
+        бы модель без заголовков."""
+        spot = brand_map(self.SHEET, {"Прайс Москва": {1: "LINDERWOOD", 3: "Peli",
+                                                       6: "LINDERWOOD"}})
+        self.assertEqual(spot.mode, BY_IMAGE)
+        # Шапка считается в НЕПУСТЫХ строках: пустые, над которыми висят картинки, в неё
+        # не входят — их не видит и `render_preview`.
+        self.assertEqual(spot.header_rows, 1)
+        self.assertEqual(dict(brands_in_rows(spot)), {"Peli": 2, "LINDERWOOD": 1})
+
+        kept = only_brand_rows(self.SHEET, spot, ["Peli"])
+        self.assertEqual(kept.rows[0], ["Коллекция", "Артикул", "Название"])
+        self.assertEqual(len(kept.rows), 3)
+
+    def test_a_single_logo_in_the_header_separates_nothing(self):
+        """У FLOOR SERVICE и Most Floor по одной картинке на лист — это шапка."""
+        self.assertIsNone(brand_map(self.SHEET, {"Прайс Москва": {1: "Most Floor"}}))
 
 if __name__ == "__main__":
     unittest.main()
