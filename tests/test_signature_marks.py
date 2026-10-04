@@ -611,13 +611,45 @@ class BackfillTest(unittest.IsolatedAsyncioTestCase):
         await self.store.set_marks_by_signature(
             "hash-1", [{"brand": "ABK", "parse": True, "tm_code": "000000265",
                         "tm_name": "ABK", "discount": 17.5}])
-        await self.store.set_signature_brand_col("hash-1", 1)
+        await self.store.set_signature_brand_col("hash-1", 1, "колонка")
         await self.add_file(self.workbook(self.WITH_BRANDS))
 
         self.assertEqual(await self.run_fill(), 0)
         rows = await self.store.marks_for("hash-1")
         self.assertEqual([(m.brand, m.rows, m.discount) for m in rows],
                          [("ABK", 7, 17.5)])
+
+    async def test_a_format_scanned_by_the_old_rule_is_read_again(self):
+        """ОТМЕТКА «СМОТРЕЛИ» ОТНОСИТСЯ К ПРАВИЛУ, КОТОРЫМ СМОТРЕЛИ (04.10.2026).
+
+        Детекция выросла с одной колонки до трёх способов, и формат, просмотренный прежним
+        правилом, остался бы с его выводом НАВСЕГДА: у FLOOR SERVICE бренды нашлись, а
+        способ в базе пуст. Перечитываем ровно один раз — признаком служит записанный
+        способ, — и решение админа это не трогает.
+        """
+        await self.store.remember_marks("hash-1", [("ABK", 7, "000000265", "ABK")])
+        await self.store.set_marks_by_signature(
+            "hash-1", [{"brand": "ABK", "parse": True, "tm_code": "000000265",
+                        "tm_name": "ABK", "discount": 17.5}])
+        await self.store.set_signature_brand_col("hash-1", 1)   # способ НЕ записан
+        await self.add_file(self.workbook(self.WITH_BRANDS))
+
+        self.assertEqual(await self.run_fill(), 1)
+        self.assertEqual(await self.store.brand_mode_for("hash-1"), "колонка")
+        rows = {m.brand: (m.parse, m.discount) for m in await self.store.marks_for("hash-1")}
+        self.assertEqual(rows["ABK"], (True, 17.5))
+        self.assertIn("VitrA", rows)
+
+        # И больше никогда: способ записан.
+        self.assertEqual(await self.run_fill(), 0)
+
+    async def test_nothing_found_is_recorded_as_a_mode_too(self):
+        """«Бренд не обозначен» — тоже способ (`нет`). Пустое значение означало бы
+        «смотрели прежним правилом», и формат перечитывался бы каждый запуск."""
+        await self.add_file(self.workbook([["Артикул", "Цена"], ["A1", 100]]))
+        self.assertEqual(await self.run_fill(), 1)
+        self.assertEqual(await self.store.brand_mode_for("hash-1"), "нет")
+        self.assertEqual(await self.run_fill(), 0)
 
     async def test_newest_file_wins(self):
         await self.add_file(self.workbook([["Бренд", "Артикул"], ["Dogma", "1"]],

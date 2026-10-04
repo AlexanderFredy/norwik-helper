@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 
-from src.price_tool.brand_rows import brand_map, brands_in_rows
+from src.price_tool.brand_rows import BY_NONE, brand_map, brands_in_rows
 from src.price_tool.parser import parse_price_table
 from src.price_tool.scope import normalize
 
@@ -118,10 +118,12 @@ async def remember(suppliers, signature: str, content: bytes, filename: str,
     column, found, mode = collect(content, filename, images)
     if not found:
         # ОТМЕТКА «СМОТРЕЛИ, БРЕНДОВ НЕТ» — чтобы дозаполнение при старте не разбирало этот
-        # файл заново при каждом перезапуске бота.
+        # файл заново при каждом перезапуске бота. Способ при этом пишется ЯВНЫЙ (`нет`):
+        # пустое значение означает «смотрели прежним правилом», и это другое.
         await suppliers.set_signature_brand_col(
-            signature, getattr(suppliers, "NO_BRAND_COLUMN", -1))
-        return {"brands": 0, "column": None, "wanted": 0, "without_tm": 0, "mode": ""}
+            signature, getattr(suppliers, "NO_BRAND_COLUMN", -1), BY_NONE)
+        return {"brands": 0, "column": None, "wanted": 0, "without_tm": 0,
+                "mode": BY_NONE}
 
     guessed = propose_marks([brand for brand, _ in found], marks or [])
     await suppliers.remember_marks(

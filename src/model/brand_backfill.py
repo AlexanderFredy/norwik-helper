@@ -64,7 +64,14 @@ async def fill_brand_lists(suppliers, marks=None, logos=None,
             continue
         seen.add(sig.signature)
 
-        if await suppliers.brand_scanned(sig.signature):
+        # ОТМЕТКА «СМОТРЕЛИ» ОТНОСИТСЯ К ПРАВИЛУ, КОТОРЫМ СМОТРЕЛИ (04.10.2026). Детекция
+        # бренда выросла с одной колонки до трёх способов, и форматы, просмотренные прежним
+        # правилом, остались бы с его выводом НАВСЕГДА: у FLOOR SERVICE бренды нашлись, а
+        # способ в базе пуст — то есть любое улучшение детектора молча обходило бы старые
+        # форматы. Признак «смотрели нынешним правилом» — записанный СПОСОБ (включая
+        # явное «нет»), поэтому перечитываем ровно один раз и больше никогда.
+        if await suppliers.brand_scanned(sig.signature) \
+                and await suppliers.brand_mode_for(sig.signature):
             continue
 
         files = await suppliers.list_price_files(sig.id)
@@ -99,7 +106,7 @@ async def fill_brand_lists(suppliers, marks=None, logos=None,
                         sig.signature[:12], summary["brands"], newest.filename,
                         summary.get("without_tm"))
         else:
-            logger.info("Формат %s: колонки бренда в %s нет — выбор брендов недоступен",
+            logger.info("Формат %s: бренд в %s не обозначен — выбор брендов недоступен",
                         sig.signature[:12], newest.filename)
 
     return filled
