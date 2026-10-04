@@ -916,6 +916,122 @@ class ServiceWiringTest(unittest.IsolatedAsyncioTestCase):
                                   price_id=price.id, task_id=task.id))
         self.assertIn("ЗАГЛУШКА", task.result)
 
+class NarrowDumpTest(unittest.IsolatedAsyncioTestCase):
+    """Выгрузка 1С сужается до КОЛЛЕКЦИИ ЗАДАЧИ (решение админа 04.10.2026).
+
+    Замер, ради которого это сделано: на марке Classen живых позиций 232, и полным составом
+    полей это 58 412 токенов, тогда как одна коллекция — 3 273–5 871. Цена не разовая: ручной
+    цикл несёт выгрузку в КАЖДЫЙ следующий запрос, и разбор одного прайса стоил $19.31 на
+    147 вызовах при прайсе в 692 токена.
+    """
+
+    class Item:
+        def __init__(self, ref, collection, code="", name="", article=""):
+            self.ref, self.name, self.article = ref, name or ref, article
+            self.collection, self.collection_code = collection, code
+            self.collection_ref = code
+            self.size = self.product_type = self.unit = ""
+            self.alt_units = []
+            self.purchase = self.retail = self.rrc = None
+            self.not_exported = False
+            self.full_name = self.site_name = ""
+            self.product_type_ref = ""
+            self.length_from = self.length_to = None
+            self.width_from = self.width_to = self.thickness = None
+            self.properties = []
+
+    def make(self, subject, items=None, tm_name="Classen / Классен"):
+        from src.model.enums import TaskKind
+        from src.model.executor import TaskTools
+
+        rows = items if items is not None else [
+            self.Item("r1", "Visiogrande", code="YO-1"),
+            self.Item("r2", "Visiogrande", code="YO-1"),
+            self.Item("r3", "Naturale", code="YO-2"),
+            self.Item("r4", "Pool WR 1033-4", code="YO-3"),
+        ]
+        tools = TaskTools(None, b"x", "прайс.xlsx", lambda: None,
+                          kind=TaskKind.CHANGE_PRICES, subject=subject)
+        tools._items_cache["000000104"] = rows
+        tools._tm_names["000000104"] = tm_name
+        return tools
+
+    @staticmethod
+    def ref(*names, code=""):
+        from src.model.refs import Ref
+
+        return Ref.make(code=code, names=list(names))
+
+    async def ask(self, tools, **inp):
+        return await tools._items({"tm_code": "000000104", **inp})
+
+    async def test_only_the_task_collection_comes_back(self):
+        tools = self.make(self.ref("Visiogrande"))
+        got = await self.ask(tools)
+        self.assertEqual(got.count('"ref"'), 2)
+        self.assertIn("показана коллекция задачи (2 поз.)", got)
+        self.assertIn("всего живых позиций марки 4", got)
+
+    async def test_the_size_tail_of_a_folder_does_not_break_it(self):
+        """В 1С папка зовётся «Классик 600x238x12», а коллекция — «Классик»: то же правило,
+        что и у сверки (`normalize.collection_keys`)."""
+        rows = [self.Item("r1", "Классик 600x238x12"), self.Item("r2", "Другая")]
+        tools = self.make(self.ref("Классик"), rows)
+        got = await self.ask(tools)
+        self.assertEqual(got.count('"ref"'), 1)
+
+    async def test_the_mark_prefix_is_stripped(self):
+        """В прайсе «Westerhof Spark», в 1С просто «Spark»."""
+        rows = [self.Item("r1", "Spark"), self.Item("r2", "Vivace")]
+        tools = self.make(self.ref("Westerhof Spark"), rows,
+                          tm_name="Westerhof / Вестерхоф")
+        got = await self.ask(tools)
+        self.assertEqual(got.count('"ref"'), 1)
+
+    async def test_the_code_wins_over_the_name(self):
+        rows = [self.Item("r1", "Как-то иначе", code="YO-7"),
+                self.Item("r2", "Visiogrande", code="YO-1")]
+        tools = self.make(self.ref("Visiogrande", code="YO-7"), rows)
+        got = await self.ask(tools)
+        self.assertIn('"r1"', got)
+        self.assertNotIn('"r2"', got)
+        self.assertIn("по коду YO-7", got)
+
+    async def test_a_name_miss_falls_back_to_the_whole_mark(self):
+        """ГЛАВНЫЙ ТЕСТ. Имена расходятся штатно («Миллениум Про» против «Millenium Pro»),
+        а код коллекции в задачах почти всегда пуст. Отдав пустой список, мы сказали бы
+        агенту «позиций в 1С нет» — и он завёл бы ДУБЛИ."""
+        tools = self.make(self.ref("Миллениум Про"))
+        got = await self.ask(tools)
+        self.assertEqual(got.count('"ref"'), 4)
+        self.assertIn("коллекцию задачи по имени в марке не нашёл", got)
+
+    async def test_the_model_can_ask_for_the_whole_mark(self):
+        tools = self.make(self.ref("Visiogrande"))
+        got = await self.ask(tools, whole_mark=True)
+        self.assertEqual(got.count('"ref"'), 4)
+        self.assertNotIn("показана коллекция задачи", got)
+
+    async def test_an_explicit_filter_from_the_model_wins(self):
+        tools = self.make(self.ref("Visiogrande"))
+        got = await self.ask(tools, collection="Naturale")
+        self.assertEqual(got.count('"ref"'), 1)
+        self.assertIn('"r3"', got)
+
+    async def test_a_task_without_a_collection_changes_nothing(self):
+        """Задача по МАРКЕ (нормализация) адресована не коллекции — сужать не по чему."""
+        tools = self.make(self.ref())
+        got = await self.ask(tools)
+        self.assertEqual(got.count('"ref"'), 4)
+        self.assertNotIn("показана коллекция", got)
+
+    async def test_discontinued_are_still_hidden(self):
+        """Снятые не показываются и после сужения: решение админа 21.09.2026."""
+        rows = [self.Item("r1", "Visiogrande"), self.Item("r2", "Visiogrande")]
+        rows[1].not_exported = True
+        tools = self.make(self.ref("Visiogrande"), rows)
+        got = await self.ask(tools)
+        self.assertEqual(got.count('"ref"'), 1)
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from src.price_tool.naming import collection_from_folder
 from src.price_tool.scope import normalize as _norm
@@ -352,3 +353,59 @@ def report(written: int, skipped: list, discontinued: int, groups: int,
             lines.append(f"— {len(refs)} поз.: {reason} ({shown}{more})")
 
     return "\n".join(lines)
+
+
+# Хвост имени папки вида «600x238x12»: цифры через x, ×, х (латинская и кириллическая).
+_SIZE_TAIL = re.compile(r"\s+\d+(?:[x×х]\d+)+$", re.IGNORECASE)
+
+
+def collection_keys(name: str, tm: str = "") -> set[str]:
+    """Под какими именами искать эту папку. Вариантов три, и все нужны.
+
+    У восьми напольных категорий размер пишется в имя ПАПКИ (§19.5): «Классик 600x238x12».
+    Коллекция же зовётся «Классик» — и в прайсе, и в свойстве «Коллекция», и в адресе
+    задачи. По полному имени папки такая коллекция не находилась никогда, из-за чего
+    сверка марок (`fix_marks`) молча не срабатывала на всей марке A+ Floor.
+
+    Хвост снимается только СТРОГО ПОХОЖИЙ на размер: цифры, разделённые «x». «Формат 3D»
+    под это не попадает — там нет второго числа.
+
+    **Третий вариант — БЕЗ ПРИСТАВКИ МАРКИ**, и он из боя 25.09.2026. В прайсе Вестерхофа
+    коллекции зовутся «Westerhof Spark», «Westerhof Vivace», а в 1С свойство «Коллекция»
+    и папка — просто «Spark», «Vivace». Совпадения не было ни одного, сверка отвечала
+    «коллекции в 1С нет», и агент предлагал завести заново три ЖИВЫЕ коллекции: 8, 8 и 10
+    позиций. Приставка снимается только ЦЕЛЫМ СЛОВОМ и только с начала: «Spark» внутри
+    «Sparkling» не тронется, а «Modern» у другой марки не притянется, потому что снимаем
+    имя ИМЕННО ЭТОЙ марки. Двуязычное «Westerhof / Вестерхоф» даёт оба слова.
+    """
+    text = " ".join(str(name or "").split())
+    variants = [text, _SIZE_TAIL.sub("", text)]
+
+    for word in _tm_words(tm):
+        for variant in list(variants):
+            flat = variant.strip()
+            low = flat.lower()
+            if low.startswith(word) and len(flat) > len(word):
+                tail = flat[len(word):].strip(" -–—/")
+                if tail:
+                    variants.append(tail)
+
+    return {_norm(v) for v in variants} - {""}
+
+
+def _tm_words(tm: str) -> list[str]:
+    """Слова, которыми марка может начинать имя коллекции: «Westerhof / Вестерхоф» → оба.
+
+    Только ПЕРВОЕ слово каждой половины: марки вроде «A+ Floor» состоят из двух, но в
+    приставке прайса стоит обычно одно. Лишнее слово тут безвреднее недостающего —
+    снятие приставки проверяется по началу строки и по длине остатка.
+    """
+    out = []
+    for half in str(tm or "").split("/"):
+        word = half.strip().lower()
+        if word:
+            out.append(word)
+            first = word.split()[0]
+            if first != word:
+                out.append(first)
+    return out

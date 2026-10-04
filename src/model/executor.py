@@ -111,12 +111,16 @@ TOOLS = [
             "СНЯТЫЕ СЮДА НЕ ПОПАДАЮТ. Часть коллекций висит под маркой с флагом «Не "
             "выгружать» — они уже сняты, работы по ним НЕТ, предлагать ничего не нужно. "
             "Найти снятую позицию (проверка на дубль перед созданием) — `find_1c_items`.\n"
-            "ВЫЗЫВАЙ ОДИН РАЗ на марку: выгрузка большая и целиком едет в каждый "
-            "следующий запрос."),
+            "ПО УМОЛЧАНИЮ ПРИХОДИТ КОЛЛЕКЦИЯ ЭТОЙ ЗАДАЧИ, а не вся марка: задача "
+            "адресована одной коллекции, а выгрузка марки целиком едет в каждый следующий "
+            "запрос и стоит десятки тысяч токенов. Коллекцию задачи код находит сам; не "
+            "нашёл по имени — отдаст всю марку и скажет об этом. Нужна вся марка намеренно "
+            "— передай whole_mark: true. ВЫЗЫВАЙ ОДИН РАЗ."),
         "input_schema": {
             "type": "object",
             "properties": {"tm_code": {"type": "string"},
-                           "collection": {"type": "string"}},
+                           "collection": {"type": "string"},
+                           "whole_mark": {"type": "boolean"}},
             "required": ["tm_code"],
             "additionalProperties": False,
         },
@@ -322,7 +326,7 @@ class TaskTools:
                  kind: TaskKind = TaskKind.CHANGE_PRICES, offers=None,
                  supplier_id: int = 0, price_date: str | None = None,
                  supplier_name: str = "",
-                 terms=None) -> None:
+                 terms=None, subject=None) -> None:
         self._onec = onec
         self._content = content
         self._filename = filename
@@ -347,6 +351,11 @@ class TaskTools:
         # марке, а скидка задана у бренда этой марки. Нет условий — розницу не пересчитываем
         # и цены не пишем вовсе.
         self._terms = terms
+        # ПРЕДМЕТ ЗАДАЧИ — её коллекция (`refs.Ref`: код 1С, артикул, имена как написаны).
+        # По нему сужается выгрузка номенклатуры: задача адресована ОДНОЙ коллекции, а
+        # выгрузка марки целиком — это 58 тыс. токенов против 3–6 тыс. на коллекцию
+        # (замер на Classen 04.10.2026), и едет она в каждый следующий запрос.
+        self._subject = subject
         # Код товара → чей прайс дал записываемую цену. Едет в 1С полем `source`, чтобы
         # там было видно, у кого закупаем (§6.4). Заполняется ТОЛЬКО для тех позиций,
         # которые пишем мы: чужие записи не трогаем и чужой источник не выдумываем.
@@ -653,10 +662,15 @@ class TaskTools:
         # Поиск по снятым остаётся у `find_1c_items` — он для того и сделан.
         items = [i for i in items if not i.not_exported]
 
+        whole = len(items)
         wanted = (inp.get("collection") or "").strip().lower()
         if wanted:
             items = [i for i in items
                      if wanted in nz.collection_of(i).lower()]
+
+        note = ""
+        if not wanted and not inp.get("whole_mark"):
+            items, note = self._narrow_to_task(items, tm_code)
 
         if not items:
             return ("Среди ЖИВЫХ позиций марки ничего не найдено"
@@ -667,7 +681,55 @@ class TaskTools:
         rows = [self._row(i) for i in shown]
         tail = ("" if len(items) <= MAX_ITEMS_SHOWN else
                 f"\n[показано {MAX_ITEMS_SHOWN} из {len(items)} — сузь фильтром collection]")
+        if note:
+            tail += f"\n[{note}; всего живых позиций марки {whole}]"
         return json.dumps(rows, ensure_ascii=False) + tail
+
+    def _narrow_to_task(self, items: list, tm_code: str) -> tuple[list, str]:
+        """Оставить позиции КОЛЛЕКЦИИ ЗАДАЧИ. Возвращает (позиции, что сказать модели).
+
+        **ЗАЧЕМ.** Задача адресована одной коллекции, а выгрузка шла по ВСЕЙ марке: на
+        Classen это 232 живых позиции и 58 412 токенов полным составом полей против
+        3 273–5 871 на коллекцию (замер 04.10.2026). Цена не разовая — ручной цикл несёт
+        выгрузку в каждый следующий запрос, и разбор одного прайса стоил $19.31 на 147
+        вызовах, где сам прайс был 692 токена.
+
+        **ОТКАТ НА ВСЮ МАРКУ ОБЯЗАТЕЛЕН.** Имена коллекций в 1С и в прайсе расходятся
+        штатно («Миллениум Про» против «Millenium Pro»), а код коллекции в адресе задачи
+        сегодня почти всегда пуст — заполнен у одной задачи из 165. Отдав при промахе
+        пустой список, мы сказали бы агенту «позиций в 1С нет», и он завёл бы ДУБЛИ. Поэтому
+        промах возвращает прежнее поведение и НАЗЫВАЕТСЯ вслух.
+
+        Сопоставление — общее `normalize.collection_keys`: оно снимает размерный хвост имени
+        папки («Классик 600x238x12») и приставку марки («Westerhof Spark» → «Spark»).
+        """
+        subject = self._subject
+        if subject is None or not items:
+            return items, ""
+
+        code = (getattr(subject, "code", "") or "").strip()
+        if code:
+            by_code = [i for i in items
+                       if (getattr(i, "collection_code", "") or "").strip() == code]
+            if by_code:
+                return by_code, (f"показана коллекция задачи по коду {code} "
+                                 f"({len(by_code)} поз.) — вся марка нужна редко, но если "
+                                 f"нужна, передай whole_mark: true")
+
+        tm_name = self._tm_names.get(tm_code, "")
+        keys = set()
+        for name in getattr(subject, "names", ()) or ():
+            keys |= nz.collection_keys(name, tm_name)
+        if not keys:
+            return items, ""
+
+        mine = [i for i in items
+                if nz.collection_keys(nz.collection_of(i), tm_name) & keys]
+        if not mine:
+            return items, ("коллекцию задачи по имени в марке не нашёл — отдаю всю марку, "
+                           "как раньше")
+        return mine, (f"показана коллекция задачи ({len(mine)} поз.) — нужна вся марка, "
+                      f"передай whole_mark: true")
 
     def _row(self, i) -> dict:
         """Одна позиция 1С. СОСТАВ ЗАВИСИТ ОТ ВИДА ЗАДАЧИ, и это не экономия ради экономии.
@@ -1101,7 +1163,9 @@ PROMPT = """Ты — контент-менеджер интернет-магаз
 Порядок работы:
 
 1. `read_price` — найди в прайсе раздел этой марки и коллекции.
-2. `get_1c_items` с tm_code — посмотри, что в 1С уже есть. ОДИН вызов на марку.
+2. `get_1c_items` с tm_code — что в 1С уже есть. ОДИН вызов. Придёт КОЛЛЕКЦИЯ ЭТОЙ
+   ЗАДАЧИ: её находит код, и этого обычно довольно. Не нашлась по имени — придёт вся
+   марка, и в ответе будет сказано об этом. Вся марка намеренно — `whole_mark: true`.
 3. Для создания позиций: `find_1c_items` со списком артикулов — проверь, нет ли товара
    среди СНЯТЫХ или под другой маркой. Иначе заведёшь дубль. Один вызов на коллекцию.
 4. `get_1c_folders` — куда класть; `get_1c_properties` — коды значений свойств.
@@ -1505,7 +1569,8 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
                       scope=scope, kind=task.kind, offers=offers,
                       supplier_id=price.supplier_price.supplier_id,
                       price_date=price.supplier_price.price_date,
-                      supplier_name=supplier_name, terms=terms)
+                      supplier_name=supplier_name, terms=terms,
+                      subject=task.address.subject)
 
     answer, _ = await orchestrator.handle_turn(
         [{"role": "user", "content": task_brief(price, task, terms)}],
