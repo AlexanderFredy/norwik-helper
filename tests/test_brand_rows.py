@@ -13,9 +13,13 @@
 import unittest
 from unittest.mock import patch
 
-from src.price_tool.brand_rows import (BY_COLUMN, BY_IMAGE, BY_SECTION,
+from pathlib import Path
+
+from src.price_tool.brand_rows import (BY_COLUMN, BY_IMAGE, BY_MARK_SECTION,
+                                       BY_SECTION, BY_SHEET_NAME, RULE_VERSION,
                                        SECTION_MIN_ROWS, brand_map, brand_per_raw_row,
-                                       brands_in_rows, find_sections, only_brand_rows,
+                                       brands_in_rows, find_marked_sections, find_sections,
+                                       from_sheet_name, mark_keys, only_brand_rows,
                                        rows_cost)
 from src.price_tool.parser import Sheet
 
@@ -385,6 +389,250 @@ class BudgetTest(unittest.TestCase):
         t = self.tools(["Бренд 0"], artisana())
         self.assertEqual(t.skipped_marks, [f"Бренд {n}" for n in range(1, 5)])
 
+MARKS = ["Classen / Классен", "Ultrafloor / Ультрафлор", "Westerhof / Вестерхоф",
+         "Kronotex", "Peli", "AGT"]
+KEYS = mark_keys(MARKS)
+
+
+def stroyindustria() -> Sheet:
+    """Боевая раскладка Стройиндустрии: 44 строки, два бренда разделителями.
+
+    Строка «ULTRAFLOOR» несёт ещё «цена 1» и «цена 2» в далёких колонках — именно поэтому
+    правило «одинокая ячейка» её не видит, а сверка со справочником видит.
+    """
+    return Sheet(name="Прайс от 01.10.2026", rows=[
+        ['ООО "СТРОЙИНДУСТРИЯ"'],
+        [],
+        ["8-495-740-99-59"],
+        ["", "", "ПРАЙС-ЛИСТ"],
+        ["", "Замок", "Размер мм", "Класс", "Фаска", "м2 в уп", "ОПТ/м2", "РРЦ/м2"],
+        ["CLASSEN"],
+        ["POOL WR 832 PROMO", "Megaloc", "1285*192*8", "32/АС4", "да", "1.974", "1285",
+         "1800"],
+        ["ELEGANT 4V", "Clic it", "1292*193*8", "33/АС5", "да", "1.995", "1180", "1715"],
+        ["ULTRAFLOOR", "", "", "", "", "", "", "", "", "цена 1", "цена 2"],
+        ["CASTELLO", "Twin Clic", "1285*192*8", "32/АС4", "нет", "2.22", "532", "691",
+         "", "506", "497"],
+        ["FORTE VARIO", "Twin Clic", "1285*192*8", "33/АС5", "да", "2.22", "727", "1017"],
+        ["Акссеуары"],
+        ["Подложка НПЕ 3мм", "", "50000*1005*3мм", "", "", "52.5", "21"],
+    ])
+
+
+class MarkedSectionTest(unittest.TestCase):
+    """Разделитель, опознанный ПО СПРАВОЧНИКУ МАРОК 1С — лист любого размера."""
+
+    def setUp(self):
+        self.sheet = stroyindustria()
+        self.spot = find_marked_sections(self.sheet, KEYS)
+
+    def test_both_brands_are_found_in_a_small_sheet(self):
+        """44 строки — порог размера такой лист не пройдёт никогда, а справочник его
+        размечает: совпадение с именем НАСТОЯЩЕЙ марки это не догадка."""
+        self.assertIsNotNone(self.spot)
+        self.assertEqual(self.spot.mode, BY_MARK_SECTION)
+        self.assertEqual([b for b, _ in brands_in_rows(self.spot)],
+                         ["CLASSEN", "ULTRAFLOOR"])
+
+    def test_a_separator_with_labels_in_far_columns_is_still_a_separator(self):
+        """РЕГРЕССИЯ. У «ULTRAFLOOR» заполнены три ячейки («цена 1», «цена 2» в колонках 9 и
+        10), и правило «одинокая ячейка» его не видит. Разделитель от товара отличает пустота
+        в КОЛОНКАХ ДАННЫХ — тех, что заняты в строке заголовков."""
+        rows = dict(brands_in_rows(self.spot))
+        self.assertEqual(rows["ULTRAFLOOR"], 4)   # 2 товара + «Акссеуары» + подложка
+
+    def test_header_is_everything_above_the_first_brand(self):
+        self.assertEqual(self.spot.header_rows, 4)
+        kept = only_brand_rows(self.sheet, self.spot, ["CLASSEN"]).rows
+        self.assertEqual(kept[0], ['ООО "СТРОЙИНДУСТРИЯ"'])
+        self.assertEqual(kept[4], ["CLASSEN"])
+        self.assertEqual(len(kept), 4 + 1 + 2)
+
+    def test_a_section_outside_the_catalogue_is_not_a_brand(self):
+        """«Акссеуары» — раздел подложек, а не марка; его строки достаются текущему бренду, и
+        это осознанно: потерять их молча хуже, а чужие виды товара отсекают категории."""
+        self.assertNotIn("Акссеуары", [b for b, _ in brands_in_rows(self.spot)])
+
+    def test_an_item_named_like_a_mark_stays_an_item(self):
+        """Строка с данными в колонках заголовков — товар, даже если её первая ячейка совпала
+        с именем марки: иначе мы потеряли бы позицию."""
+        rows = list(self.sheet.rows)
+        rows.append(["Kronotex", "Megaloc", "1285*192*8", "33/АС5", "да", "2.2", "900",
+                     "1200"])
+        spot = find_marked_sections(Sheet(name="Прайс", rows=rows), KEYS)
+        self.assertNotIn("Kronotex", [b for b, _ in brands_in_rows(spot)])
+
+    def test_a_factory_note_is_not_a_brand(self):
+        """РАСКЛАДКА ВЕСТЕРХОФА: «Завод PELI Турция» — завод, а не марка, и на их смешении мы
+        уже обожглись (18 ложных задач). Сравнение ТОЧНОЕ, поэтому не совпадает."""
+        rows = [["", "Подложка", "Упаковка", "Цена"],
+                ["Завод PELI Турция"],
+                ["WESTERHOF COSMO 33 КЛАСС", "3 мм", "2.1", "1500"],
+                ["Завод AGT Турция"],
+                ["Westerhof Effect 33 класс", "3 мм", "2.1", "1600"]]
+        self.assertIsNone(find_marked_sections(Sheet(name="ламинат Турция", rows=rows),
+                                               KEYS))
+
+    def test_collections_are_not_brands(self):
+        """РАСКЛАДКА MOST FLOOR: разделы там — коллекции, в справочнике марок их нет."""
+        rows = [["Артикул товара", "Описание коллекции", "Дилерская цена"],
+                ["Коллекция Миллениум Про - 8 декоров"],
+                ["3310 Штраус"],
+                ["3311 Бетховен"]]
+        self.assertIsNone(find_marked_sections(Sheet(name="Ламинат", rows=rows), KEYS))
+
+    def test_without_the_catalogue_it_is_silent(self):
+        """Выдумывать бренды, не сверяясь ни с чем, нельзя: по ним режут файл."""
+        self.assertIsNone(find_marked_sections(self.sheet, set()))
+
+    def test_brand_map_picks_this_way_for_the_real_sheet(self):
+        spot = brand_map(self.sheet, None, MARKS)
+        self.assertEqual(spot.mode, BY_MARK_SECTION)
+
+
+class SheetNameTest(unittest.TestCase):
+    """Бренд в ИМЕНИ ЛИСТА: «Ассортимент CLASSEN» — весь лист про эту марку."""
+
+    @staticmethod
+    def assortment(name="Ассортимент CLASSEN") -> Sheet:
+        return Sheet(name=name, rows=[
+            ["Наименование", "Стендовая программа", "Складская позиция"],
+            ["POOL WR 832 PROMO"],
+            ["68278 Ламинат Pool PROMO 832-4", "", "склад"],
+            ["Elegant 4V"],
+            ["1872070 Ламинат Classen Elegant", "", "склад"],
+        ])
+
+    def test_the_whole_sheet_belongs_to_the_mark(self):
+        spot = from_sheet_name(self.assortment(), KEYS)
+        self.assertIsNotNone(spot)
+        self.assertEqual(spot.mode, BY_SHEET_NAME)
+        self.assertEqual(brands_in_rows(spot), [("CLASSEN", 4)])
+
+    def test_name_is_shown_as_written_in_the_sheet(self):
+        spot = from_sheet_name(self.assortment("Ассортимент Classen"), KEYS)
+        self.assertEqual([b for b, _ in brands_in_rows(spot)], ["Classen"])
+
+    def test_collections_inside_do_not_become_brands(self):
+        """На таком листе одинокими ячейками размечены КОЛЛЕКЦИИ («Elegant 4V»), и брендами
+        они не становятся именно потому, что имя листа сильнее."""
+        spot = brand_map(self.assortment(), None, MARKS)
+        self.assertEqual(spot.mode, BY_SHEET_NAME)
+        self.assertNotIn("Elegant 4V", [b for b, _ in brands_in_rows(spot)])
+
+    def test_a_name_without_a_mark_gives_nothing(self):
+        self.assertIsNone(from_sheet_name(self.assortment("Прайс от 01.10.2026"), KEYS))
+        self.assertIsNone(from_sheet_name(self.assortment("ИЗМЕНЕНИЯ"), KEYS))
+
+    def test_two_marks_in_the_name_mean_none(self):
+        """Выбор наугад однажды припишет лист чужой марке, а по нему отбираются строки и
+        пишутся цены."""
+        self.assertIsNone(from_sheet_name(self.assortment("Classen и Ultrafloor"), KEYS))
+
+    def test_a_mark_as_part_of_a_word_does_not_count(self):
+        self.assertIsNone(from_sheet_name(self.assortment("Классенька"), KEYS))
+
+    def test_without_the_catalogue_it_is_silent(self):
+        self.assertIsNone(from_sheet_name(self.assortment(), set()))
+
+    def test_in_file_markup_wins_over_the_sheet_name(self):
+        """Лист, названный по бренду, внутри может быть размечен по другим — и эта разметка
+        главнее: иначе всё свалилось бы в одну марку."""
+        sheet = stroyindustria()
+        named = Sheet(name="Ассортимент CLASSEN", rows=sheet.rows)
+        spot = brand_map(named, None, MARKS)
+        self.assertEqual(spot.mode, BY_MARK_SECTION)
+        self.assertEqual([b for b, _ in brands_in_rows(spot)], ["CLASSEN", "ULTRAFLOOR"])
+class RuleVersionTest(unittest.IsolatedAsyncioTestCase):
+    """Отметка «смотрели» обязана говорить, ЧЕМ смотрели (`RULE_VERSION`, 04.10.2026).
+
+    Детекция за один день выросла дважды, и оба раза уже просмотренные форматы остались бы с
+    прежним выводом: сперва у FLOOR SERVICE висел пустой способ, потом Стройиндустрия не
+    перечиталась новыми детекторами, потому что способ у неё уже стоял. Сравнение с версией
+    закрывает это раз и навсегда.
+    """
+
+    async def asyncSetUp(self):
+        import tempfile
+
+        from src.storage.suppliers import SupplierStore
+
+        self._dir = tempfile.TemporaryDirectory()
+        self.root = Path(self._dir.name)
+        self.store = SupplierStore(self.root / "t.db")
+        await self.store.init()
+        supplier = await self.store.add_supplier("Стройиндустрия")
+        self.sig = await self.store.add_signature(supplier.id, "hash-1")
+
+    async def asyncTearDown(self):
+        self._dir.cleanup()
+
+    def workbook(self, rows):
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        for row in rows:
+            wb.active.append(row)
+        path = self.root / "прайс.xlsx"
+        wb.save(path)
+        return path
+
+    async def add_file(self):
+        path = self.workbook([
+            ["", "Замок", "Размер мм", "Класс"],
+            ["CLASSEN"],
+            ["POOL WR 832", "Megaloc", "1285*192*8", "32/АС4"],
+            ["ULTRAFLOOR", "", "", "", "", "", "", "", "", "цена 1"],
+            ["CASTELLO", "Twin Clic", "1285*192*8", "32/АС4"],
+        ])
+        await self.store.add_price_file(self.sig.id, path.name, str(path),
+                                        received_at="2026-10-01T00:00:00")
+
+    async def run_fill(self):
+        from src.model.brand_backfill import fill_brand_lists
+
+        return await fill_brand_lists(self.store, ["Classen / Классен",
+                                                   "Ultrafloor / Ультрафлор"])
+
+    async def test_an_older_rule_is_read_again_and_stamped(self):
+        await self.add_file()
+        await self.store.set_signature_brand_col("hash-1", None, "нет", 1)
+
+        self.assertEqual(await self.run_fill(), 1)
+        self.assertEqual(await self.store.brand_rule_for("hash-1"), RULE_VERSION)
+        self.assertEqual(await self.store.brand_mode_for("hash-1"),
+                         "разделитель по справочнику")
+        self.assertEqual([m.brand for m in await self.store.marks_for("hash-1")],
+                         ["CLASSEN", "ULTRAFLOOR"])
+
+    async def test_the_current_rule_is_not_read_again(self):
+        await self.add_file()
+        self.assertEqual(await self.run_fill(), 1)
+        self.assertEqual(await self.run_fill(), 0)
+
+    async def test_a_mode_without_a_column_still_counts_as_looked_at(self):
+        """РЕГРЕССИЯ. «Смотрели» определялось по номеру колонки, а у разделителей, имени
+        листа и баннеров колонки нет вовсе — такой формат перечитывался бы при КАЖДОМ
+        старте бота."""
+        await self.add_file()
+        await self.run_fill()
+        self.assertIsNone(await self.store.brand_col_for("hash-1"))
+        self.assertTrue(await self.store.brand_scanned("hash-1"))
+
+    async def test_the_admin_choice_survives_the_rescan(self):
+        await self.add_file()
+        await self.run_fill()
+        await self.store.set_marks_by_signature(
+            "hash-1", [{"brand": "CLASSEN", "parse": True, "tm_code": "000000104",
+                        "tm_name": "Classen / Классен", "discount": 12.5}])
+        # Поднялась версия правила — перечитываем, но решение админа не трогаем.
+        await self.store.set_signature_brand_col("hash-1", None,
+                                                 "разделитель по справочнику", 1)
+        self.assertEqual(await self.run_fill(), 1)
+
+        rows = {m.brand: (m.parse, m.discount) for m in await self.store.marks_for("hash-1")}
+        self.assertEqual(rows["CLASSEN"], (True, 12.5))
+        self.assertEqual(rows["ULTRAFLOOR"], (False, None))
 
 if __name__ == "__main__":
     unittest.main()

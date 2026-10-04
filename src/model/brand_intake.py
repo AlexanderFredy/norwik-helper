@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import logging
 
-from src.price_tool.brand_rows import BY_NONE, brand_map, brands_in_rows
+from src.price_tool.brand_rows import (BY_NONE, RULE_VERSION, brand_map,
+                                       brands_in_rows, name_keys)
 from src.price_tool.parser import parse_price_table
 from src.price_tool.scope import normalize
 
@@ -24,10 +25,10 @@ logger = logging.getLogger(__name__)
 def _halves(name: str) -> list[str]:
     """Имя марки по частям: «Westerhof / Вестерхоф» — это два написания одной марки.
 
-    В справочнике 1С двуязычная запись норма, и сравнивать поле целиком правильно везде,
-    кроме сопоставления с чужим ярлыком: там совпадёт ровно одна половина.
+    Правило живёт в `brand_rows.name_keys`: им же сверяются разделители и имена листов со
+    справочником, и второй набор разошёлся бы с первым молча.
     """
-    return [normalize(part) for part in str(name or "").split("/") if normalize(part)]
+    return sorted(name_keys(name))
 
 
 def propose_marks(brands, marks) -> dict[str, tuple[str, str]]:
@@ -67,7 +68,7 @@ def propose_marks(brands, marks) -> dict[str, tuple[str, str]]:
     return out
 
 
-def collect(content: bytes, filename: str, images=None):
+def collect(content: bytes, filename: str, images=None, marks=None):
     """Бренды файла: `(колонка, [(бренд, строк)], способ)`. Колонка None — бренда нет.
 
     Берутся ВСЕ листы, где бренд вообще обозначен: прайс бывает на несколько вкладок, и
@@ -89,7 +90,7 @@ def collect(content: bytes, filename: str, images=None):
     counts: dict[str, int] = {}
     order: list[str] = []
     for sheet in sheets:
-        spot = brand_map(sheet, images)
+        spot = brand_map(sheet, images, marks)
         if spot is None:
             continue
         if not mode:
@@ -115,13 +116,13 @@ async def remember(suppliers, signature: str, content: bytes, filename: str,
     1С недоступна — бренды всё равно запоминаются, просто без предложенных марок: список
     нужен сам по себе, а марку админ выставит в форме.
     """
-    column, found, mode = collect(content, filename, images)
+    column, found, mode = collect(content, filename, images, marks)
     if not found:
         # ОТМЕТКА «СМОТРЕЛИ, БРЕНДОВ НЕТ» — чтобы дозаполнение при старте не разбирало этот
         # файл заново при каждом перезапуске бота. Способ при этом пишется ЯВНЫЙ (`нет`):
         # пустое значение означает «смотрели прежним правилом», и это другое.
         await suppliers.set_signature_brand_col(
-            signature, getattr(suppliers, "NO_BRAND_COLUMN", -1), BY_NONE)
+            signature, getattr(suppliers, "NO_BRAND_COLUMN", -1), BY_NONE, RULE_VERSION)
         return {"brands": 0, "column": None, "wanted": 0, "without_tm": 0,
                 "mode": BY_NONE}
 
@@ -129,7 +130,7 @@ async def remember(suppliers, signature: str, content: bytes, filename: str,
     await suppliers.remember_marks(
         signature,
         [(brand, rows, *guessed.get(brand, ("", ""))) for brand, rows in found])
-    await suppliers.set_signature_brand_col(signature, column, mode)
+    await suppliers.set_signature_brand_col(signature, column, mode, RULE_VERSION)
 
     rows = await suppliers.marks_for(signature)
     live = [m for m in rows if m.rows]

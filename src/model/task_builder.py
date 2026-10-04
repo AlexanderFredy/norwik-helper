@@ -274,7 +274,8 @@ class TaskBuilderTools:
                  only_marks: list | None = None,
                  discounts: dict | None = None,
                  currency: dict | None = None,
-                 logos: dict | None = None) -> None:
+                 logos: dict | None = None,
+                 catalogue=None) -> None:
         self._content = content
         self._filename = filename
         self._onec = onec
@@ -345,6 +346,11 @@ class TaskBuilderTools:
         # помнит по его хешу. Сюда это приходит ГОТОВЫМ: внутри инструментов спрашивать
         # модель неоткуда, да и платить за это каждому прогону незачем.
         self._logos = dict(logos or {})
+        # СПРАВОЧНИК МАРОК 1С — внешнее доказательство для двух способов детекции: разделитель,
+        # совпавший с именем настоящей марки («CLASSEN» у Стройиндустрии), и бренд в имени
+        # листа («Ассортимент CLASSEN»). Без справочника оба молчат: выдумывать бренды,
+        # не сверяясь ни с чем, нельзя — по ним режут файл и пишут цены.
+        self._catalogue = list(catalogue or [])
         # Листы, которые агент РЕАЛЬНО прочитал. «Проанализировал» — это про них, а не про
         # те, что ему предложили: лист можно было не открыть вовсе, и админ должен видеть
         # разницу между «исключил я» и «агент сам не стал смотреть».
@@ -427,7 +433,8 @@ class TaskBuilderTools:
         # админ не расставил флажки) остановил бы разбор ЦЕЛИКОМ — у форматов, где отмечать
         # нечего в принципе. Нет признака ни в одном отмеченном листе — выбор брендов к ним
         # не относится, работаем как раньше.
-        spots = [(sheet, brand_map(sheet, self._logos)) for sheet in chosen]
+        spots = [(sheet, brand_map(sheet, self._logos, self._catalogue))
+                 for sheet in chosen]
         if not any(spot is not None for _, spot in spots):
             return chosen
 
@@ -1470,7 +1477,7 @@ class TaskBuilderTools:
         остаётся сопоставление по самому объекту строки: `prices_from_rows` ходит по тем же
         спискам `sheet.rows`. Протяжка объединённых ячеек при этом уже учтена.
         """
-        spot = brand_map(sheet, self._logos)
+        spot = brand_map(sheet, self._logos, self._catalogue)
 
         if spot is None:
             # Брендов в листе нет. Единственную заданную скидку применить можно — она
@@ -1499,7 +1506,7 @@ class TaskBuilderTools:
         if currency and not self._terms(None).has_currency:
             return dealer_price.missing(self._terms(None), currency=True)
 
-        spot = brand_map(sheet, self._logos)
+        spot = brand_map(sheet, self._logos, self._catalogue)
         if spot is None:
             terms = self._terms_reader(sheet)([])
             return dealer_price.missing(terms, currency=currency)
@@ -2318,7 +2325,7 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
                 remember_columns=None, only_sheets: str | None = None,
                 only_marks: list | None = None,
                 discounts: dict | None = None, currency: dict | None = None,
-                logos: dict | None = None,
+                logos: dict | None = None, catalogue=None,
                 note=None) -> tuple[list[PriceTask], str]:
     """Прогон формирования задач. Возвращает (задачи, короткий ответ агента).
 
@@ -2332,7 +2339,8 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
     tools = TaskBuilderTools(content, filename, onec=onec, elsewhere=elsewhere,
                              scope=scope, known_columns=known_columns,
                              only_sheets=only_sheets, only_marks=only_marks,
-                             discounts=discounts, currency=currency, logos=logos)
+                             discounts=discounts, currency=currency, logos=logos,
+                             catalogue=catalogue)
     task = f"Прайс «{filename}». Составь список задач по нему."
 
     # РАЗБИРАТЬ НЕЧЕГО — МОДЕЛЬ НЕ ЗОВЁМ ВОВСЕ. Ради этого вся затея и нужна: прогон по

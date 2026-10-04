@@ -118,7 +118,8 @@ CREATE TABLE IF NOT EXISTS signature_logo (
 #: Типы доращиваемых колонок `supplier_signature`. Таблица старше их всех, и у работающей
 #: базы колонок нет — без `ALTER TABLE` при старте все запросы к сигнатурам упали бы разом.
 COLUMN_KINDS = {"sheets": "TEXT", "sheet_list": "TEXT",
-                "brand_col": "INTEGER", "brand_mode": "TEXT", "rate": "REAL",
+                "brand_col": "INTEGER", "brand_mode": "TEXT",
+                "brand_rule": "INTEGER", "rate": "REAL",
                 "currency_code": "TEXT", "currency_name": "TEXT"}
 
 
@@ -204,8 +205,8 @@ class SupplierStore:
             # горизонтальным разделителем или картинкой-баннером (решение админа
             # 04.10.2026). Список брендов и фильтр строк обязаны считаться одинаково и на
             # приёме, и при разборе, а форма — объяснять админу, откуда взялись бренды.
-            for column in ("sheets", "sheet_list", "brand_col", "brand_mode", "rate",
-                           "currency_code", "currency_name"):
+            for column in ("sheets", "sheet_list", "brand_col", "brand_mode",
+                           "brand_rule", "rate", "currency_code", "currency_name"):
                 if have and column not in have:
                     await db.execute(
                         f"ALTER TABLE supplier_signature ADD COLUMN {column} "
@@ -519,20 +520,36 @@ class SupplierStore:
     NO_BRAND_COLUMN = -1
 
     async def set_signature_brand_col(self, signature: str, column,
-                                      mode: str = "") -> bool:
-        """Чем обозначен бренд: колонка (номер) и способ. `NO_BRAND_COLUMN` — смотрели, нет.
+                                      mode: str = "", rule: int = 0) -> bool:
+        """Чем обозначен бренд: колонка (номер), способ и ВЕРСИЯ ПРАВИЛА, которым смотрели.
 
-        У разделителей и картинок номера колонки нет, но отметка «смотрели» нужна та же —
-        иначе дозаполнение при старте перечитывало бы файл каждый запуск.
+        У разделителей, картинок и имени листа номера колонки нет, но отметка «смотрели»
+        нужна та же — иначе дозаполнение при старте перечитывало бы файл каждый запуск.
+
+        Версия обязательна: без неё «смотрели» означает «смотрели неизвестно чем», и
+        улучшенный детектор молча обошёл бы уже просмотренные форматы (так дважды и вышло
+        04.10.2026). Ноль — «версию не называли», то есть запись старая.
         """
         if not signature:
             return False
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "UPDATE supplier_signature SET brand_col = ?, brand_mode = ? "
-                "WHERE signature = ?", (column, (mode or "").strip(), signature))
+                "UPDATE supplier_signature SET brand_col = ?, brand_mode = ?, "
+                "brand_rule = ? WHERE signature = ?",
+                (column, (mode or "").strip(), int(rule or 0), signature))
             await db.commit()
         return cur.rowcount > 0
+
+    async def brand_rule_for(self, signature: str) -> int:
+        """Какой ВЕРСИЕЙ правила у формата смотрели бренды. 0 — неизвестно, то есть старой."""
+        if not signature:
+            return 0
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT COALESCE(brand_rule, 0) FROM supplier_signature "
+                "WHERE signature = ? ORDER BY id", (signature,))
+            rows = await cur.fetchall()
+        return max((int(row[0]) for row in rows), default=0)
 
     async def brand_mode_for(self, signature: str) -> str:
         """Способ детекции бренда у формата: колонка / разделитель / картинка. Пусто — нет."""
@@ -558,11 +575,15 @@ class SupplierStore:
         return None if value is None or value < 0 else value
 
     async def brand_scanned(self, signature: str) -> bool:
-        """Смотрели ли файл этого формата на бренды — включая исход «колонки нет».
+        """Смотрели ли файл этого формата на бренды — включая исход «бренд не обозначен».
 
-        Нужно ровно дозаполнению при старте: оно обязано пройти каждый формат ОДИН раз, а
-        не разбирать книгу заново при каждом перезапуске бота.
+        **НОМЕР КОЛОНКИ ДЛЯ ЭТОГО НЕ ГОДИТСЯ.** Колонка есть только у одного способа из
+        пяти: у разделителей, имени листа и баннеров её нет вовсе, и такой формат
+        перечитывался бы при КАЖДОМ старте бота (поймано на Стройиндустрии 04.10.2026).
+        Поэтому признаком служит ещё и версия правила — её штампуют все способы.
         """
+        if await self.brand_rule_for(signature):
+            return True
         return await self._brand_col_raw(signature) is not None
 
     async def _brand_col_raw(self, signature: str):

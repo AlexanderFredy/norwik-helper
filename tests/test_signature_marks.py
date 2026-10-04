@@ -611,7 +611,9 @@ class BackfillTest(unittest.IsolatedAsyncioTestCase):
         await self.store.set_marks_by_signature(
             "hash-1", [{"brand": "ABK", "parse": True, "tm_code": "000000265",
                         "tm_name": "ABK", "discount": 17.5}])
-        await self.store.set_signature_brand_col("hash-1", 1, "колонка")
+        from src.price_tool.brand_rows import RULE_VERSION
+
+        await self.store.set_signature_brand_col("hash-1", 1, "колонка", RULE_VERSION)
         await self.add_file(self.workbook(self.WITH_BRANDS))
 
         self.assertEqual(await self.run_fill(), 0)
@@ -631,7 +633,7 @@ class BackfillTest(unittest.IsolatedAsyncioTestCase):
         await self.store.set_marks_by_signature(
             "hash-1", [{"brand": "ABK", "parse": True, "tm_code": "000000265",
                         "tm_name": "ABK", "discount": 17.5}])
-        await self.store.set_signature_brand_col("hash-1", 1)   # способ НЕ записан
+        await self.store.set_signature_brand_col("hash-1", 1)   # версия НЕ записана
         await self.add_file(self.workbook(self.WITH_BRANDS))
 
         self.assertEqual(await self.run_fill(), 1)

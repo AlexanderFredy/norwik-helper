@@ -216,6 +216,7 @@ async def main() -> None:
             logger.warning("Логотипы прайса %s не прочитаны", filename, exc_info=True)
 
         only_marks = None
+        marks = []
         try:
             marks = await asyncio.to_thread(onec.selling_tm) if onec else []
             summary = await remember_brands(supplier_store, signature, content,
@@ -263,7 +264,7 @@ async def main() -> None:
                            known_columns=known_columns,
                            remember_columns=remember_columns,
                            only_sheets=only_sheets, only_marks=only_marks,
-                           discounts=discounts, logos=logos,
+                           discounts=discounts, logos=logos, catalogue=marks,
                            currency={"code": price.supplier_price.currency_code,
                                      "name": price.supplier_price.currency_name,
                                      "rate": price.supplier_price.rate},

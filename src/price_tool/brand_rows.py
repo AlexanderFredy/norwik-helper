@@ -30,8 +30,23 @@ from src.price_tool.scope import normalize
 
 #: Способ, которым бренд обозначен в этом листе. Хранится у сигнатуры: список брендов и
 #: фильтр строк обязаны считаться одинаково и на приёме, и при разборе.
+#: ВЕРСИЯ ПРАВИЛА ДЕТЕКЦИИ. Поднимается КАЖДЫЙ раз, когда детекторы начинают видеть больше
+#: прежних, и по ней дозаполнение понимает, какие форматы перечитать (`brand_backfill`).
+#:
+#: Без неё каждое улучшение молча обходило бы уже просмотренные форматы — это случилось
+#: дважды за один день: сперва у FLOOR SERVICE остался пустой способ, потом Стройиндустрия
+#: не перечиталась новыми детекторами, потому что способ у неё уже стоял. Признак «смотрели»
+#: обязан говорить, ЧЕМ смотрели.
+#:
+#:   1 — только колонка бренда;
+#:   2 — плюс разделители по размеру, картинки-баннеры, разделители по справочнику марок и
+#:       бренд в имени листа (04.10.2026).
+RULE_VERSION = 2
+
 BY_COLUMN = "колонка"
 BY_SECTION = "разделитель"
+BY_MARK_SECTION = "разделитель по справочнику"
+BY_SHEET_NAME = "имя листа"
 BY_IMAGE = "картинка"
 #: «Смотрели файл — бренд не обозначен никак». Это ОТВЕТ, и он записывается наравне с
 #: остальными: пустой способ у формата означает другое — «смотрели правилом прежней
@@ -83,13 +98,28 @@ class BrandRows:
         return out
 
 
-def brand_map(sheet: Sheet, images=None) -> BrandRows | None:
+def brand_map(sheet: Sheet, images=None, marks=None) -> BrandRows | None:
     """Как в этом листе обозначен бренд. None — никак, выбор брендов недоступен.
 
-    Порядок попыток — по убыванию надёжности. Колонка первая: признак стоит В КАЖДОЙ строке,
-    гадать не о чем. Разделитель второй: он требует доказательств. Картинка последняя: код
-    знает, ГДЕ баннер, но имя бренда на нём читает модель (`images` — готовое соответствие
-    «строка → бренд», его приносит вызывающий, см. `model/logo_intake.py`).
+    Порядок попыток — ПО УБЫВАНИЮ ДОКАЗАТЕЛЬНОЙ СИЛЫ, и он не произволен:
+
+    1. **колонка** — признак стоит в КАЖДОЙ строке, гадать не о чем;
+    2. **картинка** — код знает, ГДЕ баннер, имя на нём уже прочитано моделью (`images` —
+       готовое «строка → бренд», см. `model/logo_intake.py`);
+    3. **разделитель по размеру** — доказательство в самой раскладке: лист крупный, разделов
+       много, товарных строк кратно больше (`find_sections`);
+    4. **разделитель по справочнику ТМ** — доказательство ВНЕШНЕЕ: текст строки совпал с
+       именем настоящей марки 1С (`find_marked_sections`). Так размечен прайс Стройиндустрии:
+       строка «CLASSEN», ниже её коллекции, затем строка «ULTRAFLOOR»;
+    5. **имя листа** — последний рубеж: «Ассортимент CLASSEN» значит, что весь лист про эту
+       марку (`from_sheet_name`).
+
+    Почему справочник идёт ПОСЛЕ размера: внутри листа доказательство сильнее внешнего. И
+    почему имя листа последним: на листе, названном по бренду, внутри может быть РАЗМЕТКА по
+    другим брендам, и она главнее — иначе всё свалилось бы в одну марку.
+
+    `marks` — имена марок 1С (`onec.selling_tm`), нужны шагам 4 и 5. Без них работают только
+    первые три: выдумывать бренды, не сверяясь ни с чем, мы не станем.
     """
     spot = find_brand_column(sheet)
     if spot is not None:
@@ -99,7 +129,33 @@ def brand_map(sheet: Sheet, images=None) -> BrandRows | None:
     if by_image is not None:
         return by_image
 
-    return find_sections(sheet)
+    by_size = find_sections(sheet)
+    if by_size is not None:
+        return by_size
+
+    keys = mark_keys(marks)
+    return find_marked_sections(sheet, keys) or from_sheet_name(sheet, keys)
+
+
+def name_keys(name: str) -> set[str]:
+    """Имя марки по частям: «Classen / Классен» — два написания одной марки.
+
+    В справочнике 1С двуязычная запись норма, и сравнивать поле целиком правильно везде,
+    кроме сопоставления с чужим текстом: там совпадёт ровно одна половина.
+    """
+    text = str(name or "")
+    out = {normalize(text)}
+    out.update(normalize(part) for part in text.split("/"))
+    return {key for key in out if key}
+
+
+def mark_keys(marks) -> set[str]:
+    """Имена марок 1С в нормализованном виде — то, с чем сверяется текст прайса."""
+    keys: set[str] = set()
+    for mark in marks or ():
+        name = mark if isinstance(mark, str) else getattr(mark, "name", "")
+        keys |= name_keys(name)
+    return keys
 
 
 def _from_column(sheet: Sheet, spot: BrandColumn) -> BrandRows:
@@ -204,6 +260,112 @@ def find_sections(sheet: Sheet) -> BrandRows | None:
 
     return BrandRows(mode=BY_SECTION, header_rows=first - 1, rows=tuple(owned),
                      items=frozenset(own_items), column=column)
+
+
+def _head_at(rows: list[list[str]]) -> int:
+    """Номер строки заголовков: первая с несколькими ТЕКСТОВЫМИ ячейками.
+
+    Правило то же, что у сигнатуры формата (`signature._header`), и это не совпадение: обе
+    задачи отличают заголовок от оформления, и расхождение двух правил вылезло бы молча.
+    """
+    for number, row in enumerate(rows, 1):
+        text = [value for _, value in _cells(row) if any(ch.isalpha() for ch in value)]
+        if len(text) >= ITEM_MIN_CELLS:
+            return number
+    return 0
+
+
+def find_marked_sections(sheet: Sheet, keys: set[str]) -> BrandRows | None:
+    """Разделители, опознанные ПО СПРАВОЧНИКУ МАРОК 1С. Для листа ЛЮБОГО размера.
+
+    Так размечен прайс Стройиндустрии (44 строки — порог размера он не проходит и никогда не
+    пройдёт): строка «CLASSEN», под ней её коллекции, затем строка «ULTRAFLOOR» и её. Обе
+    есть в справочнике 1С («Classen / Классен», «Ultrafloor / Ультрафлор»), и это внешнее
+    доказательство заменяет размер: совпадение с именем НАСТОЯЩЕЙ марки — не догадка.
+
+    **ОДИНОКОЙ ЯЧЕЙКИ НЕ ТРЕБУЕМ** — и это главное отличие от `find_sections`. У
+    Стройиндустрии в строке «ULTRAFLOOR» стоят ещё «цена 1» и «цена 2» в колонках 9 и 10
+    (поставщик подписал там свои две цены), то есть заполнено ТРИ ячейки. Отличает разделитель
+    от товара не число ячеек, а то, что в КОЛОНКАХ ДАННЫХ — тех, что заняты в строке
+    заголовков, — у него пусто: у товара там замок, размер, класс и цены.
+
+    **РАЗДЕЛ, НЕ СОВПАВШИЙ СО СПРАВОЧНИКОМ, БРЕНДОМ НЕ СЧИТАЕТСЯ.** В том же листе ниже стоит
+    «Акссеуары» — это раздел подложек, а не марка; его строки достаются текущему бренду, и это
+    осознанно: потерять их молча хуже, а лишние виды товара отсекают категории (`/categories`).
+    """
+    if not keys:
+        return None
+
+    rows = non_empty_rows(sheet)
+    head_at = _head_at(rows)
+    if not head_at:
+        return None
+
+    span = {index for index, _ in _cells(rows[head_at - 1])}
+
+    owned: list[tuple[int, str]] = []
+    own_items: set[int] = set()
+    header = head_at
+    current = ""
+    for number, row in enumerate(rows, 1):
+        if number <= head_at:
+            continue
+        cells = _cells(row)
+        if not cells:
+            continue
+        first, text = cells[0]
+        data = {index for index, _ in cells if index != first} & span
+        if normalize(text) in keys and not data:
+            current = text
+            owned.append((number, current))
+            continue
+        if not current:
+            header = number
+            continue
+        owned.append((number, current))
+        own_items.add(number)
+
+    if not own_items:
+        return None
+    return BrandRows(mode=BY_MARK_SECTION, header_rows=header, rows=tuple(owned),
+                     items=frozenset(own_items))
+
+
+def from_sheet_name(sheet: Sheet, keys: set[str]) -> BrandRows | None:
+    """Бренд в ИМЕНИ ЛИСТА: «Ассортимент CLASSEN» — весь лист про эту марку.
+
+    Последний рубеж, и потому самый строгий: имя листа сверяется со справочником 1С и ЦЕЛЫМ
+    СЛОВОМ. «Ассортимент CLASSEN» совпадает, «Прайс от 01.10.2026» и «ИЗМЕНЕНИЯ» — нет.
+
+    **ДВЕ МАРКИ В ИМЕНИ — ЗНАЧИТ НИ ОДНОЙ**: выбор наугад однажды припишет лист чужой марке, а
+    по этому выбору потом отбираются строки и пишутся цены.
+
+    **ТОВАРНЫМИ СЧИТАЮТСЯ ВСЕ строки листа ниже заголовков** (а не только густые): лист целиком
+    принадлежит одной марке, и для оценки расхода важно, сколько строк уедет модели, — а уедут
+    они все. У Стройиндустрии на таком листе одинокими ячейками размечены КОЛЛЕКЦИИ («Elegant
+    4V»), и брендами они не становятся именно потому, что имя листа сильнее.
+    """
+    if not keys:
+        return None
+
+    words = set(normalize(sheet.name).split())
+    hits = {key for key in keys if key and set(key.split()) <= words}
+    if len(hits) != 1:
+        return None
+
+    # Имя показываем КАК НАПИСАНО В ЛИСТЕ — так админ узнает в списке свой прайс. Берём то
+    # слово имени листа, которым совпали: «Ассортимент CLASSEN» → «CLASSEN».
+    key = next(iter(hits))
+    shown = next((word for word in str(sheet.name).split()
+                  if normalize(word) in key.split()), key)
+
+    rows = non_empty_rows(sheet)
+    head_at = _head_at(rows)
+    owned = [(number, shown) for number in range(head_at + 1, len(rows) + 1)]
+    if not owned:
+        return None
+    return BrandRows(mode=BY_SHEET_NAME, header_rows=head_at, rows=tuple(owned),
+                     items=frozenset(number for number, _ in owned))
 
 
 def _from_images(sheet: Sheet, images) -> BrandRows | None:
