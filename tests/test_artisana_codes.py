@@ -139,22 +139,29 @@ class ProcessingModuleTest(unittest.TestCase):
         мы подменили бы саму обработку."""
         self.assertIsNone(re.search(r"^\s*Объект\s*=", self.code, re.M))
 
-    def test_the_attribute_is_checked_before_the_query(self):
-        """Нет реквизита «Арт» — запрос с ним не скомпилируется; проверка обязана стоять до."""
+    def test_the_attribute_is_checked_before_writing(self):
+        """Нет реквизита «Арт» — запись упала бы на первой же позиции."""
         check = self.code.find('Реквизиты.Найти("Арт")')
-        query = self.code.find("Н.Арт КАК Арт")
-        self.assertGreater(check, 0)
-        self.assertLess(check, query)
-
-    def test_the_record_is_rechecked_right_before_writing(self):
-        """Между сопоставлением и нажатием позицию могли поправить руками."""
         write = self.code.find("Карточка.Записать()")
-        recheck = self.code.rfind("СокрЛП(Карточка.Артикул) <> Позиция.КодАртисана", 0, write)
-        self.assertGreater(recheck, 0)
+        self.assertGreater(check, 0)
+        self.assertLess(check, write)
 
-    def test_mark_all_does_not_lift_the_safeguards(self):
-        """«Отметить все» отмечает только то, что можно записать, а не конфликты."""
-        self.assertIn("Позиция.Пометка = Позиция.МожноЗаписать;", self.code)
+    def test_a_wrong_file_stops_before_writing(self):
+        """Правило «нет в прайсе — пусто» на не том файле стёрло бы все артикулы разом."""
+        stop = self.code.find("Соответствие.Количество() = 0")
+        write = self.code.find("Карточка.Записать()")
+        self.assertGreater(stop, 0)
+        self.assertLess(stop, write)
+
+    def test_a_code_missing_from_the_price_empties_the_article(self):
+        """Решение админа 06.10.2026: «+» уходит в «Арт» всегда, «Артикул» без кода — пуст."""
+        self.assertIn("Карточка.Арт = Код;", self.code)
+        self.assertIn("Карточка.Артикул = Заводской;", self.code)
+        self.assertRegex(self.code, r'Если Заводской = Неопределено Тогда\s+Заводской = "";')
+
+    def test_no_manual_selection(self):
+        """Одна кнопка, без таблицы с флажками."""
+        self.assertNotIn("Пометка", self.code)
 
 
 if __name__ == "__main__":
