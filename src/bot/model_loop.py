@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from src.model.commands import group_by_actor, plan_batch
+from src.model.commands import CommandKind, Rejected, group_by_actor, plan_batch
 
 logger = logging.getLogger(__name__)
 
@@ -83,19 +83,23 @@ class AgentLoop:
         # Истёкшие захваты снимаем ПЕРВЫМ делом: иначе прайс, заброшенный админом, до конца
         # оборота считался бы занятым и отклонил бы чужие команды (§5.1).
         await self._service.expire_locks()
-
-        for provider in self._providers:
-            try:
-                await provider.collect(self._queue)
-            except Exception:                           # noqa: BLE001
-                logger.warning("Провайдер %s не отдал команды",
-                               type(provider).__name__, exc_info=True)
+        await self._collect()
 
         batch = await self._queue.take()
         if not batch:
             return 0
 
         self._last_activity = asyncio.get_event_loop().time()
+
+        # ПРЕРЫВАНИЕ РАЗБИРАЕТСЯ ДО ВСЕГО ОСТАЛЬНОГО и мимо `plan_batch`: это не работа по
+        # прайсу, а отмена работы. Пришло вместе с другими командами по тому же прайсу —
+        # они не выполняются: «прервать» значит и «не начинать».
+        halted: set = set()
+        applied = 0
+        for command in [c for c in batch if c.kind == CommandKind.INTERRUPT]:
+            await self._interrupt(command, halted)
+            applied += 1
+        batch = [c for c in batch if c.kind != CommandKind.INTERRUPT]
 
         # Занятость считается ОТДЕЛЬНО ДЛЯ КАЖДОГО инициатора: свой захват админа не
         # блокирует, чужой блокирует (§5.1). Общего набора «занятых» не существует.
@@ -104,16 +108,66 @@ class AgentLoop:
         # легли в очередь: первая группа берёт захват, вторая получает «прайс занят
         # другим администратором». По порядку очереди выигрывал бы тот, чьего провайдера
         # опросили раньше, — то самое, что правило «кто первый» (§7) и запрещает.
-        applied = 0
-
         for actor, commands in group_by_actor(batch):
             run, rejected = plan_batch(commands, self._service.busy_for(actor))
             for refusal in rejected:
                 await self._service.reject(refusal)
                 await self._queue.done(refusal.command.id)
             for command in run:
-                await self._service.apply(command)
+                if command.price_id is not None and command.price_id in halted:
+                    await self._service.reject(Rejected(command, "прервано админом"))
+                    await self._queue.done(command.id)
+                    continue
+                await self._apply_watched(command, halted)
                 await self._queue.done(command.id)
                 applied += 1
 
         return applied
+
+    async def _collect(self) -> None:
+        for provider in self._providers:
+            try:
+                await provider.collect(self._queue)
+            except Exception:                           # noqa: BLE001
+                logger.warning("Провайдер %s не отдал команды",
+                               type(provider).__name__, exc_info=True)
+
+    async def _interrupt(self, command, halted: set) -> None:
+        """Прервать работу по прайсу. Исход у команды один — «выполнена».
+
+        Нечего прерывать — тоже «выполнена», без отказа: желаемое состояние «ничего не
+        идёт» уже достигнуто. А отказ сопоставляется с формой по (инициатор, прайс,
+        задача) — и совпал бы с командой, которую прервали.
+        """
+        halted.add(command.price_id)
+        self._service.interrupt(command.price_id)
+        await self._queue.done(command.id)
+
+    async def _apply_watched(self, command, halted: set) -> None:
+        """Применить команду, НЕ ПЕРЕСТАВАЯ СЛУШАТЬ визуалы.
+
+        Прежде команда выполнялась прямо в обороте, и пока шла сборка задач или задача —
+        минуты, на плохом VPN десятки минут, — агент не опрашивал очередь вовсе. Нажать
+        «Прервать» было можно, услышать — некому (08.10.2026). Теперь работа идёт
+        отдельной asyncio-задачей, а цикл раз в `ACTIVE_PERIOD` забирает ТОЛЬКО
+        прерывания: прочие команды ждут конца прогона, как и раньше, — порядок «кто
+        первый» и захваты от этого не меняются. Попутно опрос держит в 1С метку «агент
+        жив», и форма перестаёт подозревать агента, занятого длинной работой.
+        """
+        job = asyncio.ensure_future(self._service.apply(command))
+        try:
+            while True:
+                done, _ = await asyncio.wait({job}, timeout=ACTIVE_PERIOD)
+                if done:
+                    break
+                await self._collect()
+                for stop in await self._queue.take(kinds={CommandKind.INTERRUPT}):
+                    await self._interrupt(stop, halted)
+        except asyncio.CancelledError:
+            # Останавливают сам цикл — работу тоже останавливаем, а не бросаем сиротой.
+            job.cancel()
+            raise
+        if job.cancelled():
+            logger.warning("Команда %s отменена, не дойдя до конца", command.label())
+        else:
+            job.result()        # выпустить то, что `apply` не поймал, как и раньше

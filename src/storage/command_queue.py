@@ -144,13 +144,19 @@ class CommandQueue:
                 "sort_at FROM command_queue WHERE taken_at IS NULL ORDER BY sort_at, id")
             return [_from_row(row) for row in await cur.fetchall()]
 
-    async def take(self, limit: int = 100) -> list[Command]:
+    async def take(self, limit: int = 100, kinds=None) -> list[Command]:
         """Забрать пачку и пометить взятой.
 
         Помечаем, а не удаляем: между «забрал» и «выполнил» процесс может умереть, и тогда
         по базе видно, на чём он встал. Удалит команду тот, кто её обработает.
+
+        `kinds` — забрать ТОЛЬКО эти виды, остальное оставить лежать: так цикл посреди
+        долгого прогона берёт прерывание, не трогая команды, которые ждут его конца.
         """
-        batch = (await self.pending())[:limit]
+        batch = await self.pending()
+        if kinds is not None:
+            batch = [c for c in batch if c.kind in kinds]
+        batch = batch[:limit]
         if not batch:
             return []
         stamp = _now()

@@ -353,6 +353,25 @@ async def cmd_rebuild(message: Message, command: CommandObject, model, queue,
                                  actor=_actor(message), price_id=price_id), loop, queue)
 
 
+@router.message(CommandFilter("stop"))
+async def cmd_stop(message: Message, command: CommandObject, queue, loop,
+                   is_admin: bool) -> None:
+    """Прервать сборку задач или выполняемую задачу по прайсу.
+
+    Существование прайса НЕ проверяем: задачи по только что присланному файлу собираются
+    раньше, чем прайс попадает в список, — а прервать хочется именно такую сборку.
+    """
+    if not is_admin:
+        return
+    price_id = _number(command.args or "")
+    if price_id is None:
+        await message.answer("Нужен номер прайса из /prices")
+        return
+    await _send(message, Command(kind=CommandKind.INTERRUPT, source="telegram",
+                                 actor=_actor(message), price_id=price_id), loop, queue)
+    await message.answer(f"Прерываю работу по прайсу №{price_id}.")
+
+
 @router.message(CommandFilter("price_delete"))
 async def cmd_price_delete(message: Message, command: CommandObject, model, queue,
                            loop, is_admin: bool) -> None:

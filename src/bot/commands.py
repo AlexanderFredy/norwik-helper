@@ -25,6 +25,7 @@ ADMIN_COMMANDS = COMMON_COMMANDS + [
     BotCommand(command="tasks", description="Задачи по прайсу"),
     BotCommand(command="run", description="Выполнить задачу"),
     BotCommand(command="rebuild", description="Собрать задачи прайса заново"),
+    BotCommand(command="stop", description="Прервать работу агента по прайсу"),
     BotCommand(command="suppliers", description="Справочник поставщиков"),
     BotCommand(command="signatures", description="Форматы прайсов поставщиков"),
     BotCommand(command="price_files", description="Файлы прайсов на сервере"),
@@ -74,6 +75,7 @@ _ADMIN_HELP = """
 /task_delete &lt;номер&gt; — удалить задачу
 /price_status &lt;номер&gt; &lt;статус&gt; — статус прайса ставит админ, не модель
 /rebuild &lt;номер&gt; — собрать задачи заново (статусы и правки НЕ переносятся)
+/stop &lt;номер&gt; — прервать сборку задач или выполняемую задачу по прайсу
 /price_delete &lt;номер&gt; — уничтожить прайс
 /unlock &lt;номер&gt; — снять свой захват досрочно
 

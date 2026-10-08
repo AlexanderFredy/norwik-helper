@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from src.model import locks as lk
@@ -67,6 +68,12 @@ class PriceListService:
         self.events = broadcaster or Broadcaster()
         self._prices: list[Price] = []
         self._locks: dict[int, lk.Lock] = {}
+        # Что сейчас идёт по прайсу: сборка задач или выполнение задачи. Держим asyncio-
+        # задачу, а не флаг — прервать работу можно, только отменив её (`interrupt`).
+        self._running: dict[int, asyncio.Task] = {}
+        # Прайсы, по которым отмену прислал АДМИН. Отличает её от остановки процесса: та
+        # тоже приходит как CancelledError, но её глотать нельзя.
+        self._interrupted: set[int] = set()
 
     # ------------------------------------------------------------------ старт
 
@@ -122,6 +129,47 @@ class PriceListService:
 
     def busy_for(self, actor: str) -> set[int]:
         return lk.busy_for(self._locks, actor)
+
+    # -------------------------------------------------------------- прерывание
+
+    def interrupt(self, price_id: int | None) -> bool:
+        """Прервать сборку задач или выполнение задачи по прайсу. True — было что прерывать.
+
+        Работа отменяется на ближайшем ожидании — обращении к модели, к 1С, к базе, — то
+        есть сразу, а не по окончании хода. Обращение, уже ушедшее в 1С из потока
+        (`to_thread`), доработает само: оборвать HTTP-запрос посреди нельзя. Но СЛЕДУЮЩЕЙ
+        записи не будет — прерванная задача сразу теряет захват, и `guard` её откажет.
+        """
+        job = self._running.get(price_id)
+        if job is None or job.done():
+            return False
+        self._interrupted.add(price_id)
+        job.cancel()
+        logger.info("Работа по прайсу %s прервана админом", price_id)
+        return True
+
+    def _working(self, price_id: int) -> None:
+        """Отметить, что ТЕКУЩАЯ asyncio-задача работает по прайсу — её и отменит `interrupt`."""
+        job = asyncio.current_task()
+        if job is not None:
+            self._running[price_id] = job
+
+    def _idle(self, price_id: int) -> None:
+        if self._running.get(price_id) is asyncio.current_task():
+            self._running.pop(price_id, None)
+
+    def _by_admin(self, price_id: int) -> bool:
+        """Отмену прислал админ — тогда её глотаем и докладываем; иначе это остановка
+        процесса, и её надо пропустить дальше."""
+        if price_id not in self._interrupted:
+            return False
+        self._interrupted.discard(price_id)
+        job = asyncio.current_task()
+        # С 3.11 пойманная отмена оставляет у задачи счётчик «отменяют», и первый же
+        # `asyncio.timeout` ниже по коду сработал бы мгновенно. Снимаем его.
+        if job is not None and hasattr(job, "uncancel"):
+            job.uncancel()
+        return True
 
     # ------------------------------------------------------------------ приём
 
@@ -414,8 +462,21 @@ class PriceListService:
             EventKind.TASK_RUNNING, price_id=price.id, task_id=task.id,
             text=f"Задача {task.id} взята в работу: {task.label()}"))
 
+        interrupted = False
+        self._working(price.id)
         try:
             status, result = await self._run(price, task, lock, command.actor)
+        except asyncio.CancelledError:
+            if not self._by_admin(price.id):
+                raise
+            # ЗАХВАТ СНИМАЕМ ПЕРВЫМ ДЕЛОМ, синхронно, до любого ожидания. Обращение к 1С,
+            # ушедшее в поток до отмены, ещё может дойти до `guard` перед следующей записью
+            # — и должно получить отказ, а не продлённую аренду.
+            self._locks.pop(price.id, None)
+            interrupted = True
+            status = TaskStatus.TODO
+            result = ("Прервано админом. Часть правок могла записаться — проверьте в 1С "
+                      "перед повтором.")
         except Exception as exc:                        # noqa: BLE001
             logger.exception("Прогон задачи %s сорвался", task.id)
             # Задача ОСТАЁТСЯ в очереди: сорвавшийся прогон мог успеть записать часть, и
@@ -428,10 +489,15 @@ class PriceListService:
             status = TaskStatus.TODO
             result = (f"Прогон сорвался: {type(exc).__name__}: {exc}. "
                       "Часть правок могла записаться — проверьте в 1С перед повтором.")
+        finally:
+            self._idle(price.id)
 
         task.complete(status, result)
         await self._store.update_task(task)
-        await self._after_task(price)
+        if interrupted:
+            await self._drop_lock(price.id, "работа прервана админом")
+        else:
+            await self._after_task(price)
 
         await self.events.publish(Event(
             EventKind.TASK_STATUS, price_id=price.id, task_id=task.id,
@@ -638,8 +704,23 @@ class PriceListService:
         if content is None:
             return await self._reject(command, "файл прайса не найден на сервере")
 
-        fresh, broke = await self._make_tasks(
-            price, content, price.supplier_price.filename, fallback=False)
+        self._working(price.id)
+        try:
+            fresh, broke = await self._make_tasks(
+                price, content, price.supplier_price.filename, fallback=False)
+        except asyncio.CancelledError:
+            if not self._by_admin(price.id):
+                raise
+            # Прежние задачи на месте: сборка их ещё не заменила. Событие, а не отказ:
+            # отказ по прайсу совпал бы адресом с самой командой прерывания, и в форме та
+            # закрылась бы «отклонённой».
+            await self.events.publish(Event(
+                EventKind.TASKS_REBUILT, price_id=price.id,
+                text=f"Сборка задач прайса №{price.id} прервана админом. Прежние задачи "
+                     "не тронуты."))
+            return
+        finally:
+            self._idle(price.id)
         if broke:
             # Прежние задачи остаются на месте: они не устарели от того, что модель не
             # ответила. Админу — причина, а не молчание.
@@ -716,7 +797,19 @@ class PriceListService:
 
     async def _fill_tasks(self, price: Price, content: bytes, filename: str) -> None:
         """Задачи при приёме. Прайс уже записан — дописываем список отдельно."""
-        tasks, _ = await self._make_tasks(price, content, filename)
+        self._working(price.id)
+        try:
+            tasks, _ = await self._make_tasks(price, content, filename)
+        except asyncio.CancelledError:
+            if not self._by_admin(price.id):
+                raise
+            tasks = []
+            await self.events.publish(Event(
+                EventKind.TASKS_REBUILT, price_id=price.id,
+                text=f"Сборка задач прайса №{price.id} прервана админом — задач нет. "
+                     f"Собрать заново: «Обновить задачи» в 1С или /rebuild {price.id}."))
+        finally:
+            self._idle(price.id)
         price.rebuild(tasks)
         await self._store.replace_tasks(price.id, price.tasks)
 
