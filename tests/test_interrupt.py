@@ -221,5 +221,67 @@ class InterruptTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Прервано админом", task.result or "")
 
 
+class ProgressTest(unittest.IsolatedAsyncioTestCase):
+    """Пачка задач докладывается в 1С ПО МЕРЕ выполнения, а не разом после последней
+    (вопрос админа 08.10.2026)."""
+
+    async def asyncSetUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.db = Path(self._dir.name) / "t.db"
+        store = ModelStore(self.db)
+        await store.init()
+        suppliers = SupplierStore(self.db)
+        await suppliers.init()
+        self.queue = CommandQueue(self.db)
+        await self.queue.init()
+
+        async def run(price, task, content, guard):
+            return TaskStatus.DONE, "готово"
+
+        self.model = PriceListService(
+            store, suppliers,
+            save_file=lambda content, name: price_files.save(self.db, name, content),
+            run_task=run)
+        await self.model.load()
+        await self.model.submit(XLSX, "Прайс Монарх 15.09.2026.xlsx", supplier_hint="Монарх",
+                                actor="admin-1")
+        self.price = self.model.prices[0]
+
+        test = self
+
+        class Provider:
+            """Что видел бы провайдер 1С при каждом опросе: статусы задач и очередь."""
+            def __init__(self):
+                self.seen = []
+
+            async def collect(self, queue):
+                alive = {c.id for c in await queue.pending() + await queue.taken()}
+                self.seen.append(([t.status for t in test.tasks], alive))
+
+        self.provider = Provider()
+        self.loop = AgentLoop(self.queue, self.model, providers=[self.provider])
+
+    async def asyncTearDown(self):
+        self._dir.cleanup()
+
+    async def test_each_task_is_reported_as_soon_as_it_is_done(self):
+        self.tasks = self.price.sorted_tasks[:2]
+        first, second = [await self.queue.put(Command(
+            kind=CommandKind.EXECUTE_TASK, source="1c", actor="admin-1",
+            price_id=self.price.id, task_id=t.id, payload={"seq": n}))
+            for n, t in enumerate(self.tasks, 1)]
+
+        await asyncio.wait_for(self.loop.tick(), WAIT)
+
+        midway = [(statuses, alive) for statuses, alive in self.provider.seen
+                  if statuses == [TaskStatus.DONE, TaskStatus.TODO]]
+        self.assertTrue(midway, "между задачами провайдер не опрашивался — статус первой "
+                                "уехал бы в 1С только вместе со второй")
+        _, alive = midway[0]
+        self.assertNotIn(first.id, alive, "команда первой задачи уже закрыта — 1С погасит "
+                                          "её колесико")
+        self.assertIn(second.id, alive)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -121,8 +121,22 @@ class AgentLoop:
                 await self._apply_watched(command, halted)
                 await self._queue.done(command.id)
                 applied += 1
+                await self._report(halted)
 
         return applied
+
+    async def _report(self, halted: set) -> None:
+        """Отчитаться визуалам СРАЗУ после команды, не дожидаясь конца пачки.
+
+        Админ отмечает пять задач и жмёт «Выполнить» один раз; исполняются они по очереди.
+        Снимок и исход команд уезжали в 1С только на следующем обороте — то есть после
+        ПОСЛЕДНЕЙ задачи, и статусы всех пяти менялись разом (вопрос админа 08.10.2026).
+        Опрос провайдера это и есть доставка: он отправляет снимок, закрывает команды,
+        которых нет в очереди, — а заодно забирает прерывание, присланное между задачами.
+        """
+        await self._collect()
+        for stop in await self._queue.take(kinds={CommandKind.INTERRUPT}):
+            await self._interrupt(stop, halted)
 
     async def _collect(self) -> None:
         for provider in self._providers:
