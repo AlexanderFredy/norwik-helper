@@ -229,10 +229,22 @@ class GuessColumnsTest(unittest.TestCase):
                 ["A1", "Дуб", "1000", "1500", "1"]]
         self.assertEqual(pc.guess_columns(rows), {"article": 1, "purchase": 3, "rrc": 4})
 
-    def test_purchase_wins_over_retail(self):
-        """Есть закупка — розница не нужна: сверяем то, что поставщик назвал закупкой."""
+    def test_with_purchase_retail_serves_as_rrc(self):
+        """Есть закупка — розница поставщика идёт как РРЦ (РРЦ = розница), а не источником."""
         rows = [["Артикул", "Закупка", "Розница"], ["A1", "1000", "1500", "9"]]
-        self.assertEqual(pc.guess_columns(rows), {"article": 1, "purchase": 2})
+        self.assertEqual(pc.guess_columns(rows), {"article": 1, "purchase": 2, "rrc": 3})
+
+    def test_artisana_factory_code_is_the_article(self):
+        """Шапка Артисаны: «Код» (+15433, внутренний) и «Заводской\\nкод». В «Артикул» 1С
+        лежит заводской — решение админа 06.10.2026."""
+        rows = [["Код", "Заводской\nкод", "Наименование", "Розн", "Опт"],
+                ["+23409", "A019842", "Панно", "5000", "3500", "1"]]
+        self.assertEqual(pc.guess_columns(rows), {"article": 2, "purchase": 5, "rrc": 4})
+
+    def test_article_beats_factory_code(self):
+        """У Кераматики есть и «Артикул», и «Код производителя» — спорить им незачем."""
+        rows = [["Артикул", "Код производителя", "Цена опт"], ["A1", "F1", "1000", "1", "2"]]
+        self.assertEqual(pc.guess_columns(rows)["article"], 1)
 
     def test_two_candidates_mean_none(self):
         """«Самовывоз» и «с доставкой» у Линдервуда — выбор человека, не шаблона."""

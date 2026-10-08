@@ -4,6 +4,7 @@
 поведение провайдера, которое живой базой как раз НЕ проверить: что снимок не уезжает
 впустую, что схлопнутые команды закрываются обе, что отказ доезжает до формы причиной.
 """
+import asyncio
 import json
 import tempfile
 import unittest
@@ -354,6 +355,37 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         provider = self.make(Dead())
         await provider.collect(self.queue)      # не должно бросить
         self.assertTrue(provider._dirty)
+
+    async def test_a_change_during_sending_is_not_lost(self):
+        """БОЙ 08.10.2026: задачи Эггера легли в базу, команда пересборки закрылась
+        «выполнена», а форма их не видела. Снимок со СТАРЫМИ задачами летел в 1С, пока
+        пересборка их заменяла; событие взвело флаг «менялось», и окончание отправки его
+        тут же сбросило — новый снимок не уехал никогда."""
+        from src.model.events import Event, EventKind
+
+        class Slow(FakeOnec):
+            def __init__(self):
+                super().__init__()
+                self.provider = None
+                self.loop = None
+
+            def set_model_state(self, prices, sheets=None, marks=None):
+                if not self.snapshots:
+                    # посреди первой отправки модель меняется — так это и было на бою
+                    asyncio.run_coroutine_threadsafe(
+                        self.provider.notify(Event(EventKind.TASKS_REBUILT, text="")),
+                        self.loop).result(5)
+                return super().set_model_state(prices, sheets, marks)
+
+        onec = Slow()
+        provider = self.make(onec)
+        onec.provider, onec.loop = provider, asyncio.get_running_loop()
+
+        await provider.collect(self.queue)
+        self.assertTrue(provider._dirty, "изменение во время отправки обязано остаться")
+        await provider.collect(self.queue)
+        self.assertEqual(len(onec.snapshots), 2, "его увозит следующий снимок")
+        self.assertFalse(provider._dirty)
 
     # --------------------------------------------- застрявшие «принятые» команды
 

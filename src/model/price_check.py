@@ -149,6 +149,12 @@ def resolve_columns(rows, spec: dict) -> Columns | str:
 #: производителя», «Артикул поставщика» в соседнем столбце, и по вхождению колонка уехала бы
 #: не туда, а сверка по чужому коду молча не нашла бы ничего.
 _ARTICLE_HEADS = {"артикул", "арт", "арт.", "article", "art", "art.", "sku"}
+#: Запасной заголовок артикула — ЗАВОДСКОЙ код. Именно он и лежит в «Артикул» в 1С (решение
+#: админа 06.10.2026 по Артисане: внутренний код поставщика уехал в «Арт»). Берётся, только
+#: когда колонки «Артикул» нет вовсе: у Кераматики есть и «Артикул», и «Код производителя»,
+#: и спорить им незачем.
+_FACTORY_HEADS = {"заводской код", "код производителя", "артикул производителя",
+                  "код фабрики", "заводской артикул"}
 _RRC = re.compile(r"ррц|мрц|rrp|рекоменд", re.I)
 _PURCHASE = re.compile(r"закуп|опт|дилер|dealer|wholesale|входн", re.I)
 _RETAIL = re.compile(r"розн|retail", re.I)
@@ -178,11 +184,18 @@ def guess_columns(rows) -> dict | None:
     Номера отдаются с единицы, как их называла бы модель, — тот же `resolve_columns` их и
     разрешит, и в память формата они лягут так же.
     """
-    head = []
+    # ШАПКА НАЧИНАЕТСЯ СО СТРОКИ ЗАГОЛОВКОВ, а не с первой строки листа: над таблицей
+    # лежат контакты поставщика, и «Оптовый отдел» Артисаны давал закупке второго кандидата.
+    # Одноклеточные строки (контакты, разделители брендов «Coffee») — не заголовки.
+    head, started = [], False
     for row in rows[:HEADER_DEPTH]:
         if sum(1 for cell in row if to_decimal(cell) is not None) >= HEADER_NUMBERS:
             break
-        head.append(row)
+        filled = sum(1 for cell in row if str(cell or "").strip())
+        if filled >= 3:
+            started = True
+        if started and filled >= 2:
+            head.append(row)
     if not head:
         return None
 
@@ -196,9 +209,13 @@ def guess_columns(rows) -> dict | None:
 
     # Артикул — по ОТДЕЛЬНОЙ ячейке шапки, а не по склейке столбца: склейка «Артикул Код»
     # от объединённых строк точным сравнением не прошла бы.
-    hits = [i for i in range(width)
-            if any(i < len(row) and str(row[i] or "").strip().casefold() in _ARTICLE_HEADS
-                   for row in head)]
+    def headed(names) -> list[int]:
+        # Переносы и двойные пробелы внутри ячейки («Заводской\nкод») — не повод промахнуться.
+        return [i for i in range(width)
+                if any(i < len(row) and " ".join(str(row[i] or "").split()).casefold()
+                       in names for row in head)]
+
+    hits = headed(_ARTICLE_HEADS) or headed(_FACTORY_HEADS)
     article = hits[0] if len(hits) == 1 else None
     if article is None:
         return None
@@ -208,6 +225,10 @@ def guess_columns(rows) -> dict | None:
     if purchase is not None:
         spec["purchase"] = purchase + 1
         rrc = only(_RRC.search)
+        # Отдельной РРЦ нет — ею служит розница поставщика («Розн» у Артисаны): РРЦ = розница,
+        # то же правило, что подтвердил админ для прайсов без закупки (03.10.2026).
+        if rrc is None:
+            rrc = only(lambda t: bool(_RETAIL.search(t)) and not _CURRENCY.search(t))
         if rrc is not None and rrc != purchase:
             spec["rrc"] = rrc + 1
         return spec

@@ -2242,7 +2242,9 @@ def _column_title(rows, number) -> str:
         if sum(1 for cell in row
                if price_check.to_decimal(cell) is not None) >= price_check.HEADER_NUMBERS:
             break
-        text = str(row[index] or "").strip() if index < len(row) else ""
+        if sum(1 for cell in row if str(cell or "").strip()) < 2:
+            continue                                # контакты и разделители — не шапка
+        text = " ".join(str(row[index] or "").split()) if index < len(row) else ""
         if text and text not in parts:
             parts.append(text)
     return f"{number} — {' / '.join(parts)}" if parts else str(number)
