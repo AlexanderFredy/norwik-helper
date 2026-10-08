@@ -29,6 +29,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from src.storage import price_files
+
 logger = logging.getLogger(__name__)
 
 #: Сколько форматов пересчитываем за один старт. Разбор книги — это чтение файла с диска,
@@ -70,7 +72,7 @@ async def rehash_signatures(suppliers, *, pricing=None, sightings=None, model_st
         # Самый свежий файл: правило считает скелет по нему же при обычном приёме, и
         # пересчёт обязан получить то значение, которое получит следующий прайс.
         newest = max(files, key=lambda f: (f.received_at or "", f.id))
-        path = Path(newest.path)
+        path = price_files.to_path(newest.path)     # путь мог прийти с Windows
         if not path.is_file():
             continue
 

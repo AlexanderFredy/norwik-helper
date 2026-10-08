@@ -19,6 +19,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from src.storage import price_files
+
 logger = logging.getLogger(__name__)
 
 #: Сколько форматов дозаполняем за один старт. Разбор книги — это чтение файла с диска,
@@ -51,7 +53,7 @@ async def fill_sheet_lists(suppliers, limit: int = LIMIT) -> int:
 
         # Самый свежий: сортируем по дате получения, а при её отсутствии — по номеру записи.
         newest = max(files, key=lambda f: (f.received_at or "", f.id))
-        path = Path(newest.path)
+        path = price_files.to_path(newest.path)     # путь мог прийти с Windows
         if not path.is_file():
             continue
 

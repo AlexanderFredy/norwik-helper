@@ -25,6 +25,7 @@ from src.model.task import PriceTask
 from src.price_tool.freshness import date_from_name, date_from_sheets, now_stamp
 from src.price_tool.parser import parse_price_table
 from src.price_tool.signature import price_signature
+from src.storage import price_files
 
 logger = logging.getLogger(__name__)
 
@@ -144,11 +145,11 @@ async def submit(content: bytes, filename: str, *, suppliers, model_store, price
     if not path:
         return Intake(None, "не удалось сохранить файл на сервере", supplier.name)
 
-    record = await suppliers.add_price_file(sig.id, filename, str(path),
+    record = await suppliers.add_price_file(sig.id, filename, price_files.text(path),
                                             received_at=received_at)
 
     candidate = Price(supplier_price=SupplierPrice(
-        supplier_id=supplier.id, file_id=record.id, file_path=str(path),
+        supplier_id=supplier.id, file_id=record.id, file_path=price_files.text(path),
         filename=filename, signature=sig.signature, received_at=received_at,
         price_date=price_date))
 
@@ -161,7 +162,8 @@ async def submit(content: bytes, filename: str, *, suppliers, model_store, price
         # НО СНАЧАЛА ПРОВЕРЯЕМ, не ссылается ли на этот файл уже принятый прайс. Файлы
         # именуются по содержимому, поэтому повторно присланный тот же прайс даёт ТОТ ЖЕ
         # путь — и наивное удаление снесло бы запись, принадлежащую живому прайсу.
-        busy = any(p.supplier_price.file_path == str(path) for p in prices)
+        busy = any(price_files.text(p.supplier_price.file_path) == price_files.text(path)
+                   for p in prices)
         if not busy:
             await suppliers.delete_price_file(record.id)
             _drop(path)
@@ -180,6 +182,6 @@ async def submit(content: bytes, filename: str, *, suppliers, model_store, price
 def _drop(path) -> None:
     from pathlib import Path
     try:
-        Path(path).unlink(missing_ok=True)
+        price_files.to_path(path).unlink(missing_ok=True)
     except OSError:                                     # noqa: BLE001
         logger.warning("Не удалось убрать отклонённый прайс %s", path, exc_info=True)

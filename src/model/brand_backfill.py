@@ -29,6 +29,7 @@ import logging
 from pathlib import Path
 
 from src.price_tool.brand_rows import RULE_VERSION
+from src.storage import price_files
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ async def fill_brand_lists(suppliers, marks=None, logos=None,
             continue
 
         newest = max(files, key=lambda f: (f.received_at or "", f.id))
-        path = Path(newest.path)
+        path = price_files.to_path(newest.path)     # путь мог прийти с Windows
         if not path.is_file():
             continue
 

@@ -87,6 +87,11 @@ async def main() -> None:
     # Ссылки собираем ИЗ ВСЕХ ТРЁХ хранилищ. Забыть здесь одно — значит стереть файл,
     # на который оно ссылается: для модели это прайс без файла, а такого объекта
     # существовать не может (§3.1 agent-workflow-model.md).
+    # ПУТИ — К ПРЯМЫМ СЛЭШАМ ДО УБОРКИ: база переезжает с Windows на Linux, и путь
+    # «data\prices\x.xlsx» там не указывает ни на что (`storage/path_fix.py`).
+    from src.storage import path_fix
+    await path_fix.normalize(config.db_path)
+
     known = (await pricing_store.known_price_paths()
              | await supplier_store.known_paths()
              | await model_store.known_paths())

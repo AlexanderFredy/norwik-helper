@@ -21,6 +21,22 @@ DIR_NAME = "prices"
 _SAFE_EXT = re.compile(r"^\.[a-z0-9]{1,8}$")
 
 
+def text(path) -> str:
+    """Путь для базы — ВСЕГДА с прямыми слэшами.
+
+    **БАЗА ПЕРЕЕЗЖАЕТ С WINDOWS НА LINUX** (решение 08.10.2026: бот переходит на VPS). На
+    Windows `str(Path)` даёт «data\\prices\\x.xlsx», а на Linux обратный слэш — обычный
+    символ имени: такой путь не найдётся НИКОГДА, и уборка сирот (`sweep`) при первом же
+    старте сочла бы все прайсы осиротевшими и стёрла их. Прямой слэш понимают обе системы.
+    """
+    return str(path or "").replace("\\", "/")
+
+
+def to_path(path) -> Path:
+    """Путь из базы — в файл. Понимает и старую запись с обратными слэшами."""
+    return Path(text(path))
+
+
 def _dir(db_path: Path) -> Path:
     return db_path.parent / DIR_NAME
 
@@ -54,7 +70,7 @@ def load(path: str | Path | None) -> bytes | None:
     if not path:
         return None
     try:
-        file = Path(path)
+        file = to_path(path)
         return file.read_bytes() if file.is_file() else None
     except OSError:
         logger.exception("Не удалось прочитать сохранённый прайс %s", path)
@@ -66,7 +82,7 @@ def forget(paths) -> int:
     removed = 0
     for path in paths or []:
         try:
-            file = Path(path)
+            file = to_path(path)
             if file.is_file():
                 file.unlink()
                 removed += 1
@@ -89,7 +105,16 @@ def sweep(db_path, known) -> int:
     if not folder.is_dir():
         return 0
 
-    keep = {str(Path(p).resolve()) for p in known or () if p}
+    keep = {str(to_path(p).resolve()) for p in known or () if p}
+
+    # ПРЕДОХРАНИТЕЛЬ: ссылки есть, а ни одна не указывает на существующий файл — значит
+    # пути в базе не того вида (переезд базы, смена каталога), а не «все файлы сироты».
+    # Стереть в такой момент весь каталог — необратимо; лучше не убрать ни одной сироты.
+    if keep and not any(Path(p).is_file() for p in keep):
+        logger.warning("Уборка прайсов пропущена: ни одна из %d ссылок базы не указывает "
+                       "на существующий файл — пути, вероятно, не того вида", len(keep))
+        return 0
+
     removed = 0
     for file in folder.iterdir():
         try:
