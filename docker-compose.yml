@@ -5,6 +5,9 @@ services:
     env_file: .env
     environment:
       DB_PATH: /app/data/users.db
+      # Ежедневная проверка фото и дайджест считают время по МЕСТНЫМ часам (`photo_daily`,
+      # `datetime.now()`): в UTC они сработали бы на три часа позже, чем на рабочей станции.
+      TZ: Europe/Moscow
     volumes:
       - bot-data:/app/data
     logging:
