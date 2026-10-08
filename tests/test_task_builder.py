@@ -382,6 +382,24 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         # и агент узнаёт, как коллекция называется в справочнике
         self.assertEqual(got["collection_в_1С"], ["Millenium Pro"])
 
+    async def test_the_task_address_carries_the_1c_name(self):
+        """БОЙ 08.10.2026: задача «перенос в снятые» адресована «8/32 Классик» (имя
+        прайса), а в 1С коллекция — «Classic 8-32V». Исполнитель не нашёл ни одной позиции и
+        ответил «не заполнен вид товара». Имя из 1С сверка знала — оно обязано попасть в
+        адрес первым, вместе с кодом папки."""
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", collection="Classic 8-32V"),
+            self.nom("R2", "3310", collection="Classic 8-32V")]))
+        await self.compare(tools, ["3309"], collection="8/32 Классик")
+        await tools.execute("add_task", {"kind": "перенос в снятые", "tm": "Egger",
+                                         "tm_code": "T1", "collection": "8/32 Классик",
+                                         "description": "кандидаты"})
+
+        subject = tools.collected[0].address.subject
+        self.assertEqual(subject.names[0], "Classic 8-32V")
+        self.assertIn("8/32 Классик", subject.names)
+        self.assertEqual(subject.code, "F1")
+
     async def test_prices_matching_the_file_report_nothing_to_do(self):
         """СЛУЧАЙ С БОЯ (21.09.2026). По Millenium Pro агент завёл задачу «обновить цены
         по 8 позициям», а закупка и РРЦ в 1С уже совпадали с прайсом: задача заводилась по
@@ -1194,7 +1212,8 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         ]), elsewhere={"3311": Sighting(9, "Паркет-Холл", "Про", "2026-09-15")})
 
         got = await self.compare(tools, ["3309"])
-        self.assertEqual(got["missing_in_price"], ["3310 Бах"])
+        # код 1С впереди: по нему позицию находят в справочнике (просьба админа 08.10.2026)
+        self.assertEqual(got["missing_in_price"], ["R2 3310 Бах"])
         self.assertIn("Паркет-Холл", got["есть_у_другого_поставщика"][0])
 
     async def test_articles_of_this_price_go_into_the_journal(self):

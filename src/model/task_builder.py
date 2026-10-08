@@ -373,6 +373,10 @@ class TaskBuilderTools:
         # Коллекция (нормализованно) → позиции, которые в 1С УЖЕ ЕСТЬ, но вне живой папки:
         # чаще всего снятые. Заводить их заново нельзя — это дубль.
         self._revivals: dict[str, list] = {}
+        # (код марки, имя коллекции в ПРАЙСЕ) → как она зовётся В 1С, по итогу сверки.
+        # Адрес задачи обязан нести имя из 1С: исполнитель ищет коллекцию именно по нему
+        # (бой 08.10.2026: «8/32 Классик» против «Classic 8-32V»).
+        self._names_in_1c: dict[tuple[str, str], list[str]] = {}
         # Имя коллекции → марки-владельцы по дереву папок 1С. Считается один раз.
         self._owners: dict | None = None
         self._haystack: str | None = None   # весь текст прайса одной строкой
@@ -1151,9 +1155,15 @@ class TaskBuilderTools:
                 if collection_of(i) in where and norm_article(i.article) not in seen]
         # …и сразу отсекаем те, что возит КТО-ТО ДРУГОЙ: они не сняты с производства, у
         # них сменился поставщик. Решает это код по журналу встреч, а не рассуждение.
+        if where:
+            self._names_in_1c[(tm_code, normalize(collection))] = sorted(where)
+
         kept, missing_in_price = [], []
         for i in gone:
-            line = f"{i.article} {i.site_name or i.name}".strip()
+            # КОД 1С ВПЕРЕДИ (просьба админа 08.10.2026): по артикулу позицию в справочнике
+            # не найти — он бывает пуст и бывает неуникален, — а по коду находится сразу.
+            # Строку модель переносит в описание задачи как есть.
+            line = f"{i.ref} {i.article} {i.site_name or i.name}".strip()
 
             # ТА ЖЕ ПРОВЕРКА, ЧТО И У КОЛЛЕКЦИЙ: агент перечислил артикулы одного листа,
             # а позиция стоит на другом. «Он её не назвал» — не «её в прайсе нет».
@@ -1788,8 +1798,16 @@ class TaskBuilderTools:
             # `_collection_folder` находит папку для переноса в снятые без сопоставления
             # имён. Пустой код — законный исход: выгрузки по марке могло не быть вовсе,
             # имена расходятся, позиций коллекции может не быть ещё ни одной.
-            subject = Ref.make(code=self._collection_code(mark.code, collection),
-                               names=[collection])
+            #
+            # ИМЯ ИЗ 1С ИДЁТ ПЕРВЫМ (бой 08.10.2026). Модель адресовала задачу именем из
+            # прайса «8/32 Классик», а в 1С коллекция — «Classic 8-32V»: исполнитель не нашёл
+            # ни одной позиции, взял вид товара у папки, где он пуст, и ответил «не заполнен
+            # вид товара». Сверка имя из 1С уже знала; теперь оно в адресе, а прайсовое
+            # остаётся вторым — по нему задача опознаётся при пересборке.
+            in_1c = self._names_in_1c.get((mark.code or "", normalize(collection))) or []
+            names = ([in_1c[0], collection] if len(in_1c) == 1
+                     and normalize(in_1c[0]) != normalize(collection) else [collection])
+            subject = Ref.make(code=self._collection_code(mark.code, names[0]), names=names)
             kind_of = TaskSubject.COLLECTION
             description = (inp.get("description") or "").strip()
 

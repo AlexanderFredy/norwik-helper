@@ -1344,8 +1344,25 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
                 "У задачи нет кода марки или имени коллекции — переносить нечего.")
 
     nom = await asyncio.to_thread(onec.by_tm_all, tm_code, include_not_exported=True)
+    # КОЛЛЕКЦИЯ — ПО ЛЮБОМУ ИМЕНИ АДРЕСА И ПО КОДУ ПАПКИ (бой 08.10.2026). Адрес несёт и
+    # имя из 1С, и имя из прайса; задачи, собранные раньше, — только прайсовое («8/32
+    # Классик» при «Classic 8-32V» в 1С). Код папки точнее имени, когда он есть.
+    names = {n.casefold() for n in task.address.subject.names if n} or {wanted.casefold()}
+    code = (task.address.subject.code or "").strip()
     mine = [i for i in nom.items
-            if nz.collection_of(i).casefold() == wanted.casefold()]
+            if nz.collection_of(i).casefold() in names
+            or (code and (getattr(i, "collection_ref", "") or "") == code)]
+
+    # ПО ИМЕНИ НЕ НАШЛОСЬ — СПРОСИМ АРТИКУЛЫ ИЗ ОПИСАНИЯ. Задачи, собранные до 08.10.2026,
+    # несут только прайсовое имя, но позиции в описании перечислены артикулами («EPL075
+    # Дуб Даннингтон темный»). Все они в ОДНОЙ коллекции 1С — значит это она; в разных —
+    # гадать нельзя, переносим только по имени.
+    if not mine:
+        owner = _collection_by_articles(nom.items, task.description)
+        if owner:
+            names.add(owner.casefold())
+            mine = [i for i in nom.items if nz.collection_of(i).casefold() == owner.casefold()]
+            wanted = owner
     live = [i for i in mine if not i.not_exported]
 
     # ПАПКУ СПРАШИВАЕМ У САМИХ ПОЗИЦИЙ, дерево — на подхвате (бой 02.10.2026). Дерево
@@ -1358,6 +1375,17 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
     if folder is not None and folder.not_exported:
         return (TaskStatus.DONE,
                 f"Папка «{folder.name}» уже помечена невыгружаемой — коллекция снята.")
+
+    # НИ ПОЗИЦИЙ, НИ ПАПКИ — ЗНАЧИТ НЕ НАШЛИ КОЛЛЕКЦИЮ, а не «вид товара пуст». Прежде
+    # дальше брался вид у несуществующей папки, и ответ «у позиции не заполнен вид
+    # товара» отправлял админа искать карточку, которой нет.
+    if not mine and folder is None:
+        known = sorted({nz.collection_of(i) for i in nom.items
+                        if not i.not_exported and nz.collection_of(i)})
+        return (TaskStatus.TODO,
+                f"У марки нет ни позиций, ни папки коллекции «{wanted}» — вероятно, в 1С "
+                f"она называется иначе. Ничего не переносил. Живые коллекции марки: "
+                f"{', '.join(known[:15])}{' …' if len(known) > 15 else ''}.")
 
     # ЧТО ИЗ КОЛЛЕКЦИИ ЕЩЁ СТОИТ В ПРАЙСЕ. Необратимая операция обязана опираться на
     # файл, а не на формулировку задачи: её писала модель.
@@ -1375,31 +1403,59 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
                 f"Все {len(live)} позиц. коллекции «{wanted}» стоят в этом прайсе — "
                 "снимать нечего, ничего не трогал.")
 
-    # Вид товара берём у позиций коллекции; если их не осталось — у папки.
-    type_ref = (mine[0].product_type_ref if mine
-                else (folder.product_type_ref if folder else ""))
-    target = dc.folder_for(type_ref)
-    if not target:
-        return (TaskStatus.TODO,
-                dc.refusal(type_ref, mine[0].product_type if mine else ""))
-
     # ЧАСТЬ КОЛЛЕКЦИИ ОСТАЁТСЯ — двигаем ПОЗИЦИИ, а не папку. Папка с живыми товарами
     # внутри уехать в снятые не может: это и есть та ошибка, ради которой проверка.
+    #
+    # ПАПКА СНЯТЫХ — ПО ВИДУ ТОВАРА КАЖДОЙ ПОЗИЦИИ, которую переносим (бой 08.10.2026). Вид
+    # брался у ПЕРВОЙ позиции коллекции вместе со снятыми: у Egger 8/32 Классик ею оказалась
+    # старая карточка с пустым видом, и вся задача отказала «не заполнен вид товара», хотя
+    # у позиций из описания он был. Позиция без вида не держит остальные — она остаётся
+    # человеку, и называется кодом 1С: без кода её в справочнике не найти.
     if staying:
+        placed = [(i, dc.folder_for(i.product_type_ref)) for i in leaving]
+        unplaced = [i for i, target in placed if not target]
+        ops = [{"op": "update_item", "ref": i.ref, "parent_ref": target}
+               for i, target in placed if target]
+        if not ops:
+            return TaskStatus.TODO, _unplaced_text(unplaced, dc)
+
         guard()
-        result = await asyncio.to_thread(
-            onec.set_items,
-            [{"op": "update_item", "ref": i.ref, "parent_ref": target} for i in leaving])
+        result = await asyncio.to_thread(onec.set_items, ops)
         errors = result.get("errors") or []
-        text = (f"Перенесено в снятые ({target}) поштучно: {len(leaving)} поз. "
-                f"({', '.join((i.site_name or i.name)[:20] for i in leaving[:5])}). "
-                f"Остальные {len(staying)} поз. коллекции «{wanted}» есть в прайсе — "
+        moved = [i for i, target in placed if target]
+        targets = sorted({target for _, target in placed if target})
+        # КОДЫ 1С — в отчёте, а не только имена (просьба админа 08.10.2026): по ним
+        # перенесённое находится в справочнике и, если надо, возвращается.
+        listed = "\n".join(f"— {i.ref} «{i.site_name or i.name}»" for i in moved[:40])
+        text = (f"Перенесено в снятые ({', '.join(targets)}) поштучно: {len(moved)} поз.:\n"
+                f"{listed}\nОстальные {len(staying)} поз. коллекции «{wanted}» есть в прайсе — "
                 f"папку не трогал.")
-        task.digest = {"сняты с производства": len(leaving) - len(errors)}
+        task.digest = {"сняты с производства": len(moved) - len(errors)}
+        if unplaced:
+            text += "\n" + _unplaced_text(unplaced, dc)
         if errors:
-            return (TaskStatus.PARTIAL, text + "\nОшибки 1С: "
-                    + "; ".join(f"{e.get('code')} {e.get('message')}" for e in errors[:3]))
-        return TaskStatus.DONE, text
+            text += "\nОшибки 1С: " + "; ".join(
+                f"{e.get('code')} {e.get('message')}" for e in errors[:3])
+        return (TaskStatus.PARTIAL if (errors or unplaced) else TaskStatus.DONE), text
+
+    # ВСЯ КОЛЛЕКЦИЯ УХОДИТ ПАПКОЙ — вид товара у её ЖИВЫХ позиций: снятые раньше лежат в
+    # другой ветке и папку не определяют. Позиций не осталось — вид у самой папки.
+    kinds = {i.product_type_ref.strip() for i in live if (i.product_type_ref or "").strip()}
+    if len(kinds) > 1:
+        return (TaskStatus.TODO,
+                f"В коллекции «{wanted}» позиции разных видов товара ({', '.join(sorted(kinds))})"
+                " — у каждого своя папка снятых, одной папкой их не перенести. Перенесите "
+                "позиции по одной.")
+    type_ref = (next(iter(kinds)) if kinds
+                else (folder.product_type_ref if folder else "")
+                or next((i.product_type_ref for i in mine if i.product_type_ref), ""))
+    target = dc.folder_for(type_ref)
+    if not target:
+        nameless = [i for i in live if not (i.product_type_ref or "").strip()]
+        if not (type_ref or "").strip() and nameless:
+            return TaskStatus.TODO, _unplaced_text(nameless, dc)
+        return (TaskStatus.TODO,
+                dc.refusal(type_ref, live[0].product_type if live else ""))
 
     # ДАЛЬШЕ ЕДЕТ ПАПКА — и только здесь она вообще нужна. Раньше её искали ПЕРЕД
     # разбором прайса, и ненайденная папка отменяла заодно поштучный перенос, которому
@@ -1415,7 +1471,7 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
     # ПАПКА ДОЛЖНА БЫТЬ НАША ЦЕЛИКОМ: перенос утащит всё, что внутри.
     strangers = sorted({nz.collection_of(i) for i in nom.items
                         if i.collection_ref == folder.ref
-                        and nz.collection_of(i).casefold() != wanted.casefold()})
+                        and nz.collection_of(i).casefold() not in names})
     if strangers:
         return (TaskStatus.TODO,
                 f"В папке «{folder.name}» лежат и другие коллекции "
@@ -1444,6 +1500,46 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
         text += (f"\nЕщё {gone} позиц. этой коллекции были сняты раньше и лежат в другой "
                  "папке снятых — их не трогал.")
     return TaskStatus.DONE, text
+
+
+def _collection_by_articles(items, description: str) -> str:
+    """Коллекция 1С, которой принадлежат ВСЕ артикулы, упомянутые в описании. Пусто — нет
+    ни одного либо они в разных коллекциях.
+
+    Слово описания считается артикулом, только если такой артикул есть у марки и он не
+    короче четырёх знаков: «32» и «8» из «8/32 Классик» иначе совпали бы с чем угодно.
+    """
+    by_key: dict[str, set[str]] = {}
+    for item in items:
+        key = norm_article(getattr(item, "article", "") or "")
+        if len(key) >= 4:
+            by_key.setdefault(key, set()).add(nz.collection_of(item))
+    # ПЕРЕСЕЧЕНИЕ, а не объединение: один код декора бывает у нескольких коллекций марки
+    # (у Egger EPL075 есть и в 8/32, и в 8/33), и ответ — та, где есть ВСЕ перечисленные.
+    owners: set[str] | None = None
+    for word in (description or "").split():
+        found = by_key.get(norm_article(word.strip(".,;:—()«»")))
+        if found:
+            owners = set(found) if owners is None else owners & found
+    if not owners:
+        return ""
+    owners.discard("")
+    return owners.pop() if len(owners) == 1 else ""
+
+
+def _unplaced_text(items, dc) -> str:
+    """Позиции, которым не нашлась папка снятых, — С КОДАМИ 1С (просьба админа 08.10.2026).
+
+    «У позиции не заполнен вид товара» без кода — тупик: позиций в коллекции десятки, и
+    искать, какая из них виновата, человеку нечем.
+    """
+    lines = []
+    for item in items[:30]:
+        why = dc.refusal(item.product_type_ref, item.product_type)
+        lines.append(f"— {item.ref} «{item.name}»: {why}")
+    tail = f"\n… и ещё {len(items) - 30}" if len(items) > 30 else ""
+    return (f"Не перенесены в снятые {len(items)} поз. — папку снятых определить не по "
+            "чему:\n" + "\n".join(lines) + tail)
 
 
 def _collection_folder(folders, subject, wanted: str, positions=()):

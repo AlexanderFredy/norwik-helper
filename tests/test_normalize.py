@@ -460,6 +460,100 @@ class DiscontinueTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, TaskStatus.DONE)
         self.assertIn("папку не трогал", text)
 
+    def typeless(self, ref, dead=False, name="Дуб"):
+        """Позиция с ПУСТЫМ видом товара — у старых невыгружаемых карточек так бывает."""
+        it = self.item_in(ref, dead=dead)
+        object.__setattr__(it, "product_type_ref", "")
+        object.__setattr__(it, "product_type", "")
+        object.__setattr__(it, "site_name", name)
+        object.__setattr__(it, "article", "")
+        return it
+
+    def named(self, it, name):
+        object.__setattr__(it, "site_name", name)
+        object.__setattr__(it, "article", "")
+        return it
+
+    async def test_an_old_typeless_card_does_not_block_the_move(self):
+        """БОЙ 08.10.2026 (Egger / 8/32 Классик): вид брался у ПЕРВОЙ позиции коллекции
+        вместе со снятыми, ею оказалась старая карточка без вида — и задача отказала
+        целиком, хотя у переносимых позиций вид был."""
+        onec = self.onec([self.typeless("OLD", dead=True),
+                          self.named(self.item_in("R1"), "Альфа"),
+                          self.named(self.item_in("R2"), "Бета")],
+                         [self.Folder("F-BR", "8/32 Классик")])
+        status, text = await run_discontinue(
+            onec, self.task_for(code="F-BR"), allow,
+            self.price(("CO 512", "Ламинат Альфа", 1290)))
+
+        self.assertEqual(onec.ops, [{"op": "update_item", "ref": "R2",
+                                     "parent_ref": self.TARGET}])
+        self.assertEqual(status, TaskStatus.DONE)
+        self.assertNotIn("не заполнен вид товара", text)
+
+    async def test_a_typeless_position_is_named_by_its_1c_code(self):
+        """Просьба админа 08.10.2026: позицию, которую перенести нельзя, называть КОДОМ 1С.
+        Остальные при этом переносятся — одна карточка без вида не держит работу."""
+        onec = self.onec([self.named(self.item_in("R1"), "Альфа"),
+                          self.named(self.item_in("R2"), "Бета"),
+                          self.typeless("YO-777", name="Гамма")],
+                         [self.Folder("F-BR", "8/32 Классик")])
+        status, text = await run_discontinue(
+            onec, self.task_for(code="F-BR"), allow,
+            self.price(("CO 512", "Ламинат Альфа", 1290)))
+
+        self.assertEqual(onec.ops, [{"op": "update_item", "ref": "R2",
+                                     "parent_ref": self.TARGET}])
+        self.assertEqual(status, TaskStatus.PARTIAL)
+        self.assertIn("YO-777", text)
+        self.assertIn("не заполнен вид товара", text)
+
+    async def test_the_folder_takes_the_kind_of_its_live_positions(self):
+        """Целой папкой — вид у ЖИВЫХ позиций: снятые раньше папку не определяют."""
+        onec = self.onec([self.typeless("OLD", dead=True), self.item_in("R1")],
+                         [self.Folder("F-BR", "Brilliant", product_type_ref="")])
+        status, text = await run_discontinue(onec, self.task_for(code="F-BR"), allow,
+                                             self.price())
+        self.assertEqual(onec.ops, [{"op": "update_folder", "ref": "F-BR",
+                                     "parent_ref": self.TARGET}])
+        self.assertEqual(status, TaskStatus.DONE)
+
+    async def test_collection_is_found_by_any_name_of_the_address(self):
+        """Адрес несёт и имя 1С, и имя прайса — искать по любому."""
+        task = self.task_for(name="8/32 Классик")
+        task.address = TaskAddress(
+            tm=task.address.tm, subject=Ref.make(names=["8/32 Классик", "Brilliant"]),
+            subject_kind=TaskSubject.COLLECTION)
+        onec = self.onec([self.item_in("R1")], [self.Folder("F-BR", "Brilliant")])
+        status, _ = await run_discontinue(onec, task, allow, self.price())
+        self.assertEqual(onec.ops, [{"op": "update_folder", "ref": "F-BR",
+                                     "parent_ref": self.TARGET}])
+
+    async def test_old_task_finds_its_collection_by_the_articles_it_lists(self):
+        """Задача 951 собрана до правки: в адресе «8/32 Классик», в описании — артикулы
+        EPL…, и все они из «Classic 8-32V». По ним коллекцию и находим."""
+        alive = self.item_in("R1", collection="Classic 8-32V")
+        object.__setattr__(alive, "article", "EPL075")
+        object.__setattr__(alive, "site_name", "Даннингтон")
+        task = self.task_for(name="8/32 Классик")
+        task.description = "Позиции:\n— EPL075 Дуб Даннингтон темный"
+        onec = self.onec([alive], [self.Folder("F-BR", "Classic 8-32V")])
+
+        status, text = await run_discontinue(onec, task, allow, self.price())
+        self.assertEqual(onec.ops, [{"op": "update_folder", "ref": "F-BR",
+                                     "parent_ref": self.TARGET}])
+        self.assertEqual(status, TaskStatus.DONE)
+
+    async def test_unknown_collection_is_named_not_blamed_on_the_kind(self):
+        """Ни позиций, ни папки — значит имя не то, а не «вид товара пуст»."""
+        onec = self.onec([self.item_in("R1", collection="Classic 8-32V")], [])
+        status, text = await run_discontinue(onec, self.task_for(name="8/32 Классик"),
+                                             allow, self.price())
+        self.assertIsNone(onec.ops)
+        self.assertEqual(status, TaskStatus.TODO)
+        self.assertNotIn("вид товара", text)
+        self.assertIn("Classic 8-32V", text, "живые коллекции марки подсказывают верное имя")
+
     async def test_whole_collection_in_price_moves_nothing(self):
         """Прайс подтверждает всю коллекцию — значит задача устарела, и трогать нечего."""
         alive = self.item_in("R1")
