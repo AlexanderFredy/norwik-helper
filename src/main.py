@@ -259,6 +259,10 @@ async def main() -> None:
         return await build(orchestrator, content, filename, onec=onec,
                            usage_labels={"kind": "pricing", "price_doc": filename},
                            elsewhere=await sightings.elsewhere(supplier_id),
+                           # Цены других поставщиков: сверка цен идёт с ПОБЕДИТЕЛЕМ, как и
+                           # запись, иначе задача заводилась бы там, где выиграет чужой прайс.
+                           rivals=await sightings.rival_offers(supplier_id),
+                           price_date=price.supplier_price.price_date,
                            remember=remember,
                            scope=[c["category"] for c in await pricing_store.list_scope()],
                            known_columns=known_columns,
@@ -321,6 +325,13 @@ async def main() -> None:
         # некуда писать, значит получить прогон, честно доложивший об успехе на ошибках
         # соединения.
         run_task=run_task if onec is not None else None)
+    # ДАТЫ ПРАЙСОВ — ДО ЗАГРУЗКИ МОДЕЛИ: она читает их из базы один раз. Без даты цены
+    # прайса в выборе наименьшей между поставщиками не стареют никогда.
+    from src.model.price_dates import backfill as backfill_price_dates
+    try:
+        await backfill_price_dates(model_store, sightings)
+    except Exception:                                   # noqa: BLE001
+        logger.warning("Даты прайсов не дозаполнены", exc_info=True)
     await model.load()
     # Модель подключается к инструментам ПОСЛЕ создания: она строится с обработчиками,
     # которые сами зовут оркестратор (сборка задач, выполнение), и раньше него появиться

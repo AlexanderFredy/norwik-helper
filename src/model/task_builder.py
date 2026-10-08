@@ -29,6 +29,7 @@ import asyncio
 import json
 import logging
 import re
+from decimal import Decimal
 
 from src.model.enums import TaskKind, TaskSubject
 from src.model.normalize import collection_keys as _collection_keys
@@ -276,10 +277,20 @@ class TaskBuilderTools:
                  discounts: dict | None = None,
                  currency: dict | None = None,
                  logos: dict | None = None,
-                 catalogue=None) -> None:
+                 catalogue=None,
+                 rivals: dict | None = None,
+                 price_date: str | None = None) -> None:
         self._content = content
         self._filename = filename
         self._onec = onec
+        # ПРЕДЛОЖЕНИЯ ДРУГИХ ПОСТАВЩИКОВ: артикул → [Offer] (бой 08.10.2026). Сверка цен
+        # сравнивала прайс только с 1С и заводила «изменение цен», которое при записи
+        # перебивал более дешёвый чужой прайс: у A6R7 (Atlas Concorde Boost Stone)
+        # Кераматика просит 7 154,45, Артисана — 6 447,65. Теперь 1С сверяется с ПОБЕДИТЕЛЕМ
+        # по тому же правилу, что и запись (`offers.best`).
+        self._rivals = rivals or {}
+        self._price_date = price_date
+        self.rival_notes: list[str] = []
         # КАТЕГОРИИ (`/categories`) — что вообще разрешено трогать. Пустой список значит
         # «ограничений нет», а не наоборот. Исполнитель задач их получал давно, сборщик —
         # нет, и это стоило задачи «завести подложку» по прайсу Linderwood: вид товара в
@@ -1447,7 +1458,11 @@ class TaskBuilderTools:
                                                 flat.get("rrc"))
             if from_flat:
                 self._remember_prices(from_flat)
-                return price_check.report(price_check.compare(found, from_flat))
+                winners, rivals = self._against_rivals(from_flat)
+                out = price_check.report(price_check.compare(found, winners))
+                if rivals:
+                    out["цена_у_другого_поставщика"] = rivals[:40]
+                return out
 
         spec = dict(inp.get("price_columns") or {})
         sheet_name = str(spec.pop("sheet", "") or "").strip() or self._last_sheet
@@ -1513,8 +1528,12 @@ class TaskBuilderTools:
         if not from_price:
             return ("в названных колонках цен не нашлось ни одного числа — проверь, те ли "
                     "это колонки")
-        self._remember_prices(from_price)
-        out = price_check.report(price_check.compare(found, from_price))
+        self._remember_prices(from_price)           # в журнал — СВОИ цены, не победителя
+        winners, rivals = self._against_rivals(from_price)
+        out = price_check.report(price_check.compare(found, winners))
+        if rivals:
+            out = dict(out)
+            out["цена_у_другого_поставщика"] = rivals[:40]
         if guessed:
             # Сказать, ЧЕМ сверено: колонки выбрал код, и если он ошибся, модель увидит это
             # по именам и назовёт свои — названное ею всегда сильнее угаданного.
@@ -1589,6 +1608,53 @@ class TaskBuilderTools:
         return ("скидка дилера не задана у брендов: " + ", ".join(without[:8])
                 + ". Задаётся в форме «Бренды» в 1С, колонка «Скидка, %»; "
                 "без неё закупку из розницы считать нельзя.")
+
+    def _against_rivals(self, from_price: dict) -> tuple[dict, list[str]]:
+        """Цены, с которыми сверять 1С: по каждому артикулу — ПОБЕДИТЕЛЬ среди поставщиков.
+
+        Правило то же, что у записи (`executor._cheapest` → `offers.best`): наименьшая
+        закупка среди свежих, РРЦ у победителя, при равенстве — этот прайс. Разойдись они —
+        сборщик заводил бы задачу, которую запись тут же отменит. Неуникальный артикул в
+        конкуренции не участвует, тоже как при записи: чужая цена по такому коду неизвестно
+        про какую толщину.
+
+        Возвращает (цены для сверки, строки о том, где победил другой поставщик).
+        """
+        from src.model.offers import Offer, best
+
+        if not self._rivals:
+            return from_price, []
+
+        counts: dict[str, int] = {}
+        for items in self._items_cache.values():
+            for item in items:
+                key = norm_article(item.article)
+                if key:
+                    counts[key] = counts.get(key, 0) + 1
+
+        out, notes = dict(from_price), []
+        for key, prices in from_price.items():
+            others = self._rivals.get(key)
+            if not others or counts.get(key, 0) > 1 or prices.get("purchase") is None:
+                continue
+            asking = Offer(supplier_id=0, supplier="этот прайс",
+                           purchase=float(prices["purchase"]),
+                           rrc=float(prices["rrc"]) if prices.get("rrc") is not None else None,
+                           price_date=self._price_date)
+            choice = best(asking, others)
+            winner = choice.offer
+            if winner is asking:
+                notes.extend(f"{key}: {n}" for n in choice.notes)   # протухшая выгода
+                continue
+            # Сверяем 1С с ценой ПОБЕДИТЕЛЯ: её и запишет выполнение задачи.
+            out[key] = {"purchase": Decimal(str(winner.purchase))}
+            if winner.rrc is not None:
+                out[key]["rrc"] = Decimal(str(winner.rrc))
+            notes.append(f"{key}: дешевле у «{winner.supplier}» — {winner.purchase:,.2f} против "
+                         f"{asking.purchase:,.2f} этого прайса; сверено с его ценой"
+                         .replace(",", " "))
+        self.rival_notes.extend(notes)
+        return out, notes
 
     def _remember_prices(self, from_price: dict) -> None:
         """Отложить цены прайса для журнала предложений (§6.4).
@@ -2007,6 +2073,9 @@ PROMPT = """Ты — контент-менеджер интернет-магаз
   придёт `цены`. Пусто в `расходятся` — задачи НЕТ: цены в 1С уже такие, прогон по ней
   кончился бы словами «менять нечего». Есть расхождения — перечисли их в описании
   артикулами и числами, они уже посчитаны за тебя.
+  Есть `цена_у_другого_поставщика` — у этих артикулов дешевле другой поставщик, и сверка
+  уже сделана с ЕГО ценой: её и запишет выполнение. Задачу заводи по `расходятся` как
+  обычно, а в описании назови, у кого цена ниже.
   Увидел `колонки_не_названы` — назови колонки и позови сверку ещё раз: «нечем сравнить»
   это не «совпадает». А если рядом стоит `без_цены_в_1С` — задачу заводи сразу, цены там
   нет вовсе, и прайс для этого вывода не нужен.
@@ -2372,7 +2441,8 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
                 only_marks: list | None = None,
                 discounts: dict | None = None, currency: dict | None = None,
                 logos: dict | None = None, catalogue=None,
-                note=None) -> tuple[list[PriceTask], str]:
+                note=None, rivals: dict | None = None,
+                price_date: str | None = None) -> tuple[list[PriceTask], str]:
     """Прогон формирования задач. Возвращает (задачи, короткий ответ агента).
 
     Пустой список — не ошибка: агент мог не найти, за что зацепиться. Вызывающий решает,
@@ -2386,7 +2456,7 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
                              scope=scope, known_columns=known_columns,
                              only_sheets=only_sheets, only_marks=only_marks,
                              discounts=discounts, currency=currency, logos=logos,
-                             catalogue=catalogue)
+                             catalogue=catalogue, rivals=rivals, price_date=price_date)
     task = f"Прайс «{filename}». Составь список задач по нему."
 
     # РАЗБИРАТЬ НЕЧЕГО — МОДЕЛЬ НЕ ЗОВЁМ ВОВСЕ. Ради этого вся затея и нужна: прогон по

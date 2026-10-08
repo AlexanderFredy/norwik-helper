@@ -554,6 +554,42 @@ class DiscontinueTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("вид товара", text)
         self.assertIn("Classic 8-32V", text, "живые коллекции марки подсказывают верное имя")
 
+    async def test_a_position_another_supplier_carries_is_not_moved(self):
+        """БОЙ 08.10.2026: журнал встреч сверялся только при СБОРКЕ задачи. Задачу,
+        собранную по одному прайсу, выполнение исполнило бы и после того, как тот же товар
+        пришёл от другого поставщика. Перенос необратим — спрашиваем журнал на месте."""
+        from src.storage.sightings import Sighting
+        alive = self.named(self.item_in("R1"), "Альфа")
+        carried = self.named(self.item_in("R2"), "Бета")
+        object.__setattr__(carried, "article", "A65S")
+        gone = self.named(self.item_in("R3"), "Гамма")
+        onec = self.onec([alive, carried, gone], [self.Folder("F-BR", "Boost")])
+
+        status, text = await run_discontinue(
+            onec, self.task_for(code="F-BR"), allow,
+            self.price(("CO 512", "Ламинат Альфа", 1290)),
+            elsewhere={"a65s": Sighting(7, "Артисан", "Boost Natural", "2026-08-26")})
+
+        self.assertEqual(onec.ops, [{"op": "update_item", "ref": "R3",
+                                     "parent_ref": self.TARGET}])
+        self.assertIn("R2", text)
+        self.assertIn("Артисан", text)
+
+    async def test_nothing_moves_when_the_rest_is_carried_by_others(self):
+        """Остальное возит другой — значит снимать нечего, а не «уходит целиком»."""
+        from src.storage.sightings import Sighting
+        carried = self.item_in("R1")
+        object.__setattr__(carried, "article", "A65S")
+        onec = self.onec([carried], [self.Folder("F-BR", "Boost")])
+
+        status, text = await run_discontinue(
+            onec, self.task_for(code="F-BR"), allow, self.price(),
+            elsewhere={"a65s": Sighting(7, "Артисан", "Boost", None)})
+
+        self.assertIsNone(onec.ops, "папка с позицией, которую возит другой, остаётся")
+        self.assertEqual(status, TaskStatus.DONE)
+        self.assertIn("другой поставщик", text)
+
     async def test_whole_collection_in_price_moves_nothing(self):
         """Прайс подтверждает всю коллекцию — значит задача устарела, и трогать нечего."""
         alive = self.item_in("R1")

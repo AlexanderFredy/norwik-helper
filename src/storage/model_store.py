@@ -384,6 +384,24 @@ class ModelStore:
             await db.commit()
         return cur.rowcount > 0
 
+    async def undated_prices(self) -> list[tuple[int, str, str, int, str]]:
+        """(номер, путь, имя файла, поставщик, сигнатура) прайсов, у которых даты нет."""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT id, file_path, filename, supplier_id, signature FROM price "
+                "WHERE price_date IS NULL OR price_date = ''")
+            return [(r[0], r[1] or "", r[2] or "", r[3] or 0, r[4] or "")
+                    for r in await cur.fetchall()]
+
+    async def set_price_date(self, price_id: int, value: str) -> bool:
+        """Дописать дату прайса, прочитанную позже приёма (`price_dates.backfill`)."""
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE price SET price_date = ? WHERE id = ? "
+                "AND (price_date IS NULL OR price_date = '')", (value, price_id))
+            await db.commit()
+        return cur.rowcount > 0
+
     async def rehash_signature(self, old: str, new: str) -> int:
         """Перевесить принятые прайсы со старого хеша формата на новый.
 

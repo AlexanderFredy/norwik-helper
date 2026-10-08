@@ -183,6 +183,42 @@ class SightingStore:
                     rrc=rrc, price_date=price_date))
         return out
 
+    async def rival_offers(self, exclude_supplier_id: int = 0) -> dict[str, list]:
+        """ВСЕ предложения остальных поставщиков с ценой: артикул → список `Offer`.
+
+        Нужно сборщику задач (бой 08.10.2026): он сверял прайс только с текущей ценой 1С и
+        заводил «изменение цен» там, где при записи всё равно победит более дешёвый чужой
+        прайс. Отдаётся целиком, как `elsewhere`: инструменты сборщика синхронны и в базу
+        по одной позиции не ходят.
+        """
+        from src.model.offers import Offer
+
+        out: dict[str, list] = {}
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT article_key, supplier_id, supplier_name, purchase, rrc, price_date "
+                "FROM price_sighting WHERE supplier_id <> ? AND purchase IS NOT NULL",
+                (exclude_supplier_id or 0,))
+            for key, sid, name, purchase, rrc, price_date in await cur.fetchall():
+                out.setdefault(key, []).append(Offer(
+                    supplier_id=sid, supplier=name or "", purchase=purchase, rrc=rrc,
+                    price_date=price_date))
+        return out
+
+    async def date_undated(self, supplier_id: int, signature: str, price_date: str) -> int:
+        """Датировать строки прайса, принятого без даты (`price_dates.backfill`).
+
+        Без даты предложение считается свежим ВСЕГДА (`offers._comparable`), то есть его
+        цена не стареет в выборе наименьшей между поставщиками.
+        """
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "UPDATE price_sighting SET price_date = ? WHERE supplier_id = ? "
+                "AND signature = ? AND (price_date IS NULL OR price_date = '')",
+                (price_date, supplier_id, signature or ""))
+            await db.commit()
+            return cur.rowcount
+
     async def rehash_signature(self, old: str, new: str) -> int:
         """Перевесить встречи артикулов со старого хеша формата на новый.
 

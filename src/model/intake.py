@@ -22,7 +22,7 @@ from src.model.enums import TaskKind
 from src.model.price import Price, SupplierPrice
 from src.model.refs import Ref, TaskAddress
 from src.model.task import PriceTask
-from src.price_tool.freshness import date_from_name, now_stamp
+from src.price_tool.freshness import date_from_name, date_from_sheets, now_stamp
 from src.price_tool.parser import parse_price_table
 from src.price_tool.signature import price_signature
 
@@ -92,7 +92,9 @@ async def submit(content: bytes, filename: str, *, suppliers, model_store, price
     # САМОГО прайса (её несёт имя файла), потом дату получения. Без них два прайса одного
     # поставщика выглядели бы одинаково свежими, и «есть более новый» не сработало бы
     # никогда — ни в тесте, ни в бою.
-    price_date = price_date or date_from_name(filename)
+    # Имя файла — первым (его выбирает человек, когда пересохраняет), шапка — следом:
+    # у «Price.xls» Артисаны даты в имени нет, а в шапке она есть.
+    price_date = price_date or date_from_name(filename) or date_from_sheets(sheets)
     received_at = received_at or now_stamp()
 
     # Личность формата считаем ОДИН РАЗ и до опознания: по ней ищется владелец, ею же

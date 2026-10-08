@@ -400,6 +400,45 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("8/32 Классик", subject.names)
         self.assertEqual(subject.code, "F1")
 
+    async def test_a_cheaper_rival_is_what_1c_is_checked_against(self):
+        """БОЙ 08.10.2026 (Atlas Concorde / Boost Stone, A6R7): Кераматика просит 7 154,45,
+        Артисана — 6 447,65. Сверка с одной 1С завела бы «поднять до 7 154,45», а запись
+        выбрала бы цену Артисаны. Теперь сверка идёт с победителем — тем, что запишут."""
+        from src.model.offers import Offer
+        from src.onec.client import Price
+        rival = Offer(supplier_id=7, supplier="Артисан", purchase=1400.0, rrc=2100.0,
+                      price_date="2026-08-26")
+        tools = TaskBuilderTools(
+            price_workbook(), "Прайс.xlsx",
+            onec=self.onec([self.nom("R1", "3309", purchase=Price(1400, None),
+                                     rrc=Price(2100, None))]),
+            rivals={"3309": [rival]}, price_date="2026-10-01")
+        await tools.execute("read_price", {})
+        got = await self.compare(tools, ["3309"], columns={
+            "article": "Артикул", "purchase": "Дилерская", "rrc": "РРЦ"})
+
+        self.assertEqual(got["цены"]["расходятся"], [],
+                         "в 1С уже цена победителя — задачи нет")
+        self.assertIn("Артисан", got["цены"]["цена_у_другого_поставщика"][0])
+        # в журнал уходит СВОЯ цена, а не победителя
+        self.assertEqual(tools.seen_prices["3309"]["purchase"], 1560.0)
+
+    async def test_a_dearer_rival_changes_nothing(self):
+        from src.model.offers import Offer
+        from src.onec.client import Price
+        rival = Offer(supplier_id=7, supplier="Артисан", purchase=1900.0, rrc=2600.0)
+        tools = TaskBuilderTools(
+            price_workbook(), "Прайс.xlsx",
+            onec=self.onec([self.nom("R1", "3309", purchase=Price(1560, None),
+                                     rrc=Price(2370, None))]),
+            rivals={"3309": [rival]})
+        await tools.execute("read_price", {})
+        got = await self.compare(tools, ["3309"], columns={
+            "article": "Артикул", "purchase": "Дилерская", "rrc": "РРЦ"})
+
+        self.assertEqual(got["цены"]["совпадают"], 1)
+        self.assertNotIn("цена_у_другого_поставщика", got["цены"])
+
     async def test_prices_matching_the_file_report_nothing_to_do(self):
         """СЛУЧАЙ С БОЯ (21.09.2026). По Millenium Pro агент завёл задачу «обновить цены
         по 8 позициям», а закупка и РРЦ в 1С уже совпадали с прайсом: задача заводилась по

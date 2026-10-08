@@ -80,6 +80,48 @@ def date_from_name(filename: str | None) -> str | None:
     return None
 
 
+_MONTHS = {"январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5, "июн": 6, "июл": 7,
+           "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12}
+_WORDY = re.compile(r"(?<!\d)(\d{1,2})\s+([а-яё]+)\s+(\d{4})", re.I)
+#: Сколько первых строк листа считать шапкой. Ниже идут товары, и дата в их ячейках —
+#: срок поставки или дата поступления, а не дата прайса.
+HEAD_ROWS = 12
+
+
+def date_from_sheets(sheets) -> str | None:
+    """`ГГГГ-ММ-ДД` из шапки листа: «Прайс-лист на 26.08.2026», «на 1 октября 2026 г».
+
+    Только даты С ГОДОМ: короткое «01.09» в шапке бывает чем угодно — от номера раздела до
+    размера. Берём первую найденную по порядку листов и строк: дату прайса поставщик ставит
+    наверх (бой 08.10.2026: у Артисаны она в пятой строке, а имя файла — просто «Price.xls»,
+    и прайс жил без даты, отчего его цены не старели в выборе наименьшей никогда).
+    """
+    for sheet in sheets or []:
+        for row in (getattr(sheet, "rows", None) or [])[:HEAD_ROWS]:
+            for cell in row:
+                text = str(cell or "")
+                if not re.search(r"\d{4}", text):
+                    continue
+                for pattern in _PATTERNS[:2]:
+                    m = pattern.search(text)
+                    if m:
+                        a, b, c = (int(x) for x in m.groups())
+                        found = _try_date(a, b, c) if a > 31 else _try_date(c, b, a)
+                        if found:
+                            return found
+                m = _WORDY.search(text)
+                if m:
+                    word = m.group(2).lower()
+                    month = next((n for stem, n in _MONTHS.items()
+                                  if word.startswith(stem) and (stem != "ма" or word in
+                                                                ("мая", "май"))), None)
+                    if month:
+                        found = _try_date(int(m.group(3)), month, int(m.group(1)))
+                        if found:
+                            return found
+    return None
+
+
 def now_stamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 

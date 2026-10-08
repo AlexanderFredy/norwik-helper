@@ -1316,7 +1316,7 @@ def _seen_in_price(item, haystack: str) -> bool:
 
 
 async def run_discontinue(onec, task, guard, content: bytes = b"",
-                          filename: str = "price.xlsx"):
+                          filename: str = "price.xlsx", elsewhere: dict | None = None):
     """Перенос ЦЕЛОЙ коллекции в снятые — кодом, одним вызовом (§6.2).
 
     **«ЦЕЛОЙ» ПРОВЕРЯЕТСЯ ПО ПРАЙСУ, А НЕ ПРИНИМАЕТСЯ НА ВЕРУ.** Задача приходит с адресом
@@ -1398,7 +1398,28 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
     staying = [i for i in live if _seen_in_price(i, haystack)]
     leaving = [i for i in live if i not in staying]
 
+    # ВОЗИТ ДРУГОЙ ПОСТАВЩИК — НЕ СНИМАЕМ (бой 08.10.2026). Журнал встреч сверялся только
+    # при СБОРКЕ задачи, а у Atlas Concorde / Boost 32 из 38 артикулов Кераматики есть и
+    # у Артисаны: задачу, собранную по одному прайсу, выполнение не имело права исполнить,
+    # не спросив, что за это время пришло от других. Такие позиции остаются на месте — их
+    # папка, значит, тоже: «уходит целиком» больше не правда.
+    others = elsewhere or {}
+    carried = [i for i in leaving if norm_article(i.article) in others]
+    if carried:
+        leaving = [i for i in leaving if i not in carried]
+        staying = staying + carried
+    carried_note = ""
+    if carried:
+        carried_note = ("\nНе сняты — их возит другой поставщик:\n" + "\n".join(
+            f"— {i.ref} «{i.site_name or i.name}»: "
+            f"{others[norm_article(i.article)].label()}" for i in carried[:30]))
+
     if live and not leaving:
+        if carried:
+            return (TaskStatus.DONE,
+                    f"Снимать нечего: из {len(live)} позиц. коллекции «{wanted}» "
+                    f"{len(live) - len(carried)} стоят в этом прайсе, остальные возит "
+                    f"другой поставщик. Ничего не трогал." + carried_note)
         return (TaskStatus.DONE,
                 f"Все {len(live)} позиц. коллекции «{wanted}» стоят в этом прайсе — "
                 "снимать нечего, ничего не трогал.")
@@ -1428,9 +1449,10 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
         # перенесённое находится в справочнике и, если надо, возвращается.
         listed = "\n".join(f"— {i.ref} «{i.site_name or i.name}»" for i in moved[:40])
         text = (f"Перенесено в снятые ({', '.join(targets)}) поштучно: {len(moved)} поз.:\n"
-                f"{listed}\nОстальные {len(staying)} поз. коллекции «{wanted}» есть в прайсе — "
-                f"папку не трогал.")
+                f"{listed}\nОстальные {len(staying)} поз. коллекции «{wanted}» остаются "
+                f"(есть в прайсе или у другого поставщика) — папку не трогал.")
         task.digest = {"сняты с производства": len(moved) - len(errors)}
+        text += carried_note
         if unplaced:
             text += "\n" + _unplaced_text(unplaced, dc)
         if errors:
@@ -1662,8 +1684,19 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
     # Задача про ОДИН товар остаётся агенту: там надо понять, что именно снимают.
     if (task.kind == TaskKind.MOVE_DISCONTINUED
             and task.subject == TaskSubject.COLLECTION):
+        # ЖУРНАЛ — НА МОМЕНТ ВЫПОЛНЕНИЯ, а не сборки: задачу могли собрать до того, как
+        # пришёл прайс другого поставщика с теми же позициями.
+        elsewhere = {}
+        if offers is not None and hasattr(offers, "elsewhere"):
+            try:
+                elsewhere = await offers.elsewhere(price.supplier_price.supplier_id)
+            except Exception:                           # noqa: BLE001
+                logger.warning("Журнал встреч не прочитался", exc_info=True)
+                return (TaskStatus.TODO,
+                        "Журнал встреч не прочитался — проверить, возит ли позиции другой "
+                        "поставщик, нечем. Перенос не делал: он необратим.")
         return await run_discontinue(onec, task, guard, content,
-                                     price.supplier_price.filename)
+                                     price.supplier_price.filename, elsewhere=elsewhere)
 
     tools = TaskTools(onec, content, price.supplier_price.filename, guard,
                       scope=scope, kind=task.kind, offers=offers,
