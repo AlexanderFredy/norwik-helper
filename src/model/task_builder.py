@@ -1453,6 +1453,23 @@ class TaskBuilderTools:
         nameless = sum(1 for i in found if not (i.purchase and i.purchase.value))
 
         spec = self._price_cols.get(sheet_name)
+        guessed = False
+        if not spec:
+            # НЕ НАЗВАНО — НЕ ЗНАЧИТ «СВЕРЯТЬ НЕЧЕМ» (бой 08.10.2026). На все 46 сверок по
+            # Кераматике модель колонок не назвала, хотя каждый ответ просил об этом, — и
+            # прайс с однозначной шапкой кончился без единой задачи по ценам. Сперва то, что
+            # уже запомнено у формата (показывалось модели, но сверкой не бралось), потом —
+            # прочитанное кодом по шапке. Только если не вышло ни то ни другое, просим.
+            spec = self._known_columns.get(sheet_name) or self._known_columns.get("")
+            if not spec:
+                sheet = next((s for s in self.sheets if s.name == sheet_name), None) \
+                    or (self.sheets[0] if self.sheets else None)
+                spec = price_check.guess_columns(sheet.rows) if sheet is not None else None
+                guessed = bool(spec)
+            if spec:
+                spec = dict(spec)
+                spec.pop("sheet", None)
+                self._price_cols[sheet_name] = spec
         if not spec:
             out = {"колонки_не_названы": "назови price_columns и позови сверку снова"}
             if nameless:
@@ -1487,7 +1504,14 @@ class TaskBuilderTools:
             return ("в названных колонках цен не нашлось ни одного числа — проверь, те ли "
                     "это колонки")
         self._remember_prices(from_price)
-        return price_check.report(price_check.compare(found, from_price))
+        out = price_check.report(price_check.compare(found, from_price))
+        if guessed:
+            # Сказать, ЧЕМ сверено: колонки выбрал код, и если он ошибся, модель увидит это
+            # по именам и назовёт свои — названное ею всегда сильнее угаданного.
+            heads = {key: _column_title(sheet.rows, number) for key, number in spec.items()}
+            out = dict(out) if isinstance(out, dict) else {"цены": out}
+            out["колонки_цен_определил_код"] = heads
+        return out
 
     def _terms(self, discount):
         """Условия пересчёта с валютой прайса. Валюта одна на прайс, скидка — у бренда."""
@@ -2207,6 +2231,21 @@ def fix_marks(tasks: list[PriceTask], owners: dict[str, set]) -> list[str]:
         notes.append(f"«{task.address.subject.label()}»: марка {was} → {mark_name}")
 
     return notes
+
+
+def _column_title(rows, number) -> str:
+    """Колонка словами: «28 — Розничная цена в евро / EUR». Шапка бывает в несколько строк,
+    и её куски склеиваются — по одному «Цена» колонку не узнать."""
+    index = int(number) - 1
+    parts = []
+    for row in rows[:price_check.HEADER_DEPTH]:
+        if sum(1 for cell in row
+               if price_check.to_decimal(cell) is not None) >= price_check.HEADER_NUMBERS:
+            break
+        text = str(row[index] or "").strip() if index < len(row) else ""
+        if text and text not in parts:
+            parts.append(text)
+    return f"{number} — {' / '.join(parts)}" if parts else str(number)
 
 
 def sheets_report(tools) -> str:

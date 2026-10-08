@@ -145,6 +145,85 @@ def resolve_columns(rows, spec: dict) -> Columns | str:
     return cols
 
 
+#: Заголовок колонки артикула — только ТОЧНОЕ совпадение. Рядом стоят «Код», «Код
+#: производителя», «Артикул поставщика» в соседнем столбце, и по вхождению колонка уехала бы
+#: не туда, а сверка по чужому коду молча не нашла бы ничего.
+_ARTICLE_HEADS = {"артикул", "арт", "арт.", "article", "art", "art.", "sku"}
+_RRC = re.compile(r"ррц|мрц|rrp|рекоменд", re.I)
+_PURCHASE = re.compile(r"закуп|опт|дилер|dealer|wholesale|входн", re.I)
+_RETAIL = re.compile(r"розн|retail", re.I)
+_CURRENCY = re.compile(r"евро|eur|€|usd|долл|\$|юан|cny|¥|валют", re.I)
+#: Где кончается шапка: первая строка, в которой столько чисел, — уже данные.
+HEADER_NUMBERS = 3
+HEADER_DEPTH = 30
+
+
+def guess_columns(rows) -> dict | None:
+    """Колонки артикула и цен ПО ШАПКЕ — когда модель их не назвала (бой 08.10.2026).
+
+    Сборка по Кераматике кончилась без единой задачи по ценам: на все 46 сверок код отвечал
+    «колонки не названы, назови и позови снова», и модель ни разу этого не сделала. А шапка
+    там однозначна: «Артикул», «Розничная цена в рублях», «Розничная цена в евро». Прочитать
+    её — работа для кода, не для рассуждений.
+
+    **Только однозначное.** Каждая роль берётся, лишь когда под неё подходит РОВНО ОДНА
+    колонка; две — значит ни одной: «самовывоз» и «с доставкой» у Линдервуда — выбор,
+    который делает человек, а не шаблон. Без артикула или без единой цены — None, и всё
+    остаётся как было: модель называет колонки сама.
+
+    Закупка есть — розница не берётся вовсе: сверяем то, что поставщик назвал закупкой.
+    Закупки нет — ИСТОЧНИКОМ (`retail`/`retail_cur`) становится колонка, прямо названная
+    розницей; закупку из неё посчитает код по скидке дилера.
+
+    Номера отдаются с единицы, как их называла бы модель, — тот же `resolve_columns` их и
+    разрешит, и в память формата они лягут так же.
+    """
+    head = []
+    for row in rows[:HEADER_DEPTH]:
+        if sum(1 for cell in row if to_decimal(cell) is not None) >= HEADER_NUMBERS:
+            break
+        head.append(row)
+    if not head:
+        return None
+
+    width = max(len(row) for row in head)
+    texts = [" ".join(str(row[i] or "").strip() for row in head if i < len(row)).strip()
+             for i in range(width)]
+
+    def only(match) -> int | None:
+        hits = [i for i, text in enumerate(texts) if text and match(text)]
+        return hits[0] if len(hits) == 1 else None
+
+    # Артикул — по ОТДЕЛЬНОЙ ячейке шапки, а не по склейке столбца: склейка «Артикул Код»
+    # от объединённых строк точным сравнением не прошла бы.
+    hits = [i for i in range(width)
+            if any(i < len(row) and str(row[i] or "").strip().casefold() in _ARTICLE_HEADS
+                   for row in head)]
+    article = hits[0] if len(hits) == 1 else None
+    if article is None:
+        return None
+
+    spec: dict = {"article": article + 1}
+    purchase = only(_PURCHASE.search)
+    if purchase is not None:
+        spec["purchase"] = purchase + 1
+        rrc = only(_RRC.search)
+        if rrc is not None and rrc != purchase:
+            spec["rrc"] = rrc + 1
+        return spec
+
+    # Закупки нет: источником берём ТОЛЬКО то, что прямо названо розницей. Лист с одной РРЦ
+    # (у FLOOR SERVICE «ПОДЛОЖКА И ПЛИНТУС») остаётся модели: РРЦ ли это сверять как есть
+    # или считать из неё закупку по скидке — решение, а не чтение шапки.
+    rub = only(lambda t: bool(_RETAIL.search(t)) and not _CURRENCY.search(t))
+    cur = only(lambda t: bool(_RETAIL.search(t)) and bool(_CURRENCY.search(t)))
+    if rub is not None:
+        spec["retail"] = rub + 1
+    if cur is not None:
+        spec["retail_cur"] = cur + 1
+    return spec if len(spec) > 1 else None
+
+
 def _index(rows, raw) -> int | None:
     if isinstance(raw, bool):
         return None

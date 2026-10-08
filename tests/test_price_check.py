@@ -195,3 +195,60 @@ class FlatPriceWithoutArticlesTest(unittest.TestCase):
         diff = pc.compare(items, {"3309": {"purchase": Decimal("2000")},
                                   "R1": {"purchase": Decimal("9999")}})
         self.assertIn("1 000 → 2 000", diff.changed[0])
+
+
+#: Шапка Кераматики, как она лежит в файле: в четыре строки, цены — объединёнными ячейками.
+KERAMATIKA = [
+    ["Прайс-лист на 1 октября 2026 г"],
+    [],
+    ["Ценовая группа", "", "", "", "Розничная цена в рублях", "Розничная цена в евро",
+     "Склад ответственного хранения"],
+    ["Фабрика", "Бренд", "Коллекция", "Артикул", "руб.", "EUR"],
+    ["", "", "", "", "Включает НДС", "Включает НДС"],
+    ["", "", "", "", "Цена", "Цена", "Свободный остаток"],
+    ["ABK", "ABK", "Eco Chic", "4938", "", "49.59", "13.44"],
+    ["ABK", "ABK", "Eco Chic", "4940", "", "49.59", "10.8"],
+]
+
+
+class GuessColumnsTest(unittest.TestCase):
+    """Колонки по шапке — когда модель их не назвала (бой 08.10.2026: 46 сверок Кераматики
+    без единой задачи по ценам)."""
+
+    def test_retail_only_price_list(self):
+        self.assertEqual(pc.guess_columns(KERAMATIKA),
+                         {"article": 4, "retail": 5, "retail_cur": 6})
+
+    def test_the_guess_is_resolved_like_a_named_one(self):
+        cols = pc.resolve_columns(KERAMATIKA, pc.guess_columns(KERAMATIKA))
+        self.assertTrue(cols.from_retail)
+        self.assertEqual(cols.retail_cur, 5)
+
+    def test_purchase_and_rrc(self):
+        rows = [["Артикул", "Наименование", "Цена опт", "РРЦ"],
+                ["A1", "Дуб", "1000", "1500", "1"]]
+        self.assertEqual(pc.guess_columns(rows), {"article": 1, "purchase": 3, "rrc": 4})
+
+    def test_purchase_wins_over_retail(self):
+        """Есть закупка — розница не нужна: сверяем то, что поставщик назвал закупкой."""
+        rows = [["Артикул", "Закупка", "Розница"], ["A1", "1000", "1500", "9"]]
+        self.assertEqual(pc.guess_columns(rows), {"article": 1, "purchase": 2})
+
+    def test_two_candidates_mean_none(self):
+        """«Самовывоз» и «с доставкой» у Линдервуда — выбор человека, не шаблона."""
+        rows = [["Артикул", "Опт самовывоз", "Опт с доставкой"], ["A1", "1000", "1100", "1"]]
+        self.assertIsNone(pc.guess_columns(rows))
+
+    def test_rrc_alone_is_left_to_the_model(self):
+        """Сверять ли РРЦ как есть или считать из неё закупку по скидке — решение."""
+        rows = [["Артикул", "Наименование", "РРЦ"], ["A1", "Дуб", "1500", "1", "2"]]
+        self.assertIsNone(pc.guess_columns(rows))
+
+    def test_article_must_match_exactly(self):
+        """«Код производителя» и «Артикул поставщика» рядом: по вхождению колонка уехала бы
+        не туда."""
+        rows = [["Артикул поставщика", "Код", "Цена опт"], ["A1", "K1", "1000", "1", "2"]]
+        self.assertIsNone(pc.guess_columns(rows))
+
+    def test_no_header_no_guess(self):
+        self.assertIsNone(pc.guess_columns([["A1", "100", "200", "300"]]))

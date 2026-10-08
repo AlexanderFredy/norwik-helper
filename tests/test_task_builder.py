@@ -426,11 +426,41 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(again["цены"]["совпадают"], 1)
 
     async def test_without_columns_the_answer_says_so(self):
-        """Молчаливое «совпадают: 0» агент прочёл бы как «менять нечего»."""
-        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx",
-                                 onec=self.onec([self.nom("R1", "3309")]))
-        got = await self.compare(tools, ["3309"])
+        """Молчаливое «совпадают: 0» агент прочёл бы как «менять нечего». Шапка «Цена» без
+        пояснения — что это, закупка или розница, код не решает."""
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx",
+                                 onec=self.onec([self.nom("R1", "LE-263")]))
+        got = await self.compare(tools, ["LE-263"])
         self.assertIn("колонки_не_названы", got["цены"])
+
+    async def test_unnamed_columns_are_read_from_an_unambiguous_header(self):
+        """БОЙ 08.10.2026: на все 46 сверок Кераматики модель колонок не назвала, хотя каждый
+        ответ просил, — и ни одной задачи по ценам. Шапка «Дилерская / РРЦ» однозначна:
+        прочитать её — работа кода, а модели сказано, какими колонками сверено."""
+        from src.onec.client import Price
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "3309", purchase=Price(1400, None), rrc=Price(2370, None))]))
+        await tools.execute("read_price", {})
+        got = await self.compare(tools, ["3309"])
+
+        self.assertEqual(len(got["цены"]["расходятся"]), 1)
+        self.assertIn("Дилерская", got["цены"]["колонки_цен_определил_код"]["purchase"])
+        self.assertIn("Ламинат", tools._price_cols, "определённое запомнится у формата")
+
+    async def test_remembered_columns_are_used_even_if_the_model_forgot_them(self):
+        """Запомненные колонки показывались модели в листе, но сверка их не брала, если
+        модель их не повторила."""
+        from src.onec.client import Price
+        tools = TaskBuilderTools(
+            workbook(), "Прайс.xlsx",
+            onec=self.onec([self.nom("R1", "LE-263", purchase=Price(1000, None))]),
+            known_columns={"Ламинат": {"article": "Артикул", "purchase": "Цена"}})
+        await tools.execute("read_price", {})
+        got = await self.compare(tools, ["LE-263"])
+
+        self.assertEqual(len(got["цены"]["расходятся"]), 1)
+        self.assertNotIn("колонки_цен_определил_код", got["цены"],
+                         "это решение человека или прошлой сборки, а не догадка кода")
 
     async def test_broken_search_is_not_passed_off_as_an_empty_base(self):
         """СЛУЧАЙ С БОЯ (22.09.2026). 1С отвечала 500 на любой запрос с артикулом, код
@@ -495,10 +525,13 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
     async def test_missing_price_in_1c_is_seen_without_the_file(self):
         """СЛУЧАЙ С БОЯ (22.09.2026): у «Классик» (A+ Floor) не было ни закупки, ни РРЦ ни
         у одной из восьми позиций. Ответ «колонки цен не названы» звучал как «сверить
-        нечем», и задача не заводилась — хотя для такого вывода прайс не нужен вовсе."""
-        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx",
-                                 onec=self.onec([self.nom("R1", "3309")]))
-        got = await self.compare(tools, ["3309"])
+        нечем», и задача не заводилась — хотя для такого вывода прайс не нужен вовсе.
+
+        Книга — со шапкой, по которой колонки не определить («Цена» без пояснения): иначе
+        их прочтёт код, и пустая цена придёт обычным расхождением."""
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx",
+                                 onec=self.onec([self.nom("R1", "LE-263")]))
+        got = await self.compare(tools, ["LE-263"])
         self.assertEqual(got["цены"]["без_цены_в_1С"], 1)
         self.assertIn("задачу заводи", got["цены"]["вывод"])
 
