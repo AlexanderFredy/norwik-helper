@@ -1578,5 +1578,40 @@ class CollectionCodeTest(unittest.TestCase):
         t = self.tools([self.Item("r1", "Naturale", "YO-2")])
         self.assertEqual(t._collection_code("000000104", "Миллениум Про"), "")
 
+
+class SlowOnecTest(unittest.IsolatedAsyncioTestCase):
+    """Медленная 1С не имеет права замораживать бот (бой 08.10.2026).
+
+    Инструменты сборщика синхронные и ходили в 1С прямо из цикла событий: выгрузка марки
+    по VPN шла минутами, и всё это время молчали Telegram, опрос очереди 1С и прерывание
+    сборки. Проверяем, что пока инструмент ждёт 1С, цикл событий живёт.
+    """
+
+    async def test_the_event_loop_keeps_running_while_1c_is_slow(self):
+        import asyncio
+        import time
+
+        class SlowOnec(FakeOnec):
+            def selling_tm(self, all_marks=False):
+                time.sleep(0.3)                     # «ответ по VPN»
+                return super().selling_tm(all_marks)
+
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=SlowOnec())
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        beat = asyncio.ensure_future(heartbeat())
+        try:
+            await tools.execute("get_selling_tm", {})
+        finally:
+            beat.cancel()
+        self.assertGreater(ticks, 10, "пока 1С отвечала, цикл событий стоял")
+
+
 if __name__ == "__main__":
     unittest.main()

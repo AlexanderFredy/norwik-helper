@@ -547,19 +547,24 @@ class TaskBuilderTools:
         return chosen
 
     async def execute(self, name: str, inp: dict):
+        """Инструменты синхронные, и ходят в 1С — поэтому исполняются В ПОТОКЕ.
+
+        Прежде они звались прямо из цикла событий, и выгрузка марки по VPN (минуты) замораживала
+        ВЕСЬ бот: Telegram не отвечал, очередь 1С не опрашивалась, форма писала «агент не
+        отвечает», а прерывание сборки было некому услышать (бой 08.10.2026: одиннадцать минут
+        тишины между двумя кругами по Кераматике). Состояние набора инструментов поток не
+        делит ни с кем: ручной цикл зовёт их строго по одному.
+        """
+        handlers = {"read_price": self._read, "get_selling_tm": lambda _: self._tm(),
+                    "compare_with_1c": self._compare, "add_task": self._add}
+        handler = handlers.get(name)
+        if handler is None:
+            return f"Неизвестный инструмент: {name}"
         try:
-            if name == "read_price":
-                return self._read(inp)
-            if name == "get_selling_tm":
-                return self._tm()
-            if name == "compare_with_1c":
-                return self._compare(inp)
-            if name == "add_task":
-                return self._add(inp)
+            return await asyncio.to_thread(handler, inp)
         except Exception as exc:                        # noqa: BLE001
             logger.exception("Инструмент %s сорвался", name)
             return f"Ошибка инструмента: {exc}"
-        return f"Неизвестный инструмент: {name}"
 
     # ------------------------------------------------------------ инструменты
 
