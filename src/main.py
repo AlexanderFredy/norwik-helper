@@ -280,6 +280,22 @@ async def main() -> None:
                                      "rate": price.supplier_price.rate},
                            note=note)
 
+    shapes: dict[str, bool] = {}
+
+    def _retail_only(price, content) -> bool:
+        """Только ли розница в прайсе (закупки нет). Помним по файлу: прайс Артисаны —
+        12 870 строк, и разбирать его заново на каждую из десятков задач незачем."""
+        from src.model import dealer_price
+        from src.model.intake import read_signature
+        from src.price_tool.parser import non_empty_rows
+
+        key = price.supplier_price.file_path or str(price.id)
+        if key not in shapes:
+            _, sheets = read_signature(content, price.supplier_price.filename)
+            shapes[key] = any(dealer_price.shape(non_empty_rows(s)).retail_only
+                              for s in sheets)
+        return shapes[key]
+
     async def run_task(price, task, content, guard):
         """Выполнение задачи агентом (§6.2) — С НАСТОЯЩЕЙ ЗАПИСЬЮ в 1С.
 
@@ -305,6 +321,14 @@ async def main() -> None:
         try:
             from src.model.dealer_price import Terms
 
+            # ТОЛЬКО ДЛЯ ПРАЙСА БЕЗ ЗАКУПКИ (бой 10.10.2026, Артисана). Условия собирались
+            # для ЛЮБОГО прайса, где у бренда стоит марка, — и у Артисаны, где скидки нет
+            # (0) и не нужна: закупка там колонкой «Опт». Задание получало «скидка не
+            # задана, цены писать нельзя», и 13 задач завели позиции без единой цены.
+            # Тот же признак, что у сборщика (`dealer_price.shape` по шапке листа).
+            if not _retail_only(price, content):
+                raise LookupError("закупка в прайсе есть — пересчёт из розницы не нужен")
+
             code = (task.address.tm.code or "").strip()
             marks = await supplier_store.marks_for(price.supplier_price.signature or "")
             mine = next((m for m in marks if m.tm_code and m.tm_code == code), None)
@@ -313,6 +337,8 @@ async def main() -> None:
                               rate=price.supplier_price.rate,
                               currency=price.supplier_price.currency_code,
                               currency_name=price.supplier_price.currency_name)
+        except LookupError:
+            pass
         except Exception:                               # noqa: BLE001
             logger.warning("Условия пересчёта цен не прочитаны", exc_info=True)
 
