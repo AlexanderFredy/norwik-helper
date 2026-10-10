@@ -139,6 +139,7 @@ async def main() -> None:
     norwik = NorwikClient()
     orchestrator = Orchestrator(
         api_key=config.anthropic_api_key,
+        model=config.anthropic_model,
         executor=ToolExecutor(mail, norwik, onec=onec, pricing_store=pricing_store,
                               photo_watch=photo_watch),
         # Учёт расхода токенов (§9.6.3): журнал хранилища и есть приёмник. Метки к строке

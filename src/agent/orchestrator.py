@@ -13,6 +13,33 @@ MODEL = "claude-opus-5"
 MAX_TOKENS = 16000
 MAX_ITERATIONS = 30
 
+# Модели ДО 4.6 адаптивного рассуждения не знают: на `thinking: adaptive` они отвечают 400.
+# Им рассуждение задаётся бюджетом, а веб-поиск — базовой версией инструмента. Список по
+# ПРЕФИКСУ имени: API отдаёт имя с датой («claude-haiku-4-5-20251001»).
+_BUDGET_THINKING = ("claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4-5",
+                    "claude-opus-4-1", "claude-sonnet-4-2", "claude-opus-4-2", "claude-3")
+THINKING_BUDGET = 4000          # меньше MAX_TOKENS: бюджет входит в предел ответа
+_WEB_SEARCH_BASIC = "web_search_20250305"
+
+
+def legacy_model(model: str) -> bool:
+    """Модель из тех, что до 4.6: рассуждение бюджетом, веб-поиск базовый."""
+    return str(model or "").startswith(_BUDGET_THINKING)
+
+
+def thinking_for(model: str) -> dict:
+    if legacy_model(model):
+        return {"type": "enabled", "budget_tokens": THINKING_BUDGET}
+    return {"type": "adaptive"}
+
+
+def tools_for(model: str, tools: list[dict]) -> list[dict]:
+    """Серверный веб-поиск новой версии старым моделям недоступен — подменяем на базовый."""
+    if not legacy_model(model):
+        return tools
+    return [{**t, "type": _WEB_SEARCH_BASIC}
+            if str(t.get("type", "")).startswith("web_search_") else t for t in tools]
+
 
 # На каких блоках можно ставить точку кеширования. thinking и tool_use исключены
 # намеренно: API их так не принимает.
@@ -55,10 +82,15 @@ def _cached(messages: list[dict]) -> list[dict]:
 
 
 class Orchestrator:
+    model = MODEL           # на уровне класса — для экземпляров, собранных в обход __init__
+
     def __init__(self, api_key: str, executor: ToolExecutor,
-                 on_usage: Callable[[dict], Awaitable[None]] | None = None) -> None:
+                 on_usage: Callable[[dict], Awaitable[None]] | None = None,
+                 model: str | None = None) -> None:
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
         self._executor = executor
+        self.model = model or MODEL
+        logger.info("Модель агента: %s", self.model)
         # Приёмник расхода токенов (§9.6.3). Оркестратор НЕ знает про хранилище: он отдаёт
         # голые счётчики, а метки («чей вызов», поставщик, прайс) подмешивает вызывающий —
         # там, где этот контекст и живёт.
@@ -82,7 +114,7 @@ class Orchestrator:
             usage = response.usage
             await self._on_usage({
                 **(labels or {}),
-                "model": getattr(response, "model", MODEL),
+                "model": getattr(response, "model", self.model),
                 "iteration": iteration,
                 "tools": ",".join(b.name for b in response.content
                                   if b.type == "tool_use") or None,
@@ -125,13 +157,14 @@ class Orchestrator:
         История сериализуема — её сохраняет вызывающий (§12.1 спеки).
         """
         messages = list(messages)
-        tools = (list(TOOL_DEFINITIONS) if base_tools else []) + list(extra_tools or [])
+        tools = tools_for(self.model, (list(TOOL_DEFINITIONS) if base_tools else [])
+                          + list(extra_tools or []))
 
         for iteration in range(1, MAX_ITERATIONS + 1):
             response = await self._client.messages.create(
-                model=MODEL,
+                model=self.model,
                 max_tokens=MAX_TOKENS,
-                thinking={"type": "adaptive"},
+                thinking=thinking_for(self.model),
                 system=[
                     {
                         "type": "text",

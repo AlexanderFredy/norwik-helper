@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+import re
+
 # $ за миллион токенов: (вход, выход). Снимок тарифов на сентябрь 2026 — при их изменении
 # правится только эта таблица, журнал пересчитается сам.
 PRICES: dict[str, tuple[float, float]] = {
@@ -39,6 +41,11 @@ def cost(model: str, input_tokens: int = 0, output_tokens: int = 0,
     честного пробела, ради которого и затевался учёт.
     """
     rates = PRICES.get(model)
+    if rates is None:
+        # API отдаёт имя С ДАТОЙ («claude-haiku-4-5-20251001»). Это та же модель, а не
+        # «ближайшая», поэтому снять дату можно; иначе расход Haiku показывался бы как
+        # «тариф неизвестен» ровно тогда, когда его и хотят сравнить.
+        rates = PRICES.get(re.sub(r"-\d{8}$", "", str(model or "")))
     if rates is None:
         return None
     price_in, price_out = rates

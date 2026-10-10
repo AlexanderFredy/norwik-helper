@@ -30,6 +30,9 @@ class Config:
     onec_base_url: str | None
     onec_token: str | None
     price_min_change_pct: float
+    # Модель агента. По умолчанию прежняя; переключается переменной окружения, чтобы
+    # сравнить модели на одной машине, не правя код (просьба админа 10.10.2026).
+    anthropic_model: str = "claude-opus-5"
 
 
 def load_config() -> Config:
@@ -53,4 +56,5 @@ def load_config() -> Config:
         onec_token=os.getenv("ONEC_TOKEN") or None,
         # порог значимости изменения цены, % (§9.1 спеки): меньше — не пишем
         price_min_change_pct=float(os.getenv("PRICE_MIN_CHANGE_PCT") or 2.0),
+        anthropic_model=(os.getenv("ANTHROPIC_MODEL") or "").strip() or "claude-opus-5",
     )
