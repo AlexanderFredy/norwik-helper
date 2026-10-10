@@ -26,6 +26,14 @@ PRICES: dict[str, tuple[float, float]] = {
     "claude-fable-5": (10.0, 50.0),
 }
 
+#: СТУПЕНЧАТЫЙ ТАРИФ — цена зависит от длины промпта одного запроса (тариф назвал админ
+#: 10.10.2026): модель → (граница, тариф до неё, тариф сверх неё), тарифы как в `PRICES`.
+#: Длина промпта — ВЕСЬ вход запроса: обычный, прочитанный из кеша и записанный в него.
+#: Сверх границы по старшему тарифу считается весь запрос, а не только хвост.
+TIERED: dict[str, tuple[int, tuple[float, float], tuple[float, float]]] = {
+    "claude-haiku-5-5": (100_000, (0.10, 0.50), (0.50, 2.50)),
+}
+
 # Множители к ВХОДНОМУ тарифу.
 CACHE_READ = 0.1        # чтение из кеша — десятая доля
 CACHE_WRITE_1H = 2.0    # запись в часовой кеш; пятиминутная стоила бы 1.25
@@ -40,12 +48,16 @@ def cost(model: str, input_tokens: int = 0, output_tokens: int = 0,
     Неизвестную модель НЕ приводим к ближайшей: молча заниженный или завышенный счёт хуже
     честного пробела, ради которого и затевался учёт.
     """
-    rates = PRICES.get(model)
-    if rates is None:
-        # API отдаёт имя С ДАТОЙ («claude-haiku-4-5-20251001»). Это та же модель, а не
-        # «ближайшая», поэтому снять дату можно; иначе расход Haiku показывался бы как
-        # «тариф неизвестен» ровно тогда, когда его и хотят сравнить.
-        rates = PRICES.get(re.sub(r"-\d{8}$", "", str(model or "")))
+    # API отдаёт имя С ДАТОЙ («claude-haiku-4-5-20251001»). Это та же модель, а не
+    # «ближайшая», поэтому снять дату можно; иначе расход Haiku показывался бы как
+    # «тариф неизвестен» ровно тогда, когда его и хотят сравнить.
+    names = (model, re.sub(r"-\d{8}$", "", str(model or "")))
+    rates = next((PRICES[n] for n in names if n in PRICES), None)
+    tier = next((TIERED[n] for n in names if n in TIERED), None)
+    if tier is not None:
+        edge, low, high = tier
+        prompt = input_tokens + cache_read + cache_write
+        rates = high if prompt > edge else low
     if rates is None:
         return None
     price_in, price_out = rates

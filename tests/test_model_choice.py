@@ -66,6 +66,22 @@ class CostTest(unittest.TestCase):
         self.assertAlmostEqual(cost(HAIKU, input_tokens=1_000_000), 1.0)
         self.assertAlmostEqual(cost(HAIKU, output_tokens=1_000_000), 5.0)
 
+    def test_haiku_5_5_short_prompt(self):
+        """Тариф админа 10.10.2026: до 100 тыс. токенов промпта — $0.10 / $0.50."""
+        self.assertAlmostEqual(cost("claude-haiku-5-5", input_tokens=50_000,
+                                    output_tokens=1_000), 0.0055)
+
+    def test_haiku_5_5_long_prompt_is_priced_whole_by_the_upper_tier(self):
+        """Свыше 100 тыс. — $0.50 / $2.50 за ВЕСЬ запрос. Кеш входит в длину промпта: на
+        прогоне по прайсу почти весь вход — чтение из кеша."""
+        got = cost("claude-haiku-5-5", input_tokens=2_000, cache_read=150_000,
+                   output_tokens=1_000)
+        expected = (2_000 * 0.50 + 150_000 * 0.50 * 0.1 + 1_000 * 2.50) / 1_000_000
+        self.assertAlmostEqual(got, expected)
+
+    def test_the_edge_itself_is_the_lower_tier(self):
+        self.assertAlmostEqual(cost("claude-haiku-5-5", input_tokens=100_000), 0.01)
+
     def test_unknown_model_is_still_unknown(self):
         self.assertIsNone(cost("claude-mystery-9"))
 
