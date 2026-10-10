@@ -9,7 +9,10 @@ from src.agent.tools import TOOL_DEFINITIONS, ToolExecutor
 
 logger = logging.getLogger(__name__)
 
-MODEL = "claude-opus-5"
+# Решение админа 10.10.2026: агент работает на Haiku 5.5. Окно у неё 1 млн, рассуждение
+# только адаптивное (бюджетом — 400), новый веб-поиск принимает; сверено со справочником
+# моделей API и живыми запросами. Сменить без правки кода — `ANTHROPIC_MODEL` в .env.
+MODEL = "claude-haiku-5-5"
 MAX_TOKENS = 16000
 MAX_ITERATIONS = 30
 

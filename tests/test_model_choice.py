@@ -24,8 +24,10 @@ class ThinkingTest(unittest.TestCase):
         self.assertLess(orch.THINKING_BUDGET, orch.MAX_TOKENS)
 
     def test_current_models_stay_adaptive(self):
-        for model in ("claude-opus-5", "claude-opus-5-5", "claude-sonnet-5-5",
-                      "claude-fable-5-1"):
+        # Haiku 5.5 бюджет рассуждения ОТВЕРГАЕТ (400: «thinking.type.enabled is not
+        # supported») — путать её с Haiku 4.5 нельзя, проверено живым запросом.
+        for model in ("claude-haiku-5-5", "claude-opus-5", "claude-opus-5-5",
+                      "claude-sonnet-5-5", "claude-fable-5-1"):
             self.assertEqual(orch.thinking_for(model), {"type": "adaptive"}, model)
 
 
@@ -46,9 +48,11 @@ class ToolsTest(unittest.TestCase):
 
 class ConfigTest(unittest.TestCase):
 
-    def test_default_model_is_unchanged(self):
+    def test_default_model_is_haiku_5_5(self):
+        """Решение админа 10.10.2026."""
         with mock.patch.dict(os.environ, ENV, clear=True):
-            self.assertEqual(load_config().anthropic_model, "claude-opus-5")
+            self.assertEqual(load_config().anthropic_model, "claude-haiku-5-5")
+        self.assertEqual(orch.MODEL, "claude-haiku-5-5")
 
     def test_model_comes_from_the_environment(self):
         with mock.patch.dict(os.environ, {**ENV, "ANTHROPIC_MODEL": f" {HAIKU} "}, clear=True):
