@@ -248,6 +248,41 @@ class CollectionPlan:
 # передаётся явными `*_from`/`*_to` — так у плитки, где длина «от 600 до 1200».
 
 
+#: Признак размера В САНТИМЕТРАХ: толщина меньше этой (мм так не бывает у напольных и
+#: настенных покрытий, кроме винила в 2 мм — но у него стороны за метр) при сторонах не
+#: длиннее `CM_SIDE_MAX`. Плитка «120 х 60 х 0,9» из прайса Кераматики подходит, виниловый
+#: ламинат 1220 × 180 × 2 — нет.
+CM_THICKNESS_MAX = 2.5
+CM_SIDE_MAX = 400
+_SIZE_KEYS = ("length", "length_from", "length_to", "width", "width_from", "width_to",
+              "thickness")
+
+
+def to_millimetres(raw: dict) -> tuple[dict, bool]:
+    """Размеры в полях 1С — В МИЛЛИМЕТРАХ (требование админа 10.10.2026).
+
+    Прайс Кераматики пишет «Формат» в сантиметрах («120 х 60 х 0,9»), и агент перенёс
+    числа как есть: в «Длину» встало 120 вместо 1200, в «Толщину» — 0,9 вместо 9.
+    Наименование при этом верное — в нём размер остаётся как у поставщика. Перевод делает
+    КОД, а не только просьба в промпте: ошибка в единицах тиха, и найдут её на сайте.
+
+    Переводим, ТОЛЬКО когда по числам видно, что это сантиметры (`CM_THICKNESS_MAX`,
+    `CM_SIDE_MAX`); без толщины догадываться не по чему — оставляем как пришло.
+    """
+    thickness = _num(raw.get("thickness"))
+    sides = [v for v in (_num(raw.get(k)) for k in _SIZE_KEYS[:6]) if v]
+    if not thickness or not (0 < thickness < CM_THICKNESS_MAX):
+        return raw, False
+    if not sides or max(sides) > CM_SIDE_MAX:
+        return raw, False
+    out = dict(raw)
+    for key in _SIZE_KEYS:
+        value = _num(raw.get(key))
+        if value is not None:
+            out[key] = round(value * 10, 3)
+    return out, True
+
+
 def _span(raw: dict, key: str) -> tuple[float | None, float | None]:
     exact = _num(raw.get(key))
     if exact is not None:
@@ -376,6 +411,12 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
             item_warnings.append(
                 "не передано название расцветки (title) — наименования оставил как есть")
 
+        raw, in_cm = to_millimetres(raw)
+        if in_cm:
+            mm = format_size(_num(raw.get("length")), _num(raw.get("width")),
+                             _num(raw.get("thickness")))
+            item_warnings.append(f"размеры пришли в сантиметрах — в поля записаны в "
+                                 f"миллиметрах ({mm})")
         length_from, length_to = _span(raw, "length")
         width_from, width_to = _span(raw, "width")
         wanted = {
@@ -546,6 +587,7 @@ def _collection_size(inp: dict, current: list, collection: str) -> str:
     """
     sizes = []
     for raw in inp.get("items") or []:
+        raw, _ = to_millimetres(raw)            # те же числа, что лягут в поля
         length, _ = _span(raw, "length")
         width, _ = _span(raw, "width")
         sizes.append(format_size(length, width, _num(raw.get("thickness"))))
