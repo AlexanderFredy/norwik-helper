@@ -148,6 +148,45 @@ def contaminated(item, tm_name: str, collection: str) -> bool:
     return False
 
 
+def strip_prefix(title: str, tm_name: str, collection: str) -> str:
+    """Снять марку и коллекцию с НАЧАЛА названия расцветки. Пусто — снимать нечего или
+    после снятия не осталось названия.
+
+    **ЗАЧЕМ (просьба админа 11.10.2026, задача 996).** У Atlas Concorde 273 позиции стояли
+    в «требует решения» с одной и той же картиной: коллекция «Mark», расцветка «MARK
+    IVORY», «MARK TAUPE MOSAIC» — поставщик начинал название расцветки с имени коллекции.
+    Админ дописал в задачу «почисти», но нормализацию выполняет КОД, описание он не читает,
+    и ответ не менялся.
+
+    **ТОЛЬКО НАЧАЛО И ТОЛЬКО ЦЕЛЫЕ СЛОВА.** В начале имя коллекции или марки — это повтор
+    шаблона `[марка] [коллекция] [название]`, снимать его безопасно. Внутри названия
+    («Дуб Mark Светлый») мы поняли бы строку неверно — такое по-прежнему решает человек.
+    Марка берётся обеими половинами двуязычного имени: «Atlas Concorde / Атлас конкорд».
+    """
+    words = str(title or "").split()
+    if not words:
+        return ""
+    prefixes = []
+    for name in [collection, *str(tm_name or "").split("/"), tm_name]:
+        parts = [w.casefold() for w in str(name or "").split()]
+        if parts and len("".join(parts)) >= 3:
+            prefixes.append(parts)
+    # Сначала длинные: «Boost Stone» раньше «Boost».
+    prefixes.sort(key=len, reverse=True)
+
+    changed = True
+    stripped = False
+    while changed and words:
+        changed = False
+        low = [w.casefold() for w in words]
+        for parts in prefixes:
+            if low[:len(parts)] == parts and len(words) > len(parts):
+                words = words[len(parts):]
+                changed = stripped = True
+                break
+    return " ".join(words) if stripped else ""
+
+
 def mark_words(marks) -> set[str]:
     """Слова, которыми зовутся МАРКИ, — из них и состоят заводские пометки.
 
@@ -224,7 +263,7 @@ def drop_shared(title: str, noise: set[str]) -> str:
 
 
 def plan(items, tm_code: str, tm_name: str, only_collection: str = "",
-         marks=()):
+         marks=(), notes: dict | None = None):
     """Что нормализуем и о чём докладываем.
 
     Возвращает `(входы, пропуски)`: входы — готовые словари для `plan_collection`,
@@ -237,6 +276,10 @@ def plan(items, tm_code: str, tm_name: str, only_collection: str = "",
     groups: dict[tuple[str, str], list] = {}
     skipped: list[tuple[object, str]] = []
     discontinued = 0
+    # Название расцветки, с которым позиция пойдёт в план: обычно `site_name` как есть,
+    # а у очищенных — без марки и коллекции в начале (`strip_prefix`).
+    titles: dict[str, str] = {}
+    cleaned: dict[str, int] = {}
 
     for item in items:
         # СНЯТЫЕ НЕ ТРОГАЕМ. Они лежат в невыгружаемых папках, на сайт не идут, и
@@ -259,9 +302,27 @@ def plan(items, tm_code: str, tm_name: str, only_collection: str = "",
             continue
 
         if contaminated(item, tm_name, collection):
-            skipped.append((item, Skipped.DIRTY_TITLE))
-            continue
+            # МАРКА ИЛИ КОЛЛЕКЦИЯ В НАЧАЛЕ — снимаем сами. Осталось грязным после снятия
+            # (повтор внутри названия) — решает человек, как и прежде.
+            #
+            # СВОЙ АРТИКУЛ ВПЕРЕДИ НИХ снимается первым: у Boost 96 названий вида «8B8P
+            # Boost Pearl» — без этого коллекция стояла бы уже не в начале.
+            from src.price_tool.naming import drop_own_article
+            clean = strip_prefix(drop_own_article(title, item.article) or title,
+                                 tm_name, collection)
+            probe = type("Probe", (), {"site_name": clean})()
+            if not clean or contaminated(probe, tm_name, collection):
+                skipped.append((item, Skipped.DIRTY_TITLE))
+                continue
+            removed = title[: len(title) - len(clean)].strip() if title.endswith(clean) \
+                else title
+            # В отчёт — без своего артикула: он у каждой позиции свой, и список «8B8P Boost,
+            # AMH4 Boost, …» ничего бы не сказал админу.
+            key = drop_own_article(removed, item.article) or removed
+            cleaned[key] = cleaned.get(key, 0) + 1
+            title = clean
 
+        titles[item.ref] = title
         groups.setdefault((collection, product_type), []).append(item)
 
     inputs = []
@@ -269,8 +330,7 @@ def plan(items, tm_code: str, tm_name: str, only_collection: str = "",
     for (collection, product_type), members in groups.items():
         first = members[0]
         # Шум считается ПО КОЛЛЕКЦИИ целиком: одна позиция о повторе ничего не знает.
-        noise = shared_tail(((i.site_name or "").strip() for i in members),
-                            marks)
+        noise = shared_tail((titles[i.ref] for i in members), marks)
         found_noise.update(noise)
         inputs.append({
             "tm_code": tm_code,
@@ -286,13 +346,15 @@ def plan(items, tm_code: str, tm_name: str, only_collection: str = "",
                 "article": i.article,
                 # `site_name` по §19.5 — это РОВНО название расцветки, без размера и без
                 # артикула. То есть готовый `title`, который модель собирала бы вручную.
-                "title": drop_shared((i.site_name or "").strip(), noise),
+                "title": drop_shared(titles[i.ref], noise),
                 # Размер отдаём как есть: нужен он в имени или нет, решит
                 # `plan_collection` по виду товара (`size_in_name`), а не мы.
                 "tail": (i.size or "").strip(),
             } for i in members],
         })
 
+    if notes is not None:
+        notes["cleaned"] = cleaned
     return inputs, skipped, discontinued, found_noise
 
 
@@ -322,7 +384,7 @@ def pending_work(items, tm_code: str, tm_name: str, scope=None) -> int:
 
 
 def report(written: int, skipped: list, discontinued: int, groups: int,
-           noise: set[str] | None = None) -> str:
+           noise: set[str] | None = None, cleaned: dict | None = None) -> str:
     """Короткий отчёт админу: сделанное одной строкой, разбирательства — списком."""
     lines = []
     if written:
@@ -340,6 +402,12 @@ def report(written: int, skipped: list, discontinued: int, groups: int,
     if noise:
         lines.append("Сняты повторяющиеся слова в конце названий (маркер коллекции, "
                      "а не расцветки): " + ", ".join(sorted(noise)) + ".")
+    # СНЯТОЕ В НАЧАЛЕ — НАЗЫВАЕТСЯ: решение принимал код, и админ должен видеть, что
+    # именно ушло из названий, — «MARK IVORY» стало «Ivory» не само по себе.
+    if cleaned:
+        shown = ", ".join(f"«{k}» — {v} поз." for k, v in
+                          sorted(cleaned.items(), key=lambda kv: -kv[1])[:10])
+        lines.append(f"Сняты марка/коллекция в начале названий расцветки: {shown}.")
 
     if skipped:
         by_reason: dict[str, list] = {}

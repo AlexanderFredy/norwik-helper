@@ -1254,8 +1254,10 @@ async def run_normalization(onec, task, guard, scope=None):
                        exc_info=True)
         marks = []
 
+    notes: dict = {}
     inputs, skipped, discontinued, noise = nz.plan(nom.items, tm_code, tm_name,
-                                            only_collection=only, marks=marks)
+                                            only_collection=only, marks=marks,
+                                            notes=notes)
 
     if not inputs and not skipped:
         return (TaskStatus.DONE,
@@ -1287,7 +1289,8 @@ async def run_normalization(onec, task, guard, scope=None):
     # её здесь ради админа и ради проверки «а была ли вообще работа».
     task.digest = {"нормализованы имена": written} if written else {}
 
-    text = nz.report(written, skipped, discontinued, len(inputs), noise)
+    text = nz.report(written, skipped, discontinued, len(inputs), noise,
+                     cleaned=notes.get("cleaned"))
     if failed:
         text += ("\n\nНЕ ЗАПИСАНО " + str(len(failed)) + ":\n"
                  + "\n".join(f"— {f}" for f in failed))

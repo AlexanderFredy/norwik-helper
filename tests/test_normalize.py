@@ -188,16 +188,25 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(inputs, [])
         self.assertEqual(skipped[0][1], nz.Skipped.NO_TITLE)
 
-    def test_contaminated_title_goes_to_the_admin(self):
-        """Марка внутри названия расцветки попала бы в имя дважды."""
+    def test_mark_at_the_start_is_stripped(self):
+        """Решение админа 11.10.2026: марка В НАЧАЛЕ названия — повтор шаблона, снимаем
+        сами (прежде позиция уходила админу)."""
         inputs, skipped, _, _ = nz.plan([item(site="Most Flooring Бах")],
                                      "000000311", "Most Flooring")
-        self.assertEqual(inputs, [])
-        self.assertEqual(skipped[0][1], nz.Skipped.DIRTY_TITLE)
+        self.assertEqual(skipped, [])
+        self.assertEqual(inputs[0]["items"][0]["title"], "Бах")
 
-    def test_collection_inside_the_title_is_caught_too(self):
+    def test_collection_at_the_start_is_stripped_too(self):
         inputs, skipped, _, _ = nz.plan([item(site="Миллениум Про Бах")],
                                      "000000311", "Most Flooring")
+        self.assertEqual(skipped, [])
+        self.assertEqual(inputs[0]["items"][0]["title"], "Бах")
+
+    def test_mark_inside_the_title_still_goes_to_the_admin(self):
+        """Внутри названия марка попала бы в имя дважды, и что лишнее — неизвестно."""
+        inputs, skipped, _, _ = nz.plan([item(site="Бах Most Flooring")],
+                                     "000000311", "Most Flooring")
+        self.assertEqual(inputs, [])
         self.assertEqual(skipped[0][1], nz.Skipped.DIRTY_TITLE)
 
     def test_short_words_do_not_block_normalization(self):
@@ -351,6 +360,60 @@ class FolderSizeTest(unittest.IsolatedAsyncioTestCase):
         written = {op["ref"]: op["name"]
                    for pack in onec.writes for op in pack if op.get("name")}
         self.assertEqual(written.get("A2"), "Ламинат A+ Floor Ле Паркет Тироль")
+
+
+class PrefixCleanTest(unittest.TestCase):
+    """Марка/коллекция в НАЧАЛЕ названия расцветки снимается кодом (просьба админа
+    11.10.2026, задача 996: 273 позиции Atlas Concorde вида «MARK IVORY» в коллекции Mark)."""
+
+    def test_collection_at_the_start_is_stripped(self):
+        self.assertEqual(nz.strip_prefix("MARK IVORY", "Atlas Concorde / Атлас конкорд",
+                                         "Mark"), "IVORY")
+        self.assertEqual(nz.strip_prefix("MARK TAUPE MOSAIC", "Atlas Concorde", "Mark"),
+                         "TAUPE MOSAIC")
+
+    def test_mark_and_collection_both(self):
+        self.assertEqual(nz.strip_prefix("Atlas Concorde Boost Stone Grey",
+                                         "Atlas Concorde / Атлас конкорд", "Boost Stone"),
+                         "Grey")
+
+    def test_nothing_left_means_no_cleaning(self):
+        self.assertEqual(nz.strip_prefix("Mark", "Atlas Concorde", "Mark"), "")
+
+    def test_inside_is_left_to_the_admin(self):
+        self.assertEqual(nz.strip_prefix("Дуб Mark Светлый", "Atlas Concorde", "Mark"), "")
+
+    def test_whole_words_only(self):
+        """«Marketing» — не «Mark»."""
+        self.assertEqual(nz.strip_prefix("Marketing Grey", "Atlas Concorde", "Mark"), "")
+
+    def test_plan_normalizes_instead_of_skipping(self):
+        notes = {}
+        inputs, skipped, _, _ = nz.plan(
+            [item(site="MARK IVORY", collection="Mark")], "000000115",
+            "Atlas Concorde / Атлас конкорд", notes=notes)
+        self.assertEqual(skipped, [])
+        self.assertEqual(inputs[0]["items"][0]["title"], "IVORY")
+        self.assertEqual(notes["cleaned"], {"MARK": 1})
+
+    def test_own_article_before_the_collection_is_stripped_too(self):
+        """Boost: «8B8P Boost Pearl» — свой артикул, затем коллекция, затем расцветка."""
+        notes = {}
+        inputs, skipped, _, _ = nz.plan(
+            [item(site="8B8P Boost Pearl", collection="Boost", article="8B8P")],
+            "000000115", "Atlas Concorde", notes=notes)
+        self.assertEqual(skipped, [])
+        self.assertEqual(inputs[0]["items"][0]["title"], "Pearl")
+        self.assertEqual(notes["cleaned"], {"Boost": 1})
+
+    def test_still_dirty_after_stripping_goes_to_the_admin(self):
+        inputs, skipped, _, _ = nz.plan(
+            [item(site="Mark Grey Mark", collection="Mark")], "000000115", "Atlas Concorde")
+        self.assertEqual(len(skipped), 1)
+
+    def test_report_names_what_was_stripped(self):
+        text = nz.report(5, [], 0, 1, cleaned={"MARK": 5})
+        self.assertIn("«MARK» — 5 поз.", text)
 
 
 class DiscontinueTest(unittest.IsolatedAsyncioTestCase):
