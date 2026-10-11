@@ -29,7 +29,8 @@ from dataclasses import dataclass, field
 
 from src.price_tool import discontinued
 from src.price_tool.naming import (collection_case, collection_from_folder,
-                                   drop_own_article, ensure_type_prefix, folder_name,
+                                   drop_own_article, drop_zero_size, ensure_type_prefix,
+                                   folder_name,
                                    format_size, size_in_folder, size_in_name, tidy,
                                    title_case, tm_for_name, uniform_size, violations)
 
@@ -109,7 +110,7 @@ def build_name(product_type: str, tm: str, collection: str, title: str,
     # имя.
     # Марка берётся В ФОРМЕ ДЛЯ ИМЕНИ: двуязычное «Westerhof / Вестерхоф» в наименовании
     # даёт обе формы подряд вместе с косой чертой.
-    parts = [tm_for_name(tm), coll, title_case(title), tail]
+    parts = [tm_for_name(tm), coll, title_case(title), drop_zero_size(tail)]
     body = " ".join(p for p in (str(x or "").strip() for x in parts) if p)
     return tidy(ensure_type_prefix(body, product_type))
 
@@ -121,7 +122,7 @@ def site_name(title: str, tail: str = "") -> str:
     сюда тоже не дописывается — на боевой базе он там оказался и был убран как отсебятина.
     """
     return tidy(" ".join(p for p in (title_case(str(title or "").strip()),
-                                     str(tail or "").strip()) if p))
+                                     drop_zero_size(tail)) if p))
 
 
 @dataclass(frozen=True)

@@ -358,15 +358,30 @@ def format_size(length, width, thickness=None) -> str:
     """`ДxШxТ` в мм. Пусто, если нет длины или ширины — половина размера бессмысленна.
 
     Толщина необязательна: у обоев её не заполняют вовсе, у керамики — только когда она
-    явно указана в прайсе (§19.5).
+    явно указана в прайсе (§19.5). НОЛЬ — ТОЖЕ «НЕ УКАЗАНА»: незаполненное числовое поле
+    1С приходит нулём, и строка «0» прежде считалась значением — отсюда «1500x750x0».
     """
     parts = [_num(length), _num(width)]
-    if not all(parts):
+    if not all(parts) or "0" in parts:
         return ""
     thick = _num(thickness)
-    if thick:
+    if thick and thick != "0":
         parts.append(thick)
     return "x".join(parts)
+
+
+#: Нулевая часть размера в КОНЦЕ размерной группы: «1500x750x0», «60х60х0,0», «1500*750*0».
+_ZERO_PART = re.compile(r"(?<=\d)\s*[xх×*]\s*0(?:[.,]0+)?(?![\d.,])", re.I)
+
+
+def drop_zero_size(text: str | None) -> str:
+    """Размер без нулевой части: «1500x750x0» → «1500x750» (просьба админа 11.10.2026).
+
+    Ноль приходит из 1С: размер для имени она собирает из полей, и незаполненная толщина
+    даёт «x0». Такой хвост в наименовании — не размер, а пустое поле. Снимается только
+    ноль ЦЕЛИКОМ после «x»: «1500x750x10» и «x0,5» остаются как есть.
+    """
+    return " ".join(_ZERO_PART.sub("", str(text or "")).split())
 
 
 def uniform_size(sizes) -> str:
@@ -385,7 +400,7 @@ def uniform_size(sizes) -> str:
 def folder_name(collection: str | None, size: str | None = None) -> str:
     """Имя папки коллекции: `Vintage 1290x190x8`. Без размера — просто имя коллекции."""
     name = collection_case(collection)
-    tail = " ".join(str(size or "").split())
+    tail = drop_zero_size(size)
     return f"{name} {tail}".strip() if tail else name
 
 
@@ -405,10 +420,12 @@ def collection_from_folder(folder: str | None, size: str | None = None) -> str:
     «Формат 3D».
     """
     name = " ".join(str(folder or "").split())
-    tail = " ".join(str(size or "").split())
-    if not tail or not name.endswith(tail):
-        return name
-    return name[: -len(tail)].strip()
+    # Хвост узнаём в ОБОИХ видах: папки, заведённые до 11.10.2026, могли получить размер с
+    # нулевой толщиной («… 1500x750x0»), новые — уже без неё.
+    for tail in dict.fromkeys((" ".join(str(size or "").split()), drop_zero_size(size))):
+        if tail and name.endswith(tail):
+            return name[: -len(tail)].strip()
+    return name
 
 # --- СВОЙ артикул в наименовании ------------------------------------------------------
 #
