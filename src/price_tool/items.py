@@ -29,7 +29,8 @@ from dataclasses import dataclass, field
 
 from src.price_tool import discontinued
 from src.price_tool.naming import (collection_case, collection_from_folder,
-                                   drop_own_article, drop_zero_size, ensure_type_prefix,
+                                   drop_own_article, drop_own_size, drop_zero_size,
+                                   ensure_type_prefix,
                                    folder_name,
                                    format_size, size_in_folder, size_in_name, tidy,
                                    title_case, tm_for_name, uniform_size, violations)
@@ -365,6 +366,26 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
         was = by_ref.get(ref) if op == "update" else None
 
         item_warnings: list[str] = []
+
+        # СВОЙ РАЗМЕР В НАЗВАНИИ РАСЦВЕТКИ — СНИМАЕМ (просьба админа 11.10.2026,
+        # YO-00073555 «Calacatta Meraviglia 120x278 - 6mm Lapp.»). Размеры — из того, что
+        # ляжет в поля, а нет их во входе — из карточки 1С: так правило работает и при
+        # создании, и при нормализации, где приходит только название и хвост.
+        mm, _ = to_millimetres(raw)
+        own_l = _span(mm, "length")[0] or getattr(was, "length_from", None)
+        own_w = _span(mm, "width")[0] or getattr(was, "width_from", None)
+        own_t = _num(mm.get("thickness")) or getattr(was, "thickness", None) or None
+        cleaned, found_t = drop_own_size(title, own_l, own_w, own_t)
+        if cleaned and cleaned != title:
+            item_warnings.append(f"из названия убран размер: «{title}» → «{cleaned}»")
+            title = cleaned
+        if found_t and not own_t:
+            # Толщина стояла только в названии — переносим в поле, а не теряем; и в хвост
+            # имени, который без неё вышел бы «2780x1200».
+            raw = {**raw, "thickness": found_t}
+            if tail and drop_zero_size(tail) == format_size(own_l, own_w):
+                tail = format_size(own_l, own_w, found_t)
+            item_warnings.append(f"толщина {found_t:g} мм перенесена из названия в поле")
         # РАЗМЕР В ИМЕНИ — ТОЛЬКО У КЕРАМИКИ (§19.5). У ламината и паркета формат один на
         # всю коллекцию: в каждой карточке он повторился бы сорок раз и не сказал бы
         # ничего, а место ему в имени ПАПКИ. Отбрасываем молча — это правило, а не ошибка

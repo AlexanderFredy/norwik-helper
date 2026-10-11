@@ -374,6 +374,71 @@ def format_size(length, width, thickness=None) -> str:
 _ZERO_PART = re.compile(r"(?<=\d)\s*[xх×*]\s*0(?:[.,]0+)?(?![\d.,])", re.I)
 
 
+_NUM = r"\d+(?:[.,]\d+)?"
+#: Размер в названии: «120x278», «60 х 120 см», «1200x600x9 мм».
+_TITLE_SIZE = re.compile(rf"(?<![\w.,])({_NUM})\s*[xх×*]\s*({_NUM})(?:\s*[xх×*]\s*({_NUM}))?"
+                         r"(?:\s*(см|cm|мм|mm))?(?![\w])", re.I)
+#: Толщина в названии: «- 6mm», «6 мм», «– 9,5mm».
+_TITLE_THICK = re.compile(rf"(?:\s[-–—])?\s*({_NUM})\s*(?:mm|мм)(?![\w])", re.I)
+
+
+def _f(text) -> float:
+    return float(str(text).replace(",", "."))
+
+
+def _same(a: float, b: float) -> bool:
+    return abs(a - b) <= max(0.5, 0.01 * max(a, b))
+
+
+def drop_own_size(title: str | None, length=None, width=None,
+                  thickness=None) -> tuple[str, float | None]:
+    """Убрать из названия расцветки СВОЙ размер позиции (просьба админа 11.10.2026).
+
+    Размер у плитки пишется в конце имени отдельно (§19.5), а поставщик дублирует его в
+    названии декора: «Calacatta Meraviglia 120x278 - 6mm Lapp.» при полях 2780 × 1200 —
+    в имени выходило «…120x278 - 6mm Lapp. 2780x1200».
+
+    Снимается ТОЛЬКО СВОЙ размер: стороны совпали с полями позиции — в мм или в см, в любом
+    порядке. Чужой размер (чип мозаики «2,5x2,5» на листе 300 × 300) — это описание
+    товара, его не трогаем. Толщина «6mm» снимается, если совпала с полем, а при ПУСТОМ
+    поле — тоже снимается, но возвращается вторым значением: её надо положить в поле, а не
+    потерять.
+
+    Возвращает (название, найденная толщина для пустого поля или None).
+    """
+    text = " ".join(str(title or "").split())
+    if not text:
+        return text, None
+    sides = sorted(v for v in (length, width) if v)
+    found_thickness = None
+
+    if len(sides) == 2:
+        def own(match) -> str:
+            a, b = sorted((_f(match.group(1)), _f(match.group(2))))
+            unit = (match.group(4) or "").lower()
+            scales = (10,) if unit in ("см", "cm") else (1,) if unit in ("мм", "mm") \
+                else (1, 10)
+            if any(_same(a * s, sides[0]) and _same(b * s, sides[1]) for s in scales):
+                return " "
+            return match.group(0)
+        text = _TITLE_SIZE.sub(own, text)
+
+    def thick(match) -> str:
+        nonlocal found_thickness
+        value = _f(match.group(1))
+        if thickness and _same(value, float(thickness)):
+            return " "
+        if not thickness and found_thickness is None:
+            found_thickness = value
+            return " "
+        return match.group(0)
+    text = _TITLE_THICK.sub(thick, text)
+
+    # Висячие разделители после снятия: «Calacatta  -  Lapp.» → «Calacatta Lapp.».
+    text = re.sub(r"\s+[-–—](?=\s|$)", " ", text)
+    return " ".join(text.split()).strip(" -–—"), found_thickness
+
+
 def drop_zero_size(text: str | None) -> str:
     """Размер без нулевой части: «1500x750x0» → «1500x750» (просьба админа 11.10.2026).
 
