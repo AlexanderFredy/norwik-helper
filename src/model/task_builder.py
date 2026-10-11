@@ -94,11 +94,17 @@ def _revival_brief(items) -> str:
     """
     lines = [f"— {i.article} «{i.name}» — код 1С {i.ref}"
              + (f", сейчас в «{i.parent_name}»" if i.parent_name else "")
+             # Карточка БЕЗ артикула, найденная по описанию: артикул ей надо проставить
+             # (решение админа 11.10.2026).
+             + (f"; артикул в 1С ПУСТ — проставить {i.article}"
+                if getattr(i, "assign", False) else "")
              for i in items[:40]]
     tail = f"\n…и ещё {len(items) - 40}" if len(items) > 40 else ""
     return ("ВОЗВРАТ РАНЕЕ СНЯТОГО, не заведение заново. Эти позиции в 1С УЖЕ ЕСТЬ и лежат "
             "вне живой коллекции — создавать их повторно нельзя, получится дубль с "
-            "потерянной историей цен. Вернуть сменой родителя на папку живой коллекции:\n"
+            "потерянной историей цен. Вернуть сменой родителя на папку живой коллекции "
+            "(`write_items`, op=update: `parent_ref`, где сказано — `article`, и `title` — "
+            "наименование соберёт код по шаблону):\n"
             + "\n".join(lines) + tail)
 
 
@@ -1272,7 +1278,7 @@ class TaskBuilderTools:
         # Эти два ключа кладутся, ТОЛЬКО когда им есть что сказать. Пустой список в ответе
         # инструмента — не «ничего», а восемь десятков символов, которые поедут в каждый
         # следующий запрос: цикл ручной, история целиком.
-        revival = self._revival_note(missing_in_1c, collection)
+        revival = self._revival_note(missing_in_1c, collection, tm_code)
         if revival:
             # Уже заведены в 1С, но лежат вне живой папки — почти всегда в снятых.
             # Заводить заново нельзя: будет дубль. Описание допишет код (см. `_add`).
@@ -1455,7 +1461,78 @@ class TaskBuilderTools:
         return other, (f"артикулы этой коллекции лежат в 1С под маркой «{name}» "
                        f"({other}), а не под названной — сверка и задача адресованы ей")
 
-    def _revival_note(self, missing: list[str], collection: str) -> list[str]:
+    def _row_with_article(self, article: str) -> str:
+        """Строка прайса, где артикул стоит ОТДЕЛЬНОЙ ячейкой или целым словом."""
+        key = norm_article(article)
+        if len(key) < 3:
+            return ""
+        for sheet in self.sheets:
+            for row in sheet.rows:
+                cells = [str(c or "").strip() for c in row]
+                if any(norm_article(c) == key for c in cells if c) or any(
+                        key in {norm_article(w) for w in c.split()} for c in cells if c):
+                    return " ".join(" ".join(c for c in cells if c).split())
+        return ""
+
+    def _nameless_in_discontinued(self, missing: list[str], collection: str,
+                                  tm_code: str, taken: set[str]) -> list:
+        """Снятая карточка БЕЗ АРТИКУЛА, описание которой совпало со строкой прайса.
+
+        **РЕШЕНИЕ АДМИНА (11.10.2026).** Позицию заводили без артикула, потом унесли в
+        снятые, а поставщик её снова привёз. По артикулу её не найти — поля пусто, —
+        и агент заводил дубль. Вернуть её можно, если описание совпало В ТОЧНОСТИ:
+        коллекция, размер и название расцветки. И только когда нет другого товара с этим
+        артикулом (он уже не нашёлся `_search_1c`) и кандидат ОДИН: два похожих — значит
+        ни одного, гадать при необратимой записи нельзя.
+
+        Размер сверяется по строке прайса тем же правилом, что снимает свой размер из
+        названия (`drop_own_size`): «60x120» в прайсе и 1200 × 600 в карточке — совпадение.
+        """
+        from types import SimpleNamespace
+        from src.model.normalize import strip_prefix
+        from src.price_tool.naming import drop_own_size
+
+        cards = [i for i in self._items_cache.get(tm_code) or ()
+                 if i.not_exported and not norm_article(i.article) and i.ref not in taken]
+        if not cards:
+            return []
+        tm_name = self._tm_names.get(tm_code, "")
+        keys = _collection_keys(collection, tm_name)
+        cards = [c for c in cards if _collection_keys(collection_of(c), tm_name) & keys]
+
+        out = []
+        for line in missing:
+            article = line.split()[0] if line.split() else ""
+            row = self._row_with_article(article)
+            if not row:
+                continue
+            fits = []
+            for card in cards:
+                raw = (card.site_name or "").strip()
+                title, _ = drop_own_size(raw, card.length_from, card.width_from,
+                                         card.thickness)
+                title = strip_prefix(title, tm_name, collection_of(card)) or title
+                words = [w for w in title.casefold().split() if w]
+                if not words:
+                    continue
+                has_title = re.search(r"(?<!\w)" + r"\s+".join(map(re.escape, words))
+                                      + r"(?!\w)", row.casefold())
+                has_size = (card.length_from and card.width_from
+                            and drop_own_size(row, card.length_from, card.width_from,
+                                              card.thickness)[0] != row)
+                if has_title and has_size:
+                    fits.append(card)
+            if len(fits) == 1:
+                card = fits[0]
+                taken.add(card.ref)
+                out.append(SimpleNamespace(
+                    ref=card.ref, article=article, name=card.name, assign=True,
+                    parent_name=card.parent or "", tm=getattr(card, "tm", ""),
+                    tm_code=getattr(card, "tm_code", "") or tm_code))
+        return out
+
+    def _revival_note(self, missing: list[str], collection: str,
+                      tm_code: str = "") -> list[str]:
         """Проверить, не лежат ли «недостающие» артикулы в 1С где-то ещё (§19.11).
 
         **ЭТО ВОЗВРАТ, А НЕ ЗАВЕДЕНИЕ.** Коллекцию, которую однажды унесли в снятые,
@@ -1476,6 +1553,16 @@ class TaskBuilderTools:
             where = item.parent_name or item.tm or "вне марки"
             out.append(f"{item.article} «{item.name}» → код {item.ref}, лежит в «{where}»")
             refs.append(item)
+
+        # ПО АРТИКУЛУ НЕ НАШЛОСЬ — ПРОБУЕМ СНЯТУЮ КАРТОЧКУ БЕЗ АРТИКУЛА (решение админа
+        # 11.10.2026). Только для артикулов, которых в 1С нет нигде.
+        if tm_code:
+            seen = {norm_article(i.article) for i in refs}
+            rest = [m for m in missing if m.split() and norm_article(m.split()[0]) not in seen]
+            for card in self._nameless_in_discontinued(rest, collection, tm_code, set()):
+                out.append(f"{card.article} «{card.name}» → код {card.ref}, лежит в снятых "
+                           f"«{card.parent_name}» БЕЗ артикула — вернуть и проставить его")
+                refs.append(card)
         if refs:
             self._revivals[normalize(collection)] = refs
         return out[:40]
