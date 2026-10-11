@@ -102,7 +102,7 @@ def _revival_brief(items) -> str:
             + "\n".join(lines) + tail)
 
 
-def normalize_brief() -> str:
+def normalize_brief(items=None, tm_name: str = "") -> str:
     """Что написано в описании задачи нормализации. Текст задаёт КОД, а не модель.
 
     **ЗАЧЕМ ОТБИРАТЬ У НЕЁ ЭТО ОПИСАНИЕ.** Агент дважды выдумывал шаблон и оба раза
@@ -117,13 +117,51 @@ def normalize_brief() -> str:
 
     **Пример собирается `build_name`, а не переписан руками.** Строка из неё не разойдётся
     с тем, что код правда делает: поменяется шаблон — поменяется и описание.
+
+    **ШАБЛОН — ПО ВИДУ ТОВАРА МАРКИ** (просьба админа 11.10.2026). Один на всё «Ламинат
+    Egger Vintage Дуб Медовый» вводил в заблуждение на марке плитки: у керамики в конце
+    стоит размер. Поэтому строка на каждый вид, который у марки ЕСТЬ: размер в шаблоне —
+    ровно там, где его пишет `plan_collection` (`size_in_name`), а пример собран из
+    настоящей позиции этого вида. Выгрузки нет — прежний общий текст.
     """
-    sample = build_name("Ламинат", "Egger", "Vintage", "Дуб Медовый")
-    return ("Привести наименования марки к шаблону §19.5: "
-            f"[вид товара] [марка] [коллекция] [название] — «{sample}». "
-            "Артикул в наименованиях НЕ используется, он отдельный реквизит. "
-            "Размер дописывается только у керамики. "
-            "Сверку с шаблоном и запись выполняет код.")
+    head = ("Привести наименования марки к шаблону §19.5. Артикул в наименованиях НЕ "
+            "используется, он отдельный реквизит. Сверку с шаблоном и запись выполняет код.")
+    kinds: dict[tuple[str, str], list] = {}
+    for item in items or ():
+        if getattr(item, "not_exported", False):
+            continue
+        name = (getattr(item, "product_type", "") or "").strip()
+        if name:
+            key = (name, (getattr(item, "product_type_ref", "") or "").strip())
+            kinds.setdefault(key, []).append(item)
+
+    if not kinds:
+        sample = build_name("Ламинат", "Egger", "Vintage", "Дуб Медовый")
+        return (head + f"\n\n[вид товара] [марка] [коллекция] [название] — «{sample}». "
+                "Размер дописывается только у керамики.")
+
+    from src.model.normalize import strip_prefix
+    from src.price_tool.naming import drop_own_article, drop_zero_size, size_in_name
+
+    lines = [head, ""]
+    for (name, code), members in sorted(kinds.items(), key=lambda kv: -len(kv[1])):
+        sized = size_in_name(name, code)
+        template = "[вид товара] [марка] [коллекция] [название]" + (" [размер]" if sized
+                                                                       else "")
+        # Пример — из позиции, у которой есть и название, и (если нужен) размер.
+        sample = ""
+        for item in members:
+            collection = collection_of(item)
+            raw = (getattr(item, "site_name", "") or "").strip()
+            title = strip_prefix(drop_own_article(raw, item.article) or raw, tm_name,
+                                 collection) or raw
+            size = drop_zero_size(getattr(item, "size", "")) if sized else ""
+            if title and collection and (size or not sized):
+                sample = build_name(name, tm_name, collection, title, size)
+                break
+        lines.append(f"— {name} ({len(members)} поз.): {template}"
+                     + (f" — «{sample}»" if sample else "") + ".")
+    return "\n".join(lines)
 
 
 TOOLS = [
@@ -1851,7 +1889,10 @@ class TaskBuilderTools:
             # — два написания бренда, пометки NEW/АКЦИЯ в заголовках, — и терять это не
             # надо. Но стандартом 1С это не является, и выдавать одно за другое нельзя.
             seen = _price_notes_only(inp.get("description"))
-            description = normalize_brief()
+            # Виды товара — из выгрузки, которая УЖЕ в кеше от проверки выше; лишнего
+            # запроса к 1С описание не стоит.
+            description = normalize_brief(self._items_cache.get(mark.code or "") or (),
+                                          self._tm_names.get(mark.code or "") or tm)
             if seen:
                 description += f"\n\nЗамечено в прайсе (наблюдение агента): {seen}"
         elif item:

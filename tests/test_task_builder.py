@@ -177,6 +177,34 @@ class ToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(build_name("Ламинат", "Egger", "Vintage", "Дуб Медовый"),
                       normalize_brief())
 
+    def test_template_is_per_product_type_of_the_mark(self):
+        """Просьба админа 11.10.2026: у каждого вида товара свой шаблон, и в описании —
+        тот, что у марки есть. У керамики в конце размер, у ламината нет."""
+        from src.onec.client import NomItem
+        from src.model.task_builder import normalize_brief
+
+        def nom(ref, kind, code, site, collection, size, dead=False):
+            return NomItem(ref=ref, id="", name="", article="", unit="м2", size=size,
+                           product_type=kind, collection=collection, parent=collection,
+                           collection_ref="F", alt_units={}, purchase=None, retail=None,
+                           rrc=None, site_name=site, product_type_ref=code,
+                           not_exported=dead)
+
+        text = normalize_brief([
+            nom("1", "Керамогранит", "000000011", "MARK IVORY", "Mark", "600x600x0"),
+            nom("2", "Керамогранит", "000000011", "Chrome", "Mark", "600x600x10"),
+            nom("3", "Ламинат", "000000003", "Дуб Медовый", "Vintage", "1290x190x8"),
+            nom("4", "Обои", "000000028", "Старое", "Old", "", dead=True),
+        ], "Atlas Concorde / Атлас конкорд")
+
+        self.assertIn("Керамогранит (2 поз.): [вид товара] [марка] [коллекция] [название] "
+                      "[размер]", text)
+        self.assertIn("Ламинат (1 поз.): [вид товара] [марка] [коллекция] [название] —", text)
+        self.assertIn("«Керамогранит Atlas Concorde Mark Ivory 600x600»", text,
+                      "пример — из настоящей позиции, очищенный, без нулевой толщины")
+        self.assertNotIn("Обои", text, "снятые в описание не идут")
+        self.assertNotIn("Egger", text)
+
     async def test_prompt_forbids_judging_names_it_has_not_seen(self):
         """Выгрузки 1С у него нет — значит и судить о соответствии шаблону не по чему.
 
