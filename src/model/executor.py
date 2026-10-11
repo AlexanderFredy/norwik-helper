@@ -1652,7 +1652,7 @@ def _collection_folder(folders, subject, wanted: str, positions=()):
     return None, f"папки с именем «{wanted}» в дереве марки нет"
 
 
-def task_brief(price, task, terms=None) -> str:
+def task_brief(price, task, terms=None, purchase_in_price: bool = False) -> str:
     """Что именно предстоит сделать — одним куском для модели."""
     lines = [
         f"ЗАДАЧА №{task.id}: {task.kind.value}",
@@ -1675,6 +1675,13 @@ def task_brief(price, task, terms=None) -> str:
         else:
             lines.append("Внимание: " + dealer_price.missing(terms)
                          + " Цены по этой задаче писать нельзя.")
+    elif purchase_in_price:
+        # ЯВНО, А НЕ МОЛЧАНИЕМ (бой 11.10.2026, задача 1002). В «Прошлом результате» ниже
+        # стоит отказ старого кода: «скидка не задана, цены писать нельзя». Промолчи мы
+        # здесь — модель примет его за действующее указание и повторит.
+        lines.append("Цены: в прайсе ЕСТЬ колонка закупки — бери закупку и РРЦ прямо из "
+                     "неё, скидка дилера не нужна. Если в прошлом результате сказано, что "
+                     "цены писать нельзя, — это устарело, цены по этой задаче писать нужно.")
     subject = task.address.subject
     if subject.article:
         lines.append(f"Артикул: {subject.article}")
@@ -1689,7 +1696,7 @@ def task_brief(price, task, terms=None) -> str:
 
 async def run(orchestrator, onec, price, task, content: bytes, guard,
               scope=None, usage_labels: dict | None = None, offers=None,
-              supplier_name: str = "", terms=None):
+              supplier_name: str = "", terms=None, purchase_in_price: bool = False):
     """Выполнить задачу. Возвращает (статус, текст результата).
 
     `guard` — функция без аргументов, бросающая `WriteRefused`, если прогон потерял право
@@ -1735,7 +1742,8 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
                       subject=task.address.subject)
 
     answer, _ = await orchestrator.handle_turn(
-        [{"role": "user", "content": task_brief(price, task, terms)}],
+        [{"role": "user", "content": task_brief(price, task, terms,
+                                                purchase_in_price=purchase_in_price)}],
         system=PROMPT, extra_tools=TOOLS, extra_executor=tools,
         base_tools=False, usage_labels=usage_labels)
 

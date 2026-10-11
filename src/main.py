@@ -318,6 +318,7 @@ async def main() -> None:
         # который админ выставил в форме брендов. Не нашли — условий нет, и цены по такой
         # задаче не запишутся вовсе: лучше отказ с причиной, чем цифра наугад в боевой 1С.
         terms = None
+        purchase_in_price = False
         try:
             from src.model.dealer_price import Terms
 
@@ -327,6 +328,7 @@ async def main() -> None:
             # задана, цены писать нельзя», и 13 задач завели позиции без единой цены.
             # Тот же признак, что у сборщика (`dealer_price.shape` по шапке листа).
             if not _retail_only(price, content):
+                purchase_in_price = True
                 raise LookupError("закупка в прайсе есть — пересчёт из розницы не нужен")
 
             code = (task.address.tm.code or "").strip()
@@ -347,7 +349,7 @@ async def main() -> None:
                                        "price_doc": price.supplier_price.filename},
                          offers=sightings,
                          supplier_name=seller.name if seller else "",
-                         terms=terms)
+                         terms=terms, purchase_in_price=purchase_in_price)
 
     model = PriceListService(
         model_store, supplier_store,

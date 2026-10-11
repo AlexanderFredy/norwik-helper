@@ -80,5 +80,36 @@ class PricesReminderTest(unittest.TestCase):
         self.assertIsNotNone(tools.outcome)
 
 
+class BriefTest(unittest.TestCase):
+    """Бой 11.10.2026, задача 1002: в «Прошлом результате» стоял отказ старого кода «скидка
+    не задана, цены писать нельзя». Для прайса С ЗАКУПКОЙ задание обязано сказать прямо,
+    что цены писать нужно, — иначе модель повторит отказ."""
+
+    def brief(self, **kw):
+        from types import SimpleNamespace
+        from src.model.executor import task_brief
+        from src.model.refs import Ref, TaskAddress
+        from src.model.enums import TaskSubject
+        task = SimpleNamespace(
+            id=1002, kind=TaskKind.ADD_NEW, subject=TaskSubject.COLLECTION,
+            address=TaskAddress(tm=Ref.make(code="000000115", names=["Atlas Concorde"]),
+                                subject=Ref.make(names=["Boost Pro"]),
+                                subject_kind=TaskSubject.COLLECTION),
+            description="Завести 5 позиций",
+            result="Цены не записаны: скидка не задана, цены по этой задаче писать нельзя.")
+        price = SimpleNamespace(id=8, supplier_price=SimpleNamespace(filename="Price.xls"))
+        return task_brief(price, task, **kw)
+
+    def test_price_with_purchase_says_prices_are_due(self):
+        text = self.brief(purchase_in_price=True)
+        self.assertIn("ЕСТЬ колонка закупки", text)
+        self.assertIn("устарело", text)
+        # и стоит ВЫШЕ прошлого результата, где лежит устаревший отказ
+        self.assertLess(text.index("ЕСТЬ колонка закупки"), text.index("Прошлый результат"))
+
+    def test_nothing_is_said_without_the_flag(self):
+        self.assertNotIn("колонка закупки", self.brief())
+
+
 if __name__ == "__main__":
     unittest.main()
