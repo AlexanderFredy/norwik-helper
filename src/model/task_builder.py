@@ -2242,6 +2242,38 @@ PROMPT = """Ты — контент-менеджер интернет-магаз
 Закончив, коротко ответь, сколько задач завёл и по каким маркам."""
 
 
+def _add_normalization_by_code(tools) -> list[str]:
+    """Завести нормализацию по каждой марке прайса, где она нужна, — КОДОМ, после хода.
+
+    **РЕШАТЬ ТУТ НЕЧЕГО, И МОДЕЛИ ЭТО НЕ ДОВЕРЯЕМ** (бой 12.10.2026, прайс Эггера). Нужна ли
+    нормализация, код знает сам: `pending_work` сравнивает имена 1С с шаблоном §19.5, а
+    модель наименований 1С не видит вовсе. Решение же заводить задачу оставалось за ней — и
+    на одном и том же прайсе Haiku заводила её через раз: 11.10 задача была, 12.10 нет, без
+    единого отказа от кода. Пропущенная работа не всплывает никак, поэтому решает код.
+
+    Марки — те, по которым прошла сверка (`_touched`). Все проверки — те же, что у вызова
+    моделью (`_add`): прайс про ЭТУ марку (закрыл не меньше половины её коллекций), и
+    менять в именах есть что. Задачу, которую модель уже завела, не дублируем.
+    """
+    added: list[str] = []
+    for tm_code in list(getattr(tools, "_touched", {}) or {}):
+        if not tm_code:
+            continue
+        if any(t.kind == TaskKind.NORMALIZE_NAMES and t.address.tm.code == tm_code
+               for t in tools.collected):
+            continue
+        covered, live = tools.mark_coverage(tm_code)
+        if live and covered * 2 < live:
+            continue                # не его марка — `_add` отказал бы тем же
+        name = tools._tm_names.get(tm_code, "") or tm_code
+        before = len(tools.collected)
+        tools._add({"kind": TaskKind.NORMALIZE_NAMES.value, "tm": name,
+                    "tm_code": tm_code})
+        if len(tools.collected) > before:
+            added.append(name)
+    return added
+
+
 def _add_discontinued_candidates(tools) -> list[str]:
     """Завести задачи по коллекциям 1С, которых прайс не закрыл.
 
@@ -2645,6 +2677,17 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
                           + "\n— ".join(kept)
         except Exception:                               # noqa: BLE001
             logger.warning("Не удалось найти коллекции вне прайса", exc_info=True)
+
+    # НОРМАЛИЗАЦИЯ — ТОЖЕ КОДОМ (бой 12.10.2026): нужна ли она, знает код, а модель
+    # заводила её через раз. В потоке: выгрузка марки обычно уже в кеше от сверки, но
+    # промах кеша — это синхронный запрос в 1С, и стоять на нём всему боту нельзя.
+    if onec is not None and tools.collected is not None:
+        try:
+            added = await asyncio.to_thread(_add_normalization_by_code, tools)
+            if added:
+                logger.info("Нормализацию завёл код: %s", ", ".join(added))
+        except Exception:                               # noqa: BLE001
+            logger.warning("Не удалось завести нормализацию кодом", exc_info=True)
 
     # ЖУРНАЛ ВСТРЕЧ ПОПОЛНЯЕТСЯ ВСЕГДА — даже когда задач не вышло ни одной.
     #
