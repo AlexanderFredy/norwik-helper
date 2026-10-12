@@ -41,6 +41,12 @@ PHOTO_CALLBACK = "photo:"
 #: Глубина «недавно добавленных» по умолчанию и где её хранят (решение админа 12.10.2026).
 PHOTO_RECENT_DAYS = 180
 PHOTO_DAYS_SETTING = "photo_recent_days"
+#: Сколько ждать бренды текстом на шаге выбора категории (решение админа 12.10.2026).
+PHOTO_BRANDS_WAIT_SECONDS = 600
+#: Часть длиннее — уже не имя марки, а фраза: такое сообщение — вопрос агенту.
+PHOTO_BRAND_WORDS = 4
+#: «Да», «ок» не сопоставляются: вхождением они нашлись бы внутри чужих марок.
+PHOTO_BRAND_MIN_CHARS = 3
 #: Сколько незакрытых вопросов помнить: кнопку обычно жмут сразу, а не через сотню вопросов.
 PHOTO_REQUESTS_KEPT = 200
 
@@ -272,6 +278,9 @@ class ToolExecutor:
         # обработчик — исполнителю незачем знать про aiogram.
         self.pending_buttons: list | None = None
         self._photo_requests: dict[str, dict] = {}
+        # Кто сейчас на шаге выбора категории и может прислать бренды текстом:
+        # (чат, человек) → (номер запроса, id сообщения с кнопками, до какого момента).
+        self._photo_brand_wait: dict[tuple, tuple] = {}
 
     def use_model(self, model) -> None:
         """Подключить модель прайсов. Отдельным вызовом, а не параметром конструктора:
@@ -542,6 +551,48 @@ class ToolExecutor:
         минутный обход второй раз."""
         self._photo_requests.pop(token, None)
 
+    def await_photo_brands(self, chat_id, user_id, token: str, message_id) -> None:
+        """Шаг выбора категории: следующим сообщением человек может прислать бренды."""
+        import time
+        self._photo_brand_wait[(chat_id, user_id)] = (
+            token, message_id, time.monotonic() + PHOTO_BRANDS_WAIT_SECONDS)
+
+    def photo_brand_wait(self, chat_id, user_id) -> tuple | None:
+        """(номер запроса, id сообщения с кнопками) — если человек сейчас на этом шаге.
+        Запрос уже запущен или забыт — ждать нечего: категорию нажали."""
+        import time
+        wait = self._photo_brand_wait.get((chat_id, user_id))
+        if wait is None:
+            return None
+        token, message_id, until = wait
+        if time.monotonic() > until or token not in self._photo_requests:
+            self._photo_brand_wait.pop((chat_id, user_id), None)
+            return None
+        return token, message_id
+
+    async def set_photo_brands(self, token: str, text: str) -> tuple[list[str], list[str]]:
+        """Бренды, присланные текстом на шаге категории → (найденные марки, ненайденное).
+
+        ТЕКСТ — СПИСОК БРЕНДОВ, ТОЛЬКО ЕСЛИ ПОХОЖ НА НЕГО: короткие части через запятую, и
+        хоть одна совпала с маркой 1С. Иначе это обычный вопрос агенту, и съесть его как
+        «бренды» значило бы оставить менеджера без ответа. Ничего не нашлось — запрос не
+        трогаем.
+        """
+        request = self._photo_requests.get(token)
+        if request is None or self._onec is None:
+            return [], []
+        parts = [" ".join(p.split()) for p in re.split(r"[,;\n]+|\s+и\s+", text or "")]
+        parts = [p for p in parts if p]
+        if not parts or any(len(p.split()) > PHOTO_BRAND_WORDS for p in parts):
+            return [], []
+        marks = await asyncio.to_thread(self._onec.selling_tm)
+        picked, unknown = photo_scan.match_marks(
+            [p for p in parts if len(p) >= PHOTO_BRAND_MIN_CHARS], marks)
+        unknown += [p for p in parts if len(p) < PHOTO_BRAND_MIN_CHARS]
+        if picked:
+            request["tms"] = [m.name for m in picked]
+        return [m.name for m in picked], unknown
+
     async def photo_recent_days(self) -> int:
         """Глубина «недавно добавленных» (команда `/photo_days`). Сбой чтения — умолчание:
         из-за настройки вопрос не должен ломаться."""
@@ -600,7 +651,11 @@ class ToolExecutor:
         out: list = [text] if photo_report.fits_chat(text) else []
         if not out:
             import tempfile
-            path = Path(tempfile.gettempdir()) / f"Без фото {date.today():%d.%m.%Y}.xlsx"
+            # Категория — в имени файла (решение админа 12.10.2026): файлы по разным
+            # категориям лежат у менеджера рядом, и различать их по дате нельзя.
+            kind = f" {type_name}" if type_name else (" новые" if since else "")
+            path = (Path(tempfile.gettempdir())
+                    / f"Без фото{kind} {date.today():%d.%m.%Y}.xlsx")
             out = [f"Без фото на сайте: {len(found.rows)} поз. В чат список не влез — "
                    "отправляю файлом Excel.", photo_report.to_excel(found.rows, path)]
         if notes:

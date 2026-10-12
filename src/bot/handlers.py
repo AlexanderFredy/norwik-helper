@@ -247,6 +247,12 @@ async def photo_choice(callback: CallbackQuery, orchestrator) -> None:
         await callback.message.edit_text(
             f"Любые товары — в какой категории смотреть?{hint}",
             reply_markup=_keyboard(_category_buttons(token)))
+        # Бренды присылают обычным сообщением — их ловит `_photo_brands` до агента.
+        await_brands = getattr(executor, "await_photo_brands", None)
+        if await_brands is not None:
+            chat = getattr(getattr(callback.message, "chat", None), "id", None)
+            user = getattr(getattr(callback, "from_user", None), "id", None)
+            await_brands(chat, user, token, getattr(callback.message, "message_id", None))
         return
 
     recent = choice == "new"
@@ -346,10 +352,46 @@ async def handle_unknown_command(message: Message) -> None:
     await message.answer(f"Не знаю команду /{name}. Список — /help.")
 
 
+async def _photo_brands(message: Message, orchestrator) -> bool:
+    """Бренды, присланные на шаге выбора категории. True — сообщение разобрано здесь.
+
+    Выдача — ПЕРЕСЕЧЕНИЕ категории и брендов (решение админа 12.10.2026): бренды
+    запоминаются в запросе, а категорию человек жмёт следующей кнопкой. Сообщение, не
+    похожее на список марок, уходит агенту как обычно — иначе вопрос, заданный на этом
+    шаге, остался бы без ответа. Прямой ответ на сообщение с кнопками — всегда про бренды.
+    """
+    executor = orchestrator.executor
+    wait_for = getattr(executor, "photo_brand_wait", None)
+    wait = wait_for(message.chat.id, message.from_user.id) if wait_for else None
+    if wait is None:
+        return False
+    token, prompt_id = wait
+    reply = message.reply_to_message
+    is_reply = reply is not None and reply.message_id == prompt_id
+    picked, unknown = await executor.set_photo_brands(token, message.text)
+    if not picked:
+        if not is_reply:
+            return False
+        await message.answer("Не нашёл таких марок среди выгружаемых на сайт: "
+                             + ", ".join(f"«{u}»" for u in unknown or [message.text])
+                             + ". Напишите ещё раз или выберите категорию кнопкой выше.")
+        return True
+    text = "Марки: " + ", ".join(picked) + "."
+    if unknown:
+        text += " Не нашёл: " + ", ".join(f"«{u}»" for u in unknown) + "."
+    sent = await message.answer(text + " Теперь выберите категорию:",
+                                reply_markup=_keyboard(_category_buttons(token)))
+    executor.await_photo_brands(message.chat.id, message.from_user.id, token,
+                                getattr(sent, "message_id", None))
+    return True
+
+
 @router.message()
 async def handle_query(message: Message, orchestrator, pricing_store=None) -> None:
     if not message.text:
         await message.answer("Пожалуйста, отправьте запрос текстом или голосовым сообщением")
+        return
+    if await _photo_brands(message, orchestrator):
         return
     status_msg = await message.answer("Обрабатываю запрос...")
     await _process_query(message, message.text, orchestrator, status_msg, pricing_store)

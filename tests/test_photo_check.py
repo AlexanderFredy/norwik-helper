@@ -329,6 +329,7 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
         files = [o for o in outputs if isinstance(o, Path)]
         self.assertEqual(len(files), 1)
         self.assertTrue(str(files[0]).endswith(".xlsx"))
+        self.assertTrue(files[0].name.startswith("Без фото Ламинат "), files[0].name)
         self.assertIn("файлом Excel", _text(outputs))
         self.assertLess(len(_text(outputs)), 500, "сам список в чат не шлём")
         files[0].unlink(missing_ok=True)
@@ -393,6 +394,62 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(code for code, _ in onec.asked), ["1", "2"])
         self.assertIn("Без фото на сайте: 2 поз.", _text(outputs))
         self.assertIn("«нетакой»", _text(outputs))
+
+    # ------------------------------------------- бренды на шаге категории
+
+    def marks3(self):
+        return [TradeMark(name="Classen / Классен", code="1"),
+                TradeMark(name="Peli", code="2"),
+                TradeMark(name="Kronotex", code="3")]
+
+    async def test_brands_text_is_remembered(self):
+        onec = FakeOnec({}, marks=self.marks3())
+        ex = self.executor(onec)
+        _, token, _ = await self.ask(ex, {})
+        picked, unknown = await ex.set_photo_brands(token, "Классен, peli и нетакой")
+        self.assertEqual(picked, ["Classen / Классен", "Peli"])
+        self.assertEqual(unknown, ["нетакой"])
+        self.assertEqual(ex.photo_request(token)["tms"], ["Classen / Классен", "Peli"])
+
+    async def test_a_question_is_not_taken_for_brands(self):
+        """Обычный вопрос на этом шаге уходит агенту, а не съедается как «бренды»."""
+        ex = self.executor(FakeOnec({}, marks=self.marks3()))
+        _, token, _ = await self.ask(ex, {})
+        for text in ("а сколько стоит Classen Adventure у поставщиков сейчас", "да", "ок"):
+            picked, _ = await ex.set_photo_brands(token, text)
+            self.assertEqual(picked, [], text)
+        self.assertEqual(ex.photo_request(token)["tms"], [])
+
+    async def test_category_and_brands_intersect(self):
+        """Выдача — пересечение категории и брендов (решение админа 12.10.2026)."""
+        onec = FakeOnec({"1": [item(site_id="1001"),
+                               item(site_id="1003", type_ref="999999999")],
+                         "2": [item(site_id="1002", tm="Peli")],
+                         "3": [item(site_id="1004", tm="Kronotex")]},
+                        marks=self.marks3())
+        ex = self.executor(onec)
+        _, token, _ = await self.ask(ex, {})
+        await ex.set_photo_brands(token, "Classen, Peli")
+        request = ex.photo_request(token)
+        request.update(type_code="000000003", type_name="Ламинат")
+        verdicts = {i: photos.NONE for i in ("1001", "1002", "1003", "1004")}
+        with patch.object(photos, "PhotoChecker", FakeChecker(verdicts)):
+            outputs = await ex.photo_check(request, recent=False)
+        text = _text(outputs)
+        self.assertIn("item/1001", text)
+        self.assertIn("item/1002", text)
+        self.assertNotIn("item/1003", text, "другая категория")
+        self.assertNotIn("item/1004", text, "другой бренд")
+        self.assertEqual(sorted(c for c, _ in onec.asked), ["1", "2"])
+
+    async def test_brand_wait_ends_with_the_request(self):
+        ex = self.executor(FakeOnec({}))
+        _, token, _ = await self.ask(ex, {})
+        ex.await_photo_brands(10, 20, token, 555)
+        self.assertEqual(ex.photo_brand_wait(10, 20), (token, 555))
+        self.assertIsNone(ex.photo_brand_wait(10, 21), "другой человек")
+        ex.forget_photo_request(token)
+        self.assertIsNone(ex.photo_brand_wait(10, 20), "категорию нажали — ждать нечего")
 
     # ------------------------------------------------- «недавно добавленные»
 

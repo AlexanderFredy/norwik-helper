@@ -106,6 +106,82 @@ class PhotoChoiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("устарел", cb.message.edits[0][0])
 
 
+class BrandExecutor(FakeExecutor):
+    def __init__(self, request, picked=(), unknown=()):
+        super().__init__(request)
+        self.picked, self.unknown = list(picked), list(unknown)
+        self.waits = {}
+
+    def await_photo_brands(self, chat, user, token, message_id):
+        self.waits[(chat, user)] = (token, message_id)
+
+    def photo_brand_wait(self, chat, user):
+        return self.waits.get((chat, user))
+
+    async def set_photo_brands(self, token, text):
+        if self.picked:
+            self.requests[token]["tms"] = list(self.picked)
+        return self.picked, self.unknown
+
+
+def text_message(text, reply_to=None):
+    msg = FakeMessage()
+    msg.text = text
+    msg.chat = SimpleNamespace(id=10)
+    msg.from_user = SimpleNamespace(id=20)
+    msg.reply_to_message = SimpleNamespace(message_id=reply_to) if reply_to else None
+    msg.markups = []
+
+    async def answer(text, reply_markup=None, **_kw):
+        msg.sent.append(text)
+        msg.markups.append(reply_markup)
+        return SimpleNamespace(message_id=777)
+    msg.answer = answer
+    return msg
+
+
+class BrandStepTest(unittest.IsolatedAsyncioTestCase):
+
+    async def test_category_prompt_starts_waiting_for_brands(self):
+        ex = BrandExecutor({"type_code": "", "type_name": "", "tms": []})
+        cb = FakeCallback("photo:abcd1234:any")
+        cb.message.chat = SimpleNamespace(id=10)
+        cb.message.message_id = 555
+        cb.from_user = SimpleNamespace(id=20)
+        await handlers.photo_choice(cb, orchestrator(ex))
+        self.assertEqual(ex.waits[(10, 20)], ("abcd1234", 555))
+
+    async def test_brands_are_taken_and_categories_shown_again(self):
+        ex = BrandExecutor({"type_code": "", "type_name": "", "tms": []},
+                           picked=["Peli"], unknown=["нетакой"])
+        ex.waits[(10, 20)] = ("abcd1234", 555)
+        msg = text_message("Peli, нетакой")
+        self.assertTrue(await handlers._photo_brands(msg, orchestrator(ex)))
+        self.assertIn("Марки: Peli.", msg.sent[0])
+        self.assertIn("«нетакой»", msg.sent[0])
+        self.assertIsNotNone(msg.markups[0], "кнопки категорий рядом")
+        self.assertEqual(ex.waits[(10, 20)], ("abcd1234", 777), "ждём у нового сообщения")
+
+    async def test_not_brands_goes_to_the_agent(self):
+        ex = BrandExecutor({"type_code": "", "type_name": "", "tms": []})
+        ex.waits[(10, 20)] = ("abcd1234", 555)
+        msg = text_message("сколько стоит Classen Adventure")
+        self.assertFalse(await handlers._photo_brands(msg, orchestrator(ex)))
+        self.assertEqual(msg.sent, [])
+
+    async def test_reply_with_unknown_brands_is_answered(self):
+        """Прямой ответ на сообщение с кнопками — всегда про бренды: молчать нельзя."""
+        ex = BrandExecutor({"type_code": "", "type_name": "", "tms": []}, unknown=["Ххх"])
+        ex.waits[(10, 20)] = ("abcd1234", 555)
+        msg = text_message("Ххх", reply_to=555)
+        self.assertTrue(await handlers._photo_brands(msg, orchestrator(ex)))
+        self.assertIn("Не нашёл", msg.sent[0])
+
+    async def test_nobody_waiting(self):
+        msg = text_message("Classen")
+        self.assertFalse(await handlers._photo_brands(msg, orchestrator(BrandExecutor({}))))
+
+
 class FakeStore:
     def __init__(self):
         self.values = {}
