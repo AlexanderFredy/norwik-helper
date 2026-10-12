@@ -242,8 +242,10 @@ async def photo_choice(callback: CallbackQuery, orchestrator) -> None:
 
     if choice == "any" and not request.get("type_code"):
         # Любые товары — только в названной категории: весь каталог не обходим.
+        # Подсказка про бренды — только пока их не назвали (решение админа 12.10.2026).
+        hint = "" if request.get("tms") else " (укажите сразу список брендов)"
         await callback.message.edit_text(
-            "Любые товары — в какой категории смотреть?",
+            f"Любые товары — в какой категории смотреть?{hint}",
             reply_markup=_keyboard(_category_buttons(token)))
         return
 

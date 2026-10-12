@@ -71,10 +71,17 @@ class PhotoChoiceTest(unittest.IsolatedAsyncioTestCase):
         await handlers.photo_choice(cb, orchestrator(ex))
         self.assertEqual(ex.checked, [])
         text, markup = cb.message.edits[0]
-        self.assertIn("в какой категории", text)
+        self.assertEqual(text, "Любые товары — в какой категории смотреть? "
+                               "(укажите сразу список брендов)")
         labels = [b.text for row in markup.inline_keyboard for b in row]
         self.assertIn("Ламинат", labels)
         self.assertIsNotNone(ex.photo_request("abcd1234"), "ждём выбора категории")
+
+    async def test_no_brand_hint_when_brands_named(self):
+        ex = FakeExecutor({"type_code": "", "type_name": "", "tms": ["Classen"]})
+        cb = FakeCallback("photo:abcd1234:any")
+        await handlers.photo_choice(cb, orchestrator(ex))
+        self.assertEqual(cb.message.edits[0][0], "Любые товары — в какой категории смотреть?")
 
     async def test_category_button_runs_any(self):
         ex = FakeExecutor({"type_code": "", "type_name": "", "tms": ["Classen"]})

@@ -240,8 +240,9 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
         ex = self.executor(onec)
         answer, token, buttons = await self.ask(ex, {"product_type": "ламинат"})
         self.assertEqual(onec.asked, [])
-        self.assertIn("Выберите вариант кнопкой ниже: любые товары (укажите сразу список "
-                      "брендов) или только недавно добавленные.", answer)
+        self.assertIn("Выберите вариант кнопкой ниже: любые товары или только недавно "
+                      "добавленные.", answer)
+        self.assertNotIn("список брендов", answer)
         question, _ = ex.take_pending()
         self.assertIn("любые товары или вас интересуют только недавно добавленные", question)
         self.assertIn("(глубина поиска 180 дн)", question)
