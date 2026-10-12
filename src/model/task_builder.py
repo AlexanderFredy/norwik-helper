@@ -1163,20 +1163,51 @@ class TaskBuilderTools:
         # тогда совпадение за её пределами — это ОМОНИМ, а не та же позиция.
         tm_name = self._tm_name(tm_code)
         keys = _collection_keys(collection, tm_name)
-        own = {i.ref for i in live if _collection_keys(collection_of(i), tm_name) & keys}
+        # СВОЯ КОЛЛЕКЦИЯ УЗНАЁТСЯ И ПО ИМЕНИ ПАПКИ (бой 12.10.2026, Эггер, задача 1044).
+        # Свойство «Коллекция» и папка у одних и тех же карточек зовутся по-разному:
+        # «Classic 8-32V» против «8/32 Classic 4V», — и агент, адресуя раздел именем папки,
+        # не совпадал ни с одной карточкой.
+        own = {i.ref for i in live
+               if (_collection_keys(collection_of(i), tm_name)
+                   | _collection_keys(getattr(i, "parent", "") or "", tm_name)) & keys}
+
+        # СВОЯ КОЛЛЕКЦИЯ НЕ ОПРЕДЕЛИЛАСЬ — ЕЁ ПОКАЗЫВАЮТ ОДНОЗНАЧНЫЕ АРТИКУЛЫ РАЗДЕЛА.
+        # Если коды раздела, которые нашлись ровно одной карточкой, все лежат в ОДНОЙ
+        # коллекции, это она и есть: у Эггера четыре кода из девяти — в «Classic 8-32V», а
+        # EPL183 и ещё три стоят там же И в «8/33 Classic Aqua+» (другой размер). Без этого
+        # такие коды считались «не найдены», и агент предлагал завести их заново.
+        #
+        # Только РАЗРЕШАЕТ СПОР, а не назначает свою коллекцию: код, найденный лишь вне
+        # неё, остаётся найденным, как и раньше. Иначе правило переиграло бы случай с
+        # омонимами, где своя коллекция есть и совпадение за её пределами — чужое.
+        home = ""
+        if not own:
+            homes = {collection_of(hits[0]) for hits in
+                     (by_article.get(k) or [] for k, _ in from_price) if len(hits) == 1}
+            if len(homes) == 1:
+                home = homes.pop()
 
         found, missing_in_1c, strangers, unclear_codes = [], [], [], []
         for key, shown in from_price:
             hits = by_article.get(key) or []
             mine = [i for i in hits if i.ref in own] if own else hits
+            if home and len(mine) > 1:
+                at_home = [i for i in mine if collection_of(i) == home]
+                if len(at_home) == 1:
+                    mine = at_home
 
             if len(mine) == 1:
                 found.append(mine[0])
             elif mine:
                 # Два товара СВОЕЙ коллекции под одним артикулом — это уже не омоним, а
                 # ошибка в справочнике: выбрать наугад значит увезти цену не туда.
-                unclear_codes.append(f"{shown} → {len(mine)} карточки в этой коллекции")
-                missing_in_1c.append(shown)
+                #
+                # НО ЭТО НЕ «НЕТ В 1С» (бой 12.10.2026): товар есть, и не один. Отнеся его к
+                # ненайденным, мы получали от агента «не найдены в коллекции» и задачу
+                # завести то, что заведено дважды.
+                unclear_codes.append(
+                    f"{shown} → {len(mine)} карточки: "
+                    + ", ".join(f"{i.ref} ({collection_of(i) or i.parent})" for i in mine))
             else:
                 missing_in_1c.append(shown)
             strangers.extend(i for i in hits if i not in mine)

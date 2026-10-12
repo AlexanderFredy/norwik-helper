@@ -371,12 +371,12 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         return Fake()
 
     def nom(self, ref, article, site="Бах", collection="Vintage", props=(),
-            not_exported=False, purchase=None, rrc=None):
+            not_exported=False, purchase=None, rrc=None, parent=None):
         from src.onec.client import ItemProperty, NomItem
         return NomItem(
             ref=ref, id="", name=f"Ламинат Egger {collection} {site}", article=article,
             unit="м2", size="", product_type="Ламинат", collection=collection,
-            parent=collection, collection_ref="F1", alt_units={},
+            parent=parent or collection, collection_ref="F1", alt_units={},
             purchase=purchase, retail=None, rrc=rrc, site_name=site,
             product_type_ref="000000003", not_exported=not_exported,
             properties=tuple(ItemProperty(property=p, code="", value=v, value_code="")
@@ -832,7 +832,37 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(got["нашлось_в_1С"], 0)
         self.assertEqual(got["артикул_не_различает_позиции"],
-                         ["6006-4 → 2 карточки в этой коллекции"])
+                         ["6006-4 → 2 карточки: S1 (Spark), S2 (Spark)"])
+        # Товар ЕСТЬ, и не один — это не «нет в 1С» (бой 12.10.2026, задача 1044): иначе
+        # агент предлагал завести то, что заведено дважды.
+        self.assertEqual(got["missing_in_1c"], [])
+
+    async def test_section_collection_breaks_the_tie(self):
+        """Эггер, задача 1044: агент назвал раздел не так, как в 1С, своя коллекция не
+        определилась, и коды, лежащие ещё и в соседней коллекции другого размера,
+        считались «не найдены». Однозначные коды раздела показывают его коллекцию."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("C1", "EPL177", site="Дуб Чезена", collection="Classic 8-32V"),
+            self.nom("C2", "EPL205", site="Дуб Ла Мора", collection="Classic 8-32V"),
+            self.nom("C3", "EPL183", site="Дуб Шерман", collection="Classic 8-32V"),
+            self.nom("L3", "EPL183", site="Дуб Шерман", collection="Large Aqua+"),
+        ], tm="Egger / Эггер"))
+        got = await self.compare(tools, ["EPL177", "EPL205", "EPL183"],
+                                 collection="8/32 Классик")
+        self.assertEqual(got["нашлось_в_1С"], 3)
+        self.assertEqual(got["missing_in_1c"], [])
+
+    async def test_folder_name_identifies_the_own_collection(self):
+        """Свойство «Classic 8-32V», папка «8/32 Classic 4V» — агент адресует папкой."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("C3", "EPL183", site="Дуб Шерман", collection="Classic 8-32V",
+                     parent="8/32 Classic 4V"),
+            self.nom("L3", "EPL183", site="Дуб Шерман", collection="Large Aqua+",
+                     parent="8/33 Classic Aqua+"),
+        ], tm="Egger / Эггер"))
+        got = await self.compare(tools, ["EPL183"], collection="8/32 Classic 4V")
+        self.assertEqual(got["нашлось_в_1С"], 1)
+        self.assertEqual(got["missing_in_1c"], [])
 
     async def test_article_match_stands_when_the_collection_is_named_otherwise(self):
         """Most Flooring: в 1С «Millenium Pro», в прайсе «Миллениум Про». Коллекции с
