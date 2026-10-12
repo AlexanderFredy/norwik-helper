@@ -240,13 +240,19 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
         ex = self.executor(onec)
         answer, token, buttons = await self.ask(ex, {"product_type": "ламинат"})
         self.assertEqual(onec.asked, [])
-        self.assertIn("кнопк", answer)
+        self.assertIn("Выберите вариант кнопкой ниже: любые товары (укажите сразу список "
+                      "брендов) или только недавно добавленные.", answer)
         question, _ = ex.take_pending()
         self.assertIn("любые товары или вас интересуют только недавно добавленные", question)
         self.assertIn("(глубина поиска 180 дн)", question)
         self.assertIn("«Ламинат»", question)
         self.assertEqual([row[0][1] for row in buttons],
                          [f"photo:{token}:any", f"photo:{token}:new"])
+
+    async def test_no_brand_hint_when_brands_named(self):
+        answer, _, _ = await self.ask(self.executor(FakeOnec({})), {"tms": ["Classen"]})
+        self.assertIn("любые товары или только недавно добавленные", answer)
+        self.assertNotIn("список брендов", answer)
 
     async def test_depth_comes_from_the_setting(self):
         ex = self.executor(FakeOnec({}), FakeSettings({"photo_recent_days": "90"}))
