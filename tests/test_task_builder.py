@@ -851,6 +851,9 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
                                  collection="8/32 Классик")
         self.assertEqual(got["нашлось_в_1С"], 3)
         self.assertEqual(got["missing_in_1c"], [])
+        # Задача 1046: соседняя карточка найденного кода в «омонимы» не идёт — агент
+        # верил этому списку больше, чем числу найденных, и заводил позицию заново.
+        self.assertNotIn("артикулы_заняты_другой_коллекцией", got)
 
     async def test_folder_name_identifies_the_own_collection(self):
         """Свойство «Classic 8-32V», папка «8/32 Classic 4V» — агент адресует папкой."""
