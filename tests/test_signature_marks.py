@@ -600,7 +600,11 @@ class BackfillTest(unittest.IsolatedAsyncioTestCase):
         бы заново при каждом перезапуске бота."""
         await self.add_file(self.workbook([["Артикул", "Цена"], ["A1", 100]]))
         self.assertEqual(await self.run_fill(), 1)
-        self.assertEqual(await self.store.marks_for("hash-1"), [])
+        # Брендов нет — есть только строка «бренд прайса» под марку и комментарий админа
+        # (решение 12.10.2026).
+        from src.storage.suppliers import PRICE_BRAND
+        self.assertEqual([m.brand for m in await self.store.marks_for("hash-1")],
+                         [PRICE_BRAND])
         self.assertTrue(await self.store.brand_scanned("hash-1"))
         self.assertIsNone(await self.store.brand_col_for("hash-1"))
         self.assertEqual(await self.run_fill(), 0)

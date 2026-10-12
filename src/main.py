@@ -168,6 +168,14 @@ async def main() -> None:
     with_brands = await fill_brand_lists(supplier_store, known_marks, read_logos)
     if with_brands:
         logger.info("Бренды форматов дозаполнены: %d", with_brands)
+    # Строка «бренд прайса» у форматов без брендов — под марку и комментарий админа.
+    try:
+        placeholders = await supplier_store.ensure_price_brands()
+        if placeholders:
+            logger.info("Форматам без брендов добавлена строка «бренд прайса»: %d",
+                        placeholders)
+    except Exception:                                   # noqa: BLE001
+        logger.warning("Строки «бренд прайса» не заведены", exc_info=True)
 
     async def build_tasks(content, filename, price):
         """Список задач составляет агент (§6.1). Метки расхода — как у прайсового
@@ -245,6 +253,8 @@ async def main() -> None:
         except Exception:                               # noqa: BLE001
             logger.warning("Скидки формата %s не прочитаны", signature[:12], exc_info=True)
 
+        admin_notes = await _admin_notes(signature)
+
         async def note(text):
             """Что разобрали и что пропустили — сообщением админу. Отдельно от задач:
             по их списку не видно, обошли прайс целиком или треть его."""
@@ -275,10 +285,30 @@ async def main() -> None:
                            remember_columns=remember_columns,
                            only_sheets=only_sheets, only_marks=only_marks,
                            discounts=discounts, logos=logos, catalogue=marks,
+                           admin_notes=admin_notes,
                            currency={"code": price.supplier_price.currency_code,
                                      "name": price.supplier_price.currency_name,
                                      "rate": price.supplier_price.rate},
                            note=note)
+
+    async def _admin_notes(signature: str) -> list[tuple[str, str, str]]:
+        """Комментарии админа формата: [(код марки, имя марки, текст)].
+
+        Сбой чтения не роняет ни сборку, ни выполнение: без комментариев агент работает
+        как раньше, а о сбое остаётся след в журнале.
+        """
+        try:
+            marks = await supplier_store.marks_for(signature)
+        except Exception:                               # noqa: BLE001
+            logger.warning("Комментарии формата %s не прочитаны", signature[:12],
+                           exc_info=True)
+            return []
+        out, seen = [], set()
+        for m in marks:
+            if m.note and m.tm_code not in seen:
+                seen.add(m.tm_code)
+                out.append((m.tm_code, m.tm_name or m.brand, m.note))
+        return out
 
     shapes: dict[str, bool] = {}
 
@@ -344,7 +374,15 @@ async def main() -> None:
         except Exception:                               # noqa: BLE001
             logger.warning("Условия пересчёта цен не прочитаны", exc_info=True)
 
+        # КОММЕНТАРИЙ АДМИНА ПО МАРКЕ ЗАДАЧИ (решение 12.10.2026): ищется по коду марки,
+        # так задача и связана с форматом. Другой марки комментарий сюда не попадает.
+        code = (task.address.tm.code or "").strip()
+        admin_note = next((text for tm, _, text in
+                           await _admin_notes(price.supplier_price.signature or "")
+                           if code and tm == code), "")
+
         return await run(orchestrator, onec, price, task, content, guard, scope=scope,
+                         admin_note=admin_note,
                          usage_labels={"kind": "model_task",
                                        "price_doc": price.supplier_price.filename},
                          offers=sightings,

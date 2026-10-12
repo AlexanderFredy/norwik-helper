@@ -2567,6 +2567,23 @@ def sheets_report(tools) -> str:
     return "\n".join(lines)
 
 
+def admin_notes_block(notes) -> str:
+    """Комментарии админа по маркам формата — в первое сообщение сборщику.
+
+    ЗАПОМНЕНЫ У ФОРМАТА (решение админа 12.10.2026): ответ, данный один раз, действует на
+    каждом прайсе того же поставщика. Без этого агент спрашивал заново на каждой пересборке
+    ровно то, на что админ уже ответил, — CL/CR у Эггера (левая и правая доска, разные
+    товары) он называл «похожими парами» и требовал уточнить у поставщика.
+    """
+    rows = [(name, text) for _, name, text in (notes or []) if (text or "").strip()]
+    if not rows:
+        return ""
+    return ("\n\nУКАЗАНИЯ АДМИНА ПО МАРКАМ ЭТОГО ФОРМАТА — обязательны и важнее подсказок "
+            "сверки (похожие артикулы и прочее). Что в них уже решено, не выноси в задачу "
+            "вопросом и не проси уточнить у поставщика:\n"
+            + "\n".join(f"— {name}: {text.strip()}" for name, text in rows))
+
+
 async def build(orchestrator, content: bytes, filename: str, onec=None,
                 usage_labels: dict | None = None,
                 elsewhere: dict | None = None,
@@ -2576,7 +2593,8 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
                 discounts: dict | None = None, currency: dict | None = None,
                 logos: dict | None = None, catalogue=None,
                 note=None, rivals: dict | None = None,
-                price_date: str | None = None) -> tuple[list[PriceTask], str]:
+                price_date: str | None = None,
+                admin_notes: list | None = None) -> tuple[list[PriceTask], str]:
     """Прогон формирования задач. Возвращает (задачи, короткий ответ агента).
 
     Пустой список — не ошибка: агент мог не найти, за что зацепиться. Вызывающий решает,
@@ -2591,7 +2609,7 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
                              only_sheets=only_sheets, only_marks=only_marks,
                              discounts=discounts, currency=currency, logos=logos,
                              catalogue=catalogue, rivals=rivals, price_date=price_date)
-    task = f"Прайс «{filename}». Составь список задач по нему."
+    task = f"Прайс «{filename}». Составь список задач по нему." + admin_notes_block(admin_notes)
 
     # РАЗБИРАТЬ НЕЧЕГО — МОДЕЛЬ НЕ ЗОВЁМ ВОВСЕ. Ради этого вся затея и нужна: прогон по
     # прайсу FLOOR SERVICE стоил $5.83, и платить его за ответ «листы не отмечены» было бы

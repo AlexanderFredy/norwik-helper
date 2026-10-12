@@ -112,7 +112,26 @@ CREATE TABLE IF NOT EXISTS signature_logo (
     seen_at    TEXT NOT NULL,
     PRIMARY KEY (signature, image_hash)
 );
+-- КОММЕНТАРИИ АДМИНА ПО МАРКЕ — у ФОРМАТА прайса (решение админа 12.10.2026). Указания
+-- вида «CL/CR — левая и правая доска, это разные товары»: агент читает их и при сборке
+-- задач, и при выполнении, чтобы не спрашивать заново на каждом прайсе того же поставщика.
+--
+-- Ключ — (формат, КОД МАРКИ 1С), а не строка бренда: задача адресована марке, и
+-- исполнитель находит указание по её коду напрямую. Два ярлыка одной марки в файле делят
+-- один комментарий — это одно указание про одну марку.
+CREATE TABLE IF NOT EXISTS signature_note (
+    signature  TEXT NOT NULL,
+    tm_code    TEXT NOT NULL,
+    note       TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (signature, tm_code)
+);
 """
+
+#: Строка-заглушка у формата, где бренд в файле не обозначен (решение админа 12.10.2026).
+#: Комментарию нужна марка, а у такого формата список брендов пуст — привязать некуда.
+#: Агент заводит ОДНУ строку с этим именем, админ ставит ей марку из справочника 1С.
+PRICE_BRAND = "бренд прайса"
 
 
 #: Типы доращиваемых колонок `supplier_signature`. Таблица старше их всех, и у работающей
@@ -165,6 +184,13 @@ class SignatureMark:
     tm_name: str = ""
     discount: float | None = None
     rows: int = 0
+    #: Комментарий админа по МАРКЕ этой строки (`signature_note`); пусто — нет или марки нет.
+    note: str = ""
+
+    @property
+    def is_price_brand(self) -> bool:
+        """Заглушка «бренд прайса», а не ярлык из файла."""
+        return self.brand_key == normalize(PRICE_BRAND)
 
 
 @dataclass(frozen=True)
@@ -446,6 +472,12 @@ class SupplierStore:
         now = _now()
         found = list(found or ())
         async with aiosqlite.connect(self._db_path) as db:
+            if found:
+                # НАСТОЯЩИЕ БРЕНДЫ ВЫТЕСНЯЮТ ЗАГЛУШКУ. Комментарий при этом не теряется: он
+                # лежит у МАРКИ, и строка бренда с той же маркой покажет его снова.
+                await db.execute(
+                    "DELETE FROM signature_mark WHERE signature = ? AND brand_key = ?",
+                    (signature, normalize(PRICE_BRAND)))
             await db.execute("UPDATE signature_mark SET rows = 0 WHERE signature = ?",
                              (signature,))
             for brand, rows, tm_code, tm_name in found:
@@ -477,13 +509,60 @@ class SupplierStore:
             return []
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
-                "SELECT brand, brand_key, parse, COALESCE(tm_code, ''), "
-                "COALESCE(tm_name, ''), discount, rows FROM signature_mark "
-                "WHERE signature = ? ORDER BY rowid", (signature,))
+                "SELECT m.brand, m.brand_key, m.parse, COALESCE(m.tm_code, ''), "
+                "COALESCE(m.tm_name, ''), m.discount, m.rows, COALESCE(n.note, '') "
+                "FROM signature_mark m LEFT JOIN signature_note n "
+                "ON n.signature = m.signature AND n.tm_code = m.tm_code "
+                "AND COALESCE(m.tm_code, '') <> '' "
+                "WHERE m.signature = ? ORDER BY m.rowid", (signature,))
             return [SignatureMark(brand=row[0], brand_key=row[1], parse=bool(row[2]),
                                   tm_code=row[3], tm_name=row[4], discount=row[5],
-                                  rows=row[6])
+                                  rows=row[6], note=row[7])
                     for row in await cur.fetchall()]
+
+    async def ensure_price_brand(self, signature: str) -> bool:
+        """Завести заглушку «бренд прайса», если у формата нет ни одной строки брендов.
+
+        Нужна ради комментария админа: он привязан к МАРКЕ, а у формата без обозначенных
+        брендов строки, где выбрать марку, нет вовсе — у Эггера, Most Floor, Westerhof.
+        Флажок на ней ни на что не влияет: фильтр брендов действует только на листах, где
+        бренд размечен, а у такого формата их нет.
+        """
+        if not signature:
+            return False
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute("SELECT 1 FROM signature_mark WHERE signature = ? LIMIT 1",
+                                   (signature,))
+            if await cur.fetchone():
+                return False
+            await db.execute(
+                "INSERT INTO signature_mark (signature, brand, brand_key, parse, rows, "
+                "seen_at) VALUES (?, ?, ?, 0, 0, ?)",
+                (signature, PRICE_BRAND, normalize(PRICE_BRAND), _now()))
+            await db.commit()
+        return True
+
+    async def ensure_price_brands(self) -> int:
+        """Заглушки всем форматам, где бренды смотрели и не нашли. Идемпотентно — при старте.
+
+        Не смотревшие не трогаем: у них бренды ещё могут найтись, и заглушка, заведённая
+        раньше разбора, показала бы админу «брендов нет» там, где их просто не искали.
+        """
+        added = 0
+        for sig in await self.list_signatures():
+            if await self.brand_scanned(sig.signature):
+                added += await self.ensure_price_brand(sig.signature)
+        return added
+
+    async def notes_for(self, signature: str) -> dict[str, str]:
+        """Комментарии админа формата: код марки 1С → текст."""
+        if not signature:
+            return {}
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "SELECT tm_code, note FROM signature_note WHERE signature = ?",
+                (signature,))
+            return {row[0]: row[1] for row in await cur.fetchall() if row[1].strip()}
 
     async def marks_wanted(self, signature: str) -> list[str]:
         """Только отмеченные бренды — тем, кому нужен фильтр, а не вся таблица."""
@@ -511,6 +590,23 @@ class SupplierStore:
                      str(row.get("tm_code") or ""), str(row.get("tm_name") or ""),
                      row.get("discount"), signature, key))
                 touched += cur.rowcount
+                # КОММЕНТАРИЙ — ПО МАРКЕ, И ТОЛЬКО КОГДА ЕГО ПРИСЛАЛИ. Нет ключа `note` —
+                # прежняя форма, про комментарий она ничего не говорит, и стирать его нельзя.
+                # Нет марки — привязать некуда; форма такого не пускает, а мы не гадаем.
+                code = str(row.get("tm_code") or "").strip()
+                if "note" in row and code:
+                    note = str(row.get("note") or "").strip()
+                    if note:
+                        await db.execute(
+                            "INSERT INTO signature_note (signature, tm_code, note, "
+                            "updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (signature, "
+                            "tm_code) DO UPDATE SET note = excluded.note, "
+                            "updated_at = excluded.updated_at",
+                            (signature, code, note, _now()))
+                    else:
+                        await db.execute(
+                            "DELETE FROM signature_note WHERE signature = ? AND tm_code = ?",
+                            (signature, code))
             await db.commit()
         return touched
 
@@ -769,6 +865,11 @@ class SupplierStore:
             # модели за чтение тех же картинок.
             await db.execute(
                 "UPDATE OR REPLACE signature_logo SET signature = ? WHERE signature = ?",
+                (new, old))
+            # Комментарии админа — по хешу формата; осиротев, они перестали бы доходить до
+            # агента, и он спросил бы заново ровно то, на что админ уже ответил.
+            await db.execute(
+                "UPDATE OR REPLACE signature_note SET signature = ? WHERE signature = ?",
                 (new, old))
             await db.commit()
             return True

@@ -123,6 +123,11 @@ async def remember(suppliers, signature: str, content: bytes, filename: str,
         # пустое значение означает «смотрели прежним правилом», и это другое.
         await suppliers.set_signature_brand_col(
             signature, getattr(suppliers, "NO_BRAND_COLUMN", -1), BY_NONE, RULE_VERSION)
+        # Строка «бренд прайса» — чтобы админу было куда выбрать марку и написать
+        # комментарий (решение 12.10.2026): у такого формата других строк нет.
+        ensure = getattr(suppliers, "ensure_price_brand", None)
+        if ensure is not None:
+            await ensure(signature)
         return {"brands": 0, "column": None, "wanted": 0, "without_tm": 0,
                 "mode": BY_NONE}
 

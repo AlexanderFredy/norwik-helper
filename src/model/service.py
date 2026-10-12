@@ -343,7 +343,22 @@ class PriceListService:
 
     async def _apply_marks(self, signature: str, rows) -> str:
         """Записать выбор брендов со марками и скидками. Возвращает, что сказать админу."""
+        from src.price_tool.scope import normalize
+        from src.storage.suppliers import PRICE_BRAND
+
         touched = await self._suppliers.set_marks_by_signature(signature, rows)
+        notes = sum(1 for r in rows if str(r.get("note") or "").strip())
+        tail = f" Комментариев по маркам: {notes}." if notes else ""
+        # ЗАГЛУШКА «БРЕНД ПРАЙСА» — НЕ БРЕНД. У формата без брендов она одна, и флажок на ней
+        # ни на что не влияет: сказать «бренды не отмечены, разбирать нечего» значило бы
+        # соврать — разбор там ограничивают только листы.
+        real = [r for r in rows if normalize(str(r.get("brand") or "")) != normalize(PRICE_BRAND)]
+        if rows and not real:
+            return (f"Формат {signature[:12]}: бренды в файле не обозначены, разбор "
+                    "ограничивают листы." + tail) if touched else \
+                   (f"Формат {signature[:12]}: строка «бренд прайса» не найдена в "
+                    "справочнике — откройте форму заново.")
+        rows = real
         wanted = [str(r.get("brand")) for r in rows if r.get("brand") and r.get("parse")]
 
         if not touched and rows:
@@ -354,7 +369,7 @@ class PriceListService:
 
         return (f"Формат {signature[:12]}: разбираем бренды — {', '.join(wanted)}."
                 if wanted else
-                f"Формат {signature[:12]}: бренды не отмечены, разбирать нечего.")
+                f"Формат {signature[:12]}: бренды не отмечены, разбирать нечего.") + tail
 
     async def _apply_currency(self, signature: str, price_id, data: dict) -> None:
         """Валюта прайса и её курс.

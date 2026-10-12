@@ -461,6 +461,9 @@ class OnecProvider(Listener):
                     "tm_code": mark.tm_code,
                     "tm_name": mark.tm_name,
                     "discount": mark.discount,
+                    # Комментарий админа по марке (решение 12.10.2026): он хранится у
+                    # формата по коду марки и в форме показывается у строки бренда.
+                    "note": mark.note,
                 })
         return out
 

@@ -1660,7 +1660,8 @@ def _collection_folder(folders, subject, wanted: str, positions=()):
     return None, f"папки с именем «{wanted}» в дереве марки нет"
 
 
-def task_brief(price, task, terms=None, purchase_in_price: bool = False) -> str:
+def task_brief(price, task, terms=None, purchase_in_price: bool = False,
+               admin_note: str = "") -> str:
     """Что именно предстоит сделать — одним куском для модели."""
     lines = [
         f"ЗАДАЧА №{task.id}: {task.kind.value}",
@@ -1690,6 +1691,12 @@ def task_brief(price, task, terms=None, purchase_in_price: bool = False) -> str:
         lines.append("Цены: в прайсе ЕСТЬ колонка закупки — бери закупку и РРЦ прямо из "
                      "неё, скидка дилера не нужна. Если в прошлом результате сказано, что "
                      "цены писать нельзя, — это устарело, цены по этой задаче писать нужно.")
+    # УКАЗАНИЕ АДМИНА ПО МАРКЕ (решение 12.10.2026) — запомнено у формата прайса и
+    # действует на каждом его прайсе. Стоит ВЫШЕ описания: описание составил агент, и где
+    # они расходятся (скажем, описание просит «уточнить», а админ уже ответил), прав админ.
+    if admin_note:
+        lines.append("\nУКАЗАНИЕ АДМИНА ПО ЭТОЙ МАРКЕ (обязательно; важнее описания задачи "
+                     f"и подсказок сверки):\n{admin_note}")
     subject = task.address.subject
     if subject.article:
         lines.append(f"Артикул: {subject.article}")
@@ -1704,7 +1711,8 @@ def task_brief(price, task, terms=None, purchase_in_price: bool = False) -> str:
 
 async def run(orchestrator, onec, price, task, content: bytes, guard,
               scope=None, usage_labels: dict | None = None, offers=None,
-              supplier_name: str = "", terms=None, purchase_in_price: bool = False):
+              supplier_name: str = "", terms=None, purchase_in_price: bool = False,
+              admin_note: str = ""):
     """Выполнить задачу. Возвращает (статус, текст результата).
 
     `guard` — функция без аргументов, бросающая `WriteRefused`, если прогон потерял право
@@ -1751,7 +1759,8 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
 
     answer, _ = await orchestrator.handle_turn(
         [{"role": "user", "content": task_brief(price, task, terms,
-                                                purchase_in_price=purchase_in_price)}],
+                                                purchase_in_price=purchase_in_price,
+                                                admin_note=admin_note)}],
         system=PROMPT, extra_tools=TOOLS, extra_executor=tools,
         base_tools=False, usage_labels=usage_labels)
 
