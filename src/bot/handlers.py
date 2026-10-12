@@ -6,9 +6,11 @@ from pathlib import Path
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import FSInputFile, Message
+from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton,
+                           InlineKeyboardMarkup, Message)
 
 from src.agent.prompts import build_system_prompt
+from src.agent.tools import PHOTO_CALLBACK
 from src.bot.commands import build_help
 from src.bot.errors import describe_api_error
 from src.price_tool.exclusive import resolve
@@ -168,6 +170,8 @@ async def _send_pending(message: Message, orchestrator) -> None:
     ответ, который менеджер уже видит.
     """
     try:
+        take_buttons = getattr(orchestrator.executor, "take_buttons", None)
+        buttons = take_buttons() if take_buttons else None
         text, file = orchestrator.executor.take_pending()
     except Exception:                                  # noqa: BLE001
         logger.exception("Не удалось забрать отложенный ответ инструмента")
@@ -175,8 +179,10 @@ async def _send_pending(message: Message, orchestrator) -> None:
 
     try:
         if text:
-            for i in range(0, len(text), 4096):
-                await message.answer(text[i : i + 4096])
+            chunks = [text[i : i + 4096] for i in range(0, len(text), 4096)]
+            for n, chunk in enumerate(chunks):
+                last = n == len(chunks) - 1
+                await message.answer(chunk, reply_markup=_keyboard(buttons) if last else None)
         if file is not None:
             await message.answer_document(FSInputFile(str(file)))
     except Exception:                                  # noqa: BLE001
@@ -189,6 +195,84 @@ async def _send_pending(message: Message, orchestrator) -> None:
                 Path(str(file)).unlink(missing_ok=True)
         except Exception:                              # noqa: BLE001
             pass
+
+
+def _keyboard(buttons) -> InlineKeyboardMarkup | None:
+    """[[(подпись, данные)]] → разметка Telegram. Пусто — без кнопок."""
+    if not buttons:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=label, callback_data=data) for label, data in row]
+        for row in buttons])
+
+
+def _category_buttons(token: str) -> list:
+    """Категории для ветки «любые товары» — по две в ряд, их двенадцать."""
+    from src.price_tool import product_types
+
+    cells = [(title, f"{PHOTO_CALLBACK}{token}:t{code}")
+             for title, code in product_types.known()]
+    return [cells[i : i + 2] for i in range(0, len(cells), 2)]
+
+
+@router.callback_query(F.data.startswith(PHOTO_CALLBACK))
+async def photo_choice(callback: CallbackQuery, orchestrator) -> None:
+    """Ответ кнопкой на вопрос «любые товары или недавно добавленные».
+
+    ПРОВЕРКУ ЗАПУСКАЕТ КОД, А НЕ МОДЕЛЬ: разговор с менеджером без истории, и ответ,
+    присланный текстом, пришёл бы отдельным запросом без контекста. Запрос (категория,
+    марки) запомнил инструмент, кнопка несёт только его номер и выбор.
+    """
+    await callback.answer()
+    executor = orchestrator.executor
+    _, token, choice = (callback.data or "").split(":", 2)
+    request = executor.photo_request(token)
+    if request is None:
+        await callback.message.edit_text(
+            "Этот вопрос устарел — спросите ещё раз «где нет фото».")
+        return
+
+    if choice.startswith("t"):
+        from src.price_tool import product_types
+
+        code = choice[1:]
+        request["type_code"] = code
+        request["type_name"] = next((t for t, c in product_types.known() if c == code), "")
+        choice = "any"
+
+    if choice == "any" and not request.get("type_code"):
+        # Любые товары — только в названной категории: весь каталог не обходим.
+        await callback.message.edit_text(
+            "Любые товары — в какой категории смотреть?",
+            reply_markup=_keyboard(_category_buttons(token)))
+        return
+
+    recent = choice == "new"
+    executor.forget_photo_request(token)
+    if recent:
+        what = f"недавно добавленные (за {await executor.photo_recent_days()} дн)"
+    else:
+        what = "любые товары"
+    category = request.get("type_name")
+    await callback.message.edit_text(
+        f"Проверяю {what}" + (f" в категории «{category}»" if category else "")
+        + ". Это минута-две.")
+
+    try:
+        outputs = await executor.photo_check(request, recent=recent)
+    except Exception as exc:                           # noqa: BLE001
+        logger.exception("Проверка фото сорвалась")
+        await callback.message.answer(f"Проверка фото сорвалась: {exc}")
+        return
+    for out in outputs:
+        if isinstance(out, Path):
+            try:
+                await callback.message.answer_document(FSInputFile(str(out)))
+            finally:
+                out.unlink(missing_ok=True)
+        else:
+            for i in range(0, len(out), 4096):
+                await callback.message.answer(out[i : i + 4096])
 
 
 @router.message(F.voice)

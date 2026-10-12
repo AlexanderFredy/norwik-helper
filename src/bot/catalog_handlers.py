@@ -493,6 +493,41 @@ async def cmd_no_photo_summary(message: Message, command: CommandObject,
     await message.answer(text or why)
 
 
+@router.message(Command("photo_days"))
+async def cmd_photo_days(message: Message, command: CommandObject, pricing_store) -> None:
+    """Глубина поиска «недавно добавленных» в вопросе про фото (решение админа 12.10.2026).
+
+    ДЛЯ ВСЕХ, КТО МОЖЕТ СПРОСИТЬ АГЕНТА ПРО ФОТО — то есть для всех с доступом к боту:
+    белый список уже стоит на входе (`AuthMiddleware`), второго замка не нужно. Значение
+    одно на всех: им пользуется вопрос любого менеджера.
+    """
+    from src.agent.tools import PHOTO_DAYS_SETTING, PHOTO_RECENT_DAYS
+
+    current = await pricing_store.get_setting(PHOTO_DAYS_SETTING, str(PHOTO_RECENT_DAYS))
+    raw = (command.args or "").strip()
+    if not raw:
+        await message.answer(
+            f"Глубина поиска недавно добавленных товаров: {current} дн.\n"
+            f"Изменить: /photo_days <дней>, от 1 до {PHOTO_DAYS_MAX}.")
+        return
+    try:
+        days = int(raw)
+    except ValueError:
+        days = 0
+    if not 1 <= days <= PHOTO_DAYS_MAX:
+        await message.answer(f"Нужно число дней от 1 до {PHOTO_DAYS_MAX}, например "
+                             "/photo_days 90.")
+        return
+    await pricing_store.set_setting(PHOTO_DAYS_SETTING, str(days))
+    await message.answer(f"Глубина поиска недавно добавленных товаров: {days} дн. "
+                         f"(было {current}).")
+
+
+#: Три года. Дальше «недавно добавленные» превращаются в весь каталог — а его без
+#: категории не обходим.
+PHOTO_DAYS_MAX = 1095
+
+
 # ------------------------------------------------- подписка на дайджест по фото
 
 @router.message(Command("photo_subs"))

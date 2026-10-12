@@ -159,6 +159,11 @@ async def scan_category(onec, *, type_code: str, type_name: str = "",
     фильтром, медленнее, и об этом говорит `note`.
     """
     out = Scan()
+    # Без категории — только недавно заведённые: каталог целиком не обходим НИКОГДА, и
+    # ограничить выборку может лишь одно из двух (решение админа 12.10.2026).
+    if not type_code and not since:
+        out.problem = ("Назови категорию товара — анализ по всему каталогу не делаю.")
+        return out
     marks = await asyncio.to_thread(onec.selling_tm)
     if tms:
         marks, out.unknown_tms = match_marks(list(tms), marks)
@@ -171,7 +176,7 @@ async def scan_category(onec, *, type_code: str, type_name: str = "",
 
     walk = [(m.code, m.name) for m in marks] if tms else [(None, "")]
     picked: list[tuple[str, object]] = []
-    kw = {"product_type": type_code}
+    kw = {"product_type": type_code} if type_code else {}
     if since:
         kw["created_from"] = since
 
@@ -192,7 +197,7 @@ async def scan_category(onec, *, type_code: str, type_name: str = "",
             # Отбор ПОВТОРЯЕТСЯ в Python: старый BSL фильтры мог и не применить.
             if item.not_exported or not (item.id or "").strip():
                 continue
-            if (item.product_type_ref or "").strip() != type_code:
+            if type_code and (item.product_type_ref or "").strip() != type_code:
                 continue
             if since and not (item.created and item.created >= since):
                 continue

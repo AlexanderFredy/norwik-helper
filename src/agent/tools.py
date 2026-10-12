@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from src.email_tool.attachments import excel_sheet_names, extract_text
@@ -34,6 +34,15 @@ PRICE_CHAT_ROWS = 60
 #: оплачивается один раз, — но и одного раза на сорок тысяч знаков хватит, чтобы вопрос
 #: «в какой колонке» стоил дороже всего разбора прайса.
 MAX_PRICE_CHARS = 12000
+
+
+#: Префикс данных кнопок вопроса про фото — разбирает его `handlers.photo_choice`.
+PHOTO_CALLBACK = "photo:"
+#: Глубина «недавно добавленных» по умолчанию и где её хранят (решение админа 12.10.2026).
+PHOTO_RECENT_DAYS = 180
+PHOTO_DAYS_SETTING = "photo_recent_days"
+#: Сколько незакрытых вопросов помнить: кнопку обычно жмут сразу, а не через сотню вопросов.
+PHOTO_REQUESTS_KEPT = 200
 
 
 def _months_ago(months: int, today: date | None = None) -> str:
@@ -203,28 +212,21 @@ TOOL_DEFINITIONS = [
         "name": "find_items_without_photo",
         "description": (
             "Товары, выгружаемые на сайт, у которых там нет ни одного фото. Отвечает на "
-            "вопросы «где не хватает фото», «где не добавлены фото». КАТЕГОРИЯ ТОВАРА "
-            "ОБЯЗАТЕЛЬНА (product_type: ламинат, керамогранит, керамическая плитка, …): "
-            "по всему каталогу проверка не делается. Не назвал менеджер категорию — спроси "
-            "её, не вызывая инструмент. tms — марки, если назвали (одна или несколько). "
-            "months — только если спрашивают про НОВЫЕ товары: тогда смотрим заведённые за "
-            "последние months месяцев; без него — весь ассортимент категории на сайте. "
-            "Проверка категории идёт минуту-другую — предупреди об этом. "
-            "СПИСОК УЖЕ ОТПРАВЛЕН менеджеру — отдельным сообщением или файлом Excel, "
-            "смотря по длине. Тебе возвращаются ТОЛЬКО ЧИСЛА: ответь по ним одной "
-            "фразой и не пересказывай список, не придумывай наименования и ссылки."
+            "вопросы «где не хватает фото», «где не добавлены фото». Вызывай СРАЗУ, ничего "
+            "не уточняя: вопрос «любые товары или только недавно добавленные» инструмент "
+            "задаст менеджеру сам, кнопками, и категорию спросит тоже сам. product_type — "
+            "категория, ЕСЛИ менеджер её назвал (ламинат, керамогранит, …); tms — марки, "
+            "если назвали. Ответ — одной фразой по тому, что вернул инструмент."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "product_type": {"type": "string",
-                                 "description": "категория товара — обязательна для списка"},
+                                 "description": "категория товара, если её назвали"},
                 "tms": {"type": "array", "items": {"type": "string"},
                         "description": "торговые марки, если менеджер их назвал"},
                 "tm": {"type": "string",
                        "description": "одна торговая марка (устарело — используй tms)"},
-                "months": {"type": "integer",
-                           "description": "только новые: за сколько последних месяцев"},
                 "brief": {
                     "type": "boolean",
                     "description": (
@@ -232,7 +234,7 @@ TOOL_DEFINITIONS = [
                         "списка позиций: та же, что уходит подписчикам по понедельникам. "
                         "Ставь, когда просят «дайджест», «сводку», «коротко», «сколько "
                         "всего ждут фото». Отвечает мгновенно, по данным последней "
-                        "ежедневной проверки."),
+                        "ежедневной проверки, и вопроса кнопками не задаёт."),
                 },
             },
             "additionalProperties": False,
@@ -266,6 +268,10 @@ class ToolExecutor:
         # в прайсовом потоке.
         self.pending_message: str | None = None
         self.pending_file = None                # Path | None — Excel, когда в чат не влез
+        # Кнопки к отложенному сообщению: [[(подпись, данные)]]. Разметку Telegram собирает
+        # обработчик — исполнителю незачем знать про aiogram.
+        self.pending_buttons: list | None = None
+        self._photo_requests: dict[str, dict] = {}
 
     def use_model(self, model) -> None:
         """Подключить модель прайсов. Отдельным вызовом, а не параметром конструктора:
@@ -278,6 +284,11 @@ class ToolExecutor:
         message, file = self.pending_message, self.pending_file
         self.pending_message, self.pending_file = None, None
         return message, file
+
+    def take_buttons(self) -> list | None:
+        """Кнопки к отложенному сообщению — забрать и очистить, как `take_pending`."""
+        buttons, self.pending_buttons = self.pending_buttons, None
+        return buttons
 
     async def execute(self, name: str, tool_input: dict) -> str:
         try:
@@ -461,11 +472,18 @@ class ToolExecutor:
     # ------------------------------------------------ фото на сайте (решение 30.09.2026)
 
     async def _photos_missing(self, inp: dict) -> str:
-        """Товары без фото на сайте — по КАТЕГОРИИ, марки по желанию (решение 11.10.2026).
+        """Товары без фото на сайте: модель только ЗАДАЁТ ВОПРОС, проверку запускает кнопка.
 
-        ТОТАЛЬНОГО ОБХОДА КАТАЛОГА НЕТ И НЕ БУДЕТ: категория обязательна, и проверяет это код.
-        Прежний режим «новые товары всех категорий» агенту больше не отдаётся; журнал
-        прогресса по-прежнему наполняет ежедневная проверка (`photo_scan.scan`).
+        **ВОПРОС «ЛЮБЫЕ ИЛИ НЕДАВНИЕ» ЗАДАЁТСЯ ВСЕГДА** (решение админа 12.10.2026), и задаёт
+        его код, а не модель: разговор с менеджером БЕЗ ИСТОРИИ — ответ «только недавние»,
+        присланный текстом, пришёл бы отдельным запросом, в котором уже не видно, про что он.
+        Поэтому вопрос уходит КНОПКАМИ, запрос запоминается здесь, а нажатие исполняет
+        `photo_check` напрямую — второго круга модели нет вовсе.
+
+        Ветки: «любые товары» — КАТЕГОРИЯ ОБЯЗАТЕЛЬНА (анализ всего каталога запрещён,
+        решение 11.10.2026), не названа — спрашивается следующими кнопками; «недавно
+        добавленные» — заведённые за `photo_recent_days` дней (по умолчанию 180, команда
+        `/photo_days`), категория и марки сужают по желанию.
         """
         if self._onec is None:
             return "Проверка фото недоступна: интеграция с 1С не настроена."
@@ -478,46 +496,113 @@ class ToolExecutor:
         if inp.get("brief"):
             return await self._photo_digest(tms[0] if len(tms) == 1 else "")
 
-        # КАТЕГОРИЯ ОБЯЗАТЕЛЬНА — РЕШАЕТ КОД, а не промпт (решение админа 11.10.2026):
-        # проверка всего каталога запрещена, она стоила бы минут на каждый вопрос.
-        from src.price_tool import product_types
-        try:
-            type_code, type_name = product_types.resolve(inp.get("product_type"))
-        except ValueError as exc:
-            return str(exc)
-        return await self._photos_in_category(type_code, type_name, tms,
-                                              months=inp.get("months"))
+        type_code, type_name = "", ""
+        if (inp.get("product_type") or "").strip():
+            from src.price_tool import product_types
+            try:
+                type_code, type_name = product_types.resolve(inp.get("product_type"))
+            except ValueError as exc:
+                return str(exc)
 
-    async def _photos_in_category(self, type_code: str, type_name: str, tms: list[str],
-                                  months=None) -> str:
-        """Товары категории без фото: только выгружаемые на сайт, марки по желанию."""
-        since = _months_ago(max(1, min(12, int(months)))) if months else ""
+        days = await self.photo_recent_days()
+        token = self._remember_photo_request(
+            {"type_code": type_code, "type_name": type_name, "tms": tms})
+        where = f" в категории «{type_name}»" if type_name else ""
+        if tms:
+            where += f" по маркам {', '.join(tms)}"
+        self.pending_message = (f"Где нет фото{where}: вы хотите узнать про любые товары "
+                                f"или вас интересуют только недавно добавленные "
+                                f"(глубина поиска {days} дн)?")
+        self.pending_buttons = [
+            [("Любые товары", f"{PHOTO_CALLBACK}{token}:any")],
+            [(f"Только недавно добавленные ({days} дн)", f"{PHOTO_CALLBACK}{token}:new")],
+        ]
+        return ("Менеджеру уже задан вопрос кнопками: любые товары или только недавно "
+                "добавленные. Ответь ОДНОЙ короткой фразой — «выберите вариант кнопкой ниже»; "
+                "сам ничего не проверяй и не спрашивай.")
+
+    def _remember_photo_request(self, request: dict) -> str:
+        """Запрос до нажатия кнопки. В памяти намеренно: после перезапуска бота кнопка
+        отвечает «спросите заново» — переспросить дешевле, чем хранить ради этого базу."""
+        import secrets
+        token = secrets.token_hex(4)
+        self._photo_requests[token] = request
+        while len(self._photo_requests) > PHOTO_REQUESTS_KEPT:
+            self._photo_requests.pop(next(iter(self._photo_requests)))
+        return token
+
+    def photo_request(self, token: str) -> dict | None:
+        return self._photo_requests.get(token)
+
+    def forget_photo_request(self, token: str) -> None:
+        """Снимается при запуске проверки: второе нажатие той же кнопки запустило бы
+        минутный обход второй раз."""
+        self._photo_requests.pop(token, None)
+
+    async def photo_recent_days(self) -> int:
+        """Глубина «недавно добавленных» (команда `/photo_days`). Сбой чтения — умолчание:
+        из-за настройки вопрос не должен ломаться."""
+        if self._pricing_store is None:
+            return PHOTO_RECENT_DAYS
+        try:
+            raw = await self._pricing_store.get_setting(PHOTO_DAYS_SETTING,
+                                                        str(PHOTO_RECENT_DAYS))
+            return max(1, int(raw))
+        except Exception:                                  # noqa: BLE001
+            logger.exception("Не удалось прочитать глубину поиска фото")
+            return PHOTO_RECENT_DAYS
+
+    async def photo_check(self, request: dict, recent: bool) -> list:
+        """Проверка по нажатой кнопке: что отправить менеджеру, по порядку (текст или Path
+        файла Excel). Модель здесь не участвует — список и так шёл мимо неё."""
+        if self._onec is None:
+            return ["Проверка фото недоступна: интеграция с 1С не настроена."]
+        type_code = request.get("type_code") or ""
+        type_name = request.get("type_name") or ""
+        tms = list(request.get("tms") or [])
+        since = ""
+        if recent:
+            since = (date.today() - timedelta(days=await self.photo_recent_days())).isoformat()
+        elif not type_code:
+            return ["Назовите категорию товара — анализ по всему каталогу не делаю."]
+
         found = await photo_scan.scan_category(self._onec, type_code=type_code,
                                                type_name=type_name, tms=tms, since=since)
         if found.problem:
-            return found.problem
-        scope = ", ".join(tms) if tms else ""
+            return [found.problem]
         if self._watch is not None and found.observations:
             await self._watch.observe(found.observations)
+
+        notes = []
+        if found.lost:
+            notes.append(f"1С не отдала {found.lost} поз. — они не проверены.")
+        if found.unknown_tms:
+            notes.append("Не нашёл среди выгружаемых марок: "
+                         + ", ".join(f"«{t}»" for t in found.unknown_tms) + ".")
+        if found.note:
+            notes.append(found.note)
+
+        scope = ", ".join(tms)
+        if not found.checked:
+            what = f"в категории «{type_name}»" if type_name else "среди недавно добавленных"
+            head = (f"Товаров, выгружаемых на сайт, {what}"
+                    + (f" по маркам {scope}" if scope else "")
+                    + (f" (заведены с {photo_report._ru(since)})" if since else "")
+                    + " нет — проверять нечего.")
+            return [" ".join([head] + notes)]
 
         text = photo_report.render(found.rows, since=since, checked=found.checked,
                                    marks=found.marks, no_card=found.no_card,
                                    failed=found.failed, scope=scope, category=type_name)
-        tail = ""
-        if found.unknown_tms:
-            tail += " Не нашёл среди выгружаемых марок: " + ", ".join(
-                f"«{t}»" for t in found.unknown_tms) + "."
-        if found.note:
-            tail += " " + found.note
-        if not found.checked:
-            return (f"В категории «{type_name}»" + (f" по маркам {scope}" if scope else "")
-                    + " нет товаров, выгружаемых на сайт, — проверять нечего." + tail)
-        answer = self._deliver(text, found.rows, since, found.lost)
-        if found.rows:
-            answer = answer.replace(f"среди заведённых с {since}",
-                                    f"в категории «{type_name}»"
-                                    + (f", заведённых с {since}" if since else ""))
-        return answer + tail
+        out: list = [text] if photo_report.fits_chat(text) else []
+        if not out:
+            import tempfile
+            path = Path(tempfile.gettempdir()) / f"Без фото {date.today():%d.%m.%Y}.xlsx"
+            out = [f"Без фото на сайте: {len(found.rows)} поз. В чат список не влез — "
+                   "отправляю файлом Excel.", photo_report.to_excel(found.rows, path)]
+        if notes:
+            out.append("\n".join(notes))
+        return out
 
     async def _photo_digest(self, tm: str = "") -> str:
         """Короткая сводка по маркам — ТА ЖЕ, что уходит подписчикам по понедельникам.
@@ -534,25 +619,6 @@ class ToolExecutor:
         self.pending_message = text
         return ("Короткая сводка по фото уже отправлена менеджеру — не пересказывай её, "
                 "ответь одной фразой.")
-
-    def _deliver(self, text: str, rows: list, since: str, lost: int) -> str:
-        """Список — менеджеру напрямую, модели — только числа (см. `take_pending`)."""
-        tail = (f" 1С не отдала {lost} поз. — они не проверены." if lost else "")
-        if not rows:
-            self.pending_message = None
-            return text + tail
-
-        if photo_report.fits_chat(text):
-            self.pending_message = text
-            how = "списком в чат"
-        else:
-            import tempfile
-            path = Path(tempfile.gettempdir()) / f"Без фото {date.today():%d.%m.%Y}.xlsx"
-            self.pending_file = photo_report.to_excel(rows, path)
-            how = "файлом Excel (в чат не влез)"
-
-        return (f"Найдено {len(rows)} товаров без фото среди заведённых с {since}. "
-                f"Список уже отправлен менеджеру {how} — не пересказывай его." + tail)
 
     async def _price_history(self, inp: dict) -> str:
         if self._onec is None:

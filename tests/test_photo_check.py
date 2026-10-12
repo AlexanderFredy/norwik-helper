@@ -6,11 +6,11 @@
 """
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from src.agent.tools import ToolExecutor, _months_ago
+from src.agent.tools import ToolExecutor, _months_ago  # noqa: F401
 from src.onec.client import NomItem, Nomenclature, TradeMark
 from src.website_tool import photo_report, photos
 
@@ -190,73 +190,126 @@ class FakeChecker:
         pass
 
 
+def _days_ago(days: int) -> str:
+    return (date.today() - timedelta(days=days)).isoformat()
+
+
+def _text(outputs) -> str:
+    return "\n".join(o for o in outputs if isinstance(o, str))
+
+
+class FakeSettings:
+    def __init__(self, values=None):
+        self.values = dict(values or {})
+
+    async def get_setting(self, key, default=""):
+        return self.values.get(key, default)
+
+    async def set_setting(self, key, value):
+        self.values[key] = value
+
+
 class ToolTest(unittest.IsolatedAsyncioTestCase):
+    """Модель задаёт вопрос кнопками, проверку запускает нажатие (решение админа 12.10.2026)."""
 
-    def executor(self, onec):
-        return ToolExecutor(mail=None, norwik=None, onec=onec)
+    def executor(self, onec, settings=None):
+        return ToolExecutor(mail=None, norwik=None, onec=onec, pricing_store=settings)
 
-    async def run_tool(self, onec, verdicts, inp=None):
-        """Категория обязательна (решение админа 11.10.2026) — по умолчанию ламинат."""
+    async def ask(self, ex, inp=None):
+        """Вопрос модели → (ответ модели, номер запроса, кнопки)."""
+        answer = await ex._photos_missing(dict(inp or {}))
+        buttons = ex.take_buttons()
+        token = buttons[0][0][1].split(":")[1] if buttons else None
+        return answer, token, buttons
+
+    async def run_tool(self, onec, verdicts, inp=None, recent=False):
+        """По умолчанию — «любые товары» в ламинате."""
         ex = self.executor(onec)
+        inp = {"product_type": "ламинат", **(inp or {})}
         with patch.object(photos, "PhotoChecker", FakeChecker(verdicts)):
-            answer = await ex._photos_missing({"product_type": "ламинат", **(inp or {})})
-        return ex, answer
+            _, token, _ = await self.ask(ex, inp)
+            ex.take_pending()
+            outputs = await ex.photo_check(ex.photo_request(token), recent=recent)
+        return ex, outputs
 
-    async def test_list_goes_to_the_manager_not_through_the_model(self):
-        """Пересказ сотни строк — это выходные токены за копирование и риск, что ссылки
-        разойдутся с настоящими."""
-        onec = FakeOnec({None: [item(site_id="1001"), item(site_id="1002")]})
-        ex, answer = await self.run_tool(onec, {"1001": photos.NONE})
-        self.assertIn("Найдено 1", answer)
-        self.assertNotIn("norwik.ru", answer, "ссылок модель не видит")
-        text, file = ex.take_pending()
-        self.assertIn("https://www.norwik.ru/item/1001", text)
-        self.assertIsNone(file)
+    # ---------------------------------------------------------------- вопрос
 
-    async def test_pending_is_cleared_once_taken(self):
+    async def test_the_question_is_always_asked_and_nothing_is_walked(self):
+        """«Любые или недавние» спрашивается ВСЕГДА, и до ответа в 1С не ходим."""
         onec = FakeOnec({None: [item()]})
-        ex, _ = await self.run_tool(onec, {"1001": photos.NONE})
-        ex.take_pending()
-        self.assertEqual(ex.take_pending(), (None, None))
+        ex = self.executor(onec)
+        answer, token, buttons = await self.ask(ex, {"product_type": "ламинат"})
+        self.assertEqual(onec.asked, [])
+        self.assertIn("кнопк", answer)
+        question, _ = ex.take_pending()
+        self.assertIn("любые товары или вас интересуют только недавно добавленные", question)
+        self.assertIn("(глубина поиска 180 дн)", question)
+        self.assertIn("«Ламинат»", question)
+        self.assertEqual([row[0][1] for row in buttons],
+                         [f"photo:{token}:any", f"photo:{token}:new"])
 
-    async def test_date_filter_goes_to_1c(self):
-        """Отбор на стороне 1С: иначе тянули бы каталог целиком, чтобы отбросить почти всё."""
+    async def test_depth_comes_from_the_setting(self):
+        ex = self.executor(FakeOnec({}), FakeSettings({"photo_recent_days": "90"}))
+        _, _, buttons = await self.ask(ex, {})
+        self.assertIn("90 дн", buttons[1][0][0])
+        self.assertIn("глубина поиска 90 дн", ex.take_pending()[0])
+
+    async def test_buttons_fit_telegram_callback_limit(self):
+        _, _, buttons = await self.ask(self.executor(FakeOnec({})), {})
+        for row in buttons:
+            for _, data in row:
+                self.assertLessEqual(len(data.encode()) + 10, 64, "и место под код вида")
+
+    async def test_unknown_category_is_named_before_the_question(self):
+        onec = FakeOnec({})
+        ex = self.executor(onec)
+        answer, token, _ = await self.ask(ex, {"product_type": "космолёты"})
+        self.assertIn("«космолёты»", answer)
+        self.assertIsNone(token)
+
+    async def test_request_is_forgotten_once_run(self):
+        """Второе нажатие не запускает минутный обход второй раз."""
+        ex = self.executor(FakeOnec({}))
+        _, token, _ = await self.ask(ex, {})
+        ex.forget_photo_request(token)
+        self.assertIsNone(ex.photo_request(token))
+
+    # ------------------------------------------------------- «любые товары»
+
+    async def test_any_without_category_is_refused_by_code(self):
+        """Анализ всей товарной массы запрещён — и проверяет это КОД, а не промпт."""
         onec = FakeOnec({None: [item()]})
-        await self.run_tool(onec, {}, {"months": 2})
-        self.assertEqual(onec.asked[0][1], _months_ago(2))
+        ex = self.executor(onec)
+        outputs = await ex.photo_check({"type_code": "", "tms": []}, recent=False)
+        self.assertIn("категорию", _text(outputs))
+        self.assertEqual(onec.asked, [], "в 1С не ходили")
 
-    async def test_old_items_are_dropped_even_if_1c_sent_them(self):
-        """Старый by-tm.bsl параметр не заметит и отдаст всё — отбор повторяем у себя."""
-        onec = FakeOnec({None: [item(site_id="1001", created="2020-01-01"),
-                                item(site_id="1002", created=_months_ago(1))]})
-        ex, answer = await self.run_tool(onec, {"1001": photos.NONE, "1002": photos.NONE},
-                                         {"months": 3})
-        text, _ = ex.take_pending()
-        self.assertIn("item/1002", text)
-        self.assertNotIn("item/1001", text)
-
-    async def test_without_months_the_whole_category_is_checked(self):
-        """Категория — весь её ассортимент на сайте (решение админа 11.10.2026): дата
-        заведения не нужна вовсе, старые позиции тоже в отчёте."""
+    async def test_any_checks_the_whole_category(self):
+        """Любые товары — весь ассортимент категории на сайте, старые позиции тоже."""
         onec = FakeOnec({None: [item(site_id="1001", created=""),
                                 item(site_id="1002", created="2020-01-01")]})
-        ex, answer = await self.run_tool(onec, {"1001": photos.NONE, "1002": photos.NONE})
+        _, outputs = await self.run_tool(onec, {"1001": photos.NONE, "1002": photos.NONE})
         self.assertEqual(onec.asked, [(None, None)], "окна новизны нет")
-        text, _ = ex.take_pending()
+        text = _text(outputs)
         self.assertIn("item/1001", text)
         self.assertIn("item/1002", text)
         self.assertIn("категории «Ламинат»", text)
 
+    async def test_list_goes_to_the_manager(self):
+        onec = FakeOnec({None: [item(site_id="1001"), item(site_id="1002")]})
+        _, outputs = await self.run_tool(onec, {"1001": photos.NONE})
+        self.assertIn("https://www.norwik.ru/item/1001", _text(outputs))
+        self.assertNotIn("item/1002", _text(outputs))
+
     async def test_discontinued_are_skipped(self):
         onec = FakeOnec({None: [item(site_id="1001", not_exported=True)]})
-        _, answer = await self.run_tool(onec, {"1001": photos.NONE})
-        self.assertIn("нет товаров, выгружаемых на сайт", answer)
+        _, outputs = await self.run_tool(onec, {"1001": photos.NONE})
+        self.assertIn("нет — проверять нечего", _text(outputs))
 
     async def test_items_without_a_card_are_not_listed(self):
         onec = FakeOnec({None: [item(site_id="1001"), item(site_id="1002")]})
-        ex, answer = await self.run_tool(
-            onec, {"1001": photos.NO_CARD, "1002": photos.NONE})
-        text, _ = ex.take_pending()
+        _, outputs = await self.run_tool(onec, {"1001": photos.NO_CARD, "1002": photos.NONE})
+        text = _text(outputs)
         self.assertNotIn("item/1001", text)
         self.assertIn("1 поз. на сайт пока не выгрузились", text)
 
@@ -265,39 +318,33 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
                      name=f"Ламинат Classen Очень Длинное Название Декора Номер {i}")
                 for i in range(200)]
         onec = FakeOnec({None: rows})
-        ex, answer = await self.run_tool(
-            onec, {str(2000 + i): photos.NONE for i in range(200)})
-        text, file = ex.take_pending()
-        self.assertIsNone(text, "в чат не шлём — не влезло")
-        self.assertTrue(str(file).endswith(".xlsx"))
-        self.assertIn("файлом Excel", answer)
-        Path(str(file)).unlink(missing_ok=True)
+        _, outputs = await self.run_tool(onec, {str(2000 + i): photos.NONE for i in range(200)})
+        files = [o for o in outputs if isinstance(o, Path)]
+        self.assertEqual(len(files), 1)
+        self.assertTrue(str(files[0]).endswith(".xlsx"))
+        self.assertIn("файлом Excel", _text(outputs))
+        self.assertLess(len(_text(outputs)), 500, "сам список в чат не шлём")
+        files[0].unlink(missing_ok=True)
 
-    async def test_without_a_mark_it_is_one_request_not_one_per_mark(self):
-        """Обход по марке стоил 285 с на 166 марок — четыре с половиной минуты на вопрос
-        в чате и 166 поводов потерять запрос в туннеле (замер 30.09.2026)."""
+    async def test_one_request_not_one_per_mark(self):
+        """Обход по марке стоил 285 с на 166 марок (замер 30.09.2026)."""
         onec = FakeOnec({None: [item()]},
-                        marks=[TradeMark(name=f"Марка {i}", code=str(i))
-                               for i in range(166)])
+                        marks=[TradeMark(name=f"Марка {i}", code=str(i)) for i in range(166)])
         await self.run_tool(onec, {"1001": photos.HAS})
         self.assertEqual(onec.asked, [(None, None)])
 
     async def test_mark_name_comes_from_the_item(self):
-        """Без внешнего цикла по маркам группировать по ТМ больше не по чему — имя
-        приходит в самой позиции."""
         onec = FakeOnec({None: [item(site_id="1001", tm="Peli")]})
-        ex, _ = await self.run_tool(onec, {"1001": photos.NONE})
-        text, _ = ex.take_pending()
-        self.assertIn("Peli / Adventure WR", text)
+        _, outputs = await self.run_tool(onec, {"1001": photos.NONE})
+        self.assertIn("Peli / Adventure WR", _text(outputs))
 
     async def test_old_bsl_falls_back_to_walking_marks(self):
-        """Старый by-tm.bsl без марки не отвечает (tm_missing) — принять это за «товаров
-        нет» нельзя: обходим помеченные марки и говорим, что ускорится после выкладки."""
+        """Старый by-tm.bsl без марки отвечает tm_missing — «товаров нет» это не значит."""
         onec = FakeOnec({"1": [item(site_id="1001")]}, old_bsl=True)
-        _, answer = await self.run_tool(onec, {"1001": photos.NONE})
+        _, outputs = await self.run_tool(onec, {"1001": photos.NONE})
         self.assertEqual([code for code, _ in onec.asked], [None, "1"])
-        self.assertIn("Найдено 1", answer)
-        self.assertIn("by-tm.bsl", answer)
+        self.assertIn("item/1001", _text(outputs))
+        self.assertIn("by-tm.bsl", _text(outputs))
 
     async def test_mark_filter(self):
         onec = FakeOnec({"1": [item()]},
@@ -307,42 +354,26 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([code for code, _ in onec.asked], ["1"])
 
     async def test_unknown_mark(self):
-        onec = FakeOnec({})
-        _, answer = await self.run_tool(onec, {}, {"tm": "нетакой"})
-        self.assertIn("нет марок: «нетакой»", answer)
+        _, outputs = await self.run_tool(FakeOnec({}), {}, {"tm": "нетакой"})
+        self.assertIn("нет марок: «нетакой»", _text(outputs))
 
-    async def test_lost_positions_are_named_to_the_model(self):
+    async def test_lost_positions_are_named(self):
         onec = FakeOnec({None: [item()]}, errors=3)
-        _, answer = await self.run_tool(onec, {"1001": photos.NONE})
-        self.assertIn("не отдала 3", answer)
-
-    async def test_category_is_required(self):
-        """Анализ всей товарной массы запрещён — и проверяет это КОД, а не промпт."""
-        onec = FakeOnec({None: [item()]})
-        answer = await self.executor(onec)._photos_missing({})
-        self.assertIn("Назови категорию", answer)
-        self.assertEqual(onec.asked, [], "в 1С не ходили")
-
-    async def test_unknown_category_is_named(self):
-        onec = FakeOnec({})
-        answer = await self.executor(onec)._photos_missing({"product_type": "космолёты"})
-        self.assertIn("«космолёты»", answer)
-        self.assertEqual(onec.asked, [])
+        _, outputs = await self.run_tool(onec, {"1001": photos.NONE})
+        self.assertIn("не отдала 3", _text(outputs))
 
     async def test_other_categories_are_dropped(self):
         """Старый BSL фильтр вида мог не применить — отбор повторяем у себя."""
         onec = FakeOnec({None: [item(site_id="1001"),
                                 item(site_id="1002", type_ref="999999999")]})
-        ex, _ = await self.run_tool(onec, {"1001": photos.NONE, "1002": photos.NONE})
-        text, _ = ex.take_pending()
-        self.assertIn("item/1001", text)
-        self.assertNotIn("item/1002", text)
+        _, outputs = await self.run_tool(onec, {"1001": photos.NONE, "1002": photos.NONE})
+        self.assertIn("item/1001", _text(outputs))
+        self.assertNotIn("item/1002", _text(outputs))
 
     async def test_items_without_site_id_are_not_checked(self):
-        """Без id сайта товар на сайт не выгружался — «фото нет» про него не новость."""
         onec = FakeOnec({None: [item(site_id=""), item(site_id="1002")]})
-        ex, _ = await self.run_tool(onec, {"1002": photos.NONE})
-        self.assertIn("1 позиций", ex.take_pending()[0])
+        _, outputs = await self.run_tool(onec, {"1002": photos.NONE})
+        self.assertIn("1 позиций", _text(outputs))
 
     async def test_marks_list_and_unknown_mark_named(self):
         onec = FakeOnec({"1": [item(site_id="1001")],
@@ -350,11 +381,47 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
                         marks=[TradeMark(name="Classen / Классен", code="1"),
                                TradeMark(name="Peli", code="2"),
                                TradeMark(name="Kronotex", code="3")])
-        _, answer = await self.run_tool(onec, {"1001": photos.NONE, "1002": photos.NONE},
-                                        {"tms": ["Классен", "peli", "нетакой"]})
+        _, outputs = await self.run_tool(onec, {"1001": photos.NONE, "1002": photos.NONE},
+                                         {"tms": ["Классен", "peli", "нетакой"]})
         self.assertEqual(sorted(code for code, _ in onec.asked), ["1", "2"])
-        self.assertIn("Найдено 2", answer)
-        self.assertIn("«нетакой»", answer)
+        self.assertIn("Без фото на сайте: 2 поз.", _text(outputs))
+        self.assertIn("«нетакой»", _text(outputs))
+
+    # ------------------------------------------------- «недавно добавленные»
+
+    async def test_recent_goes_to_1c_with_the_depth(self):
+        """Отбор на стороне 1С: иначе тянули бы каталог, чтобы отбросить почти всё."""
+        onec = FakeOnec({None: [item()]})
+        await self.run_tool(onec, {}, recent=True)
+        self.assertEqual(onec.asked, [(None, _days_ago(180))])
+
+    async def test_recent_needs_no_category(self):
+        """Недавно добавленные ограничены сроком — категория тут по желанию."""
+        onec = FakeOnec({None: [item(site_id="1001", created=_days_ago(10)),
+                                item(site_id="1002", created=_days_ago(10),
+                                     type_ref="999999999")]})
+        _, outputs = await self.run_tool(onec, {"1001": photos.NONE, "1002": photos.NONE},
+                                         {"product_type": None}, recent=True)
+        text = _text(outputs)
+        self.assertIn("item/1001", text)
+        self.assertIn("item/1002", text, "все категории")
+        self.assertIn("новых позиций", text)
+
+    async def test_recent_drops_old_items_even_if_1c_sent_them(self):
+        """Старый by-tm.bsl параметр не заметит и отдаст всё — отбор повторяем у себя."""
+        onec = FakeOnec({None: [item(site_id="1001", created="2020-01-01"),
+                                item(site_id="1002", created=_days_ago(30))]})
+        _, outputs = await self.run_tool(onec, {"1001": photos.NONE, "1002": photos.NONE},
+                                         recent=True)
+        self.assertIn("item/1002", _text(outputs))
+        self.assertNotIn("item/1001", _text(outputs))
+
+    async def test_recent_depth_setting_reaches_1c(self):
+        onec = FakeOnec({None: [item()]})
+        ex = self.executor(onec, FakeSettings({"photo_recent_days": "30"}))
+        with patch.object(photos, "PhotoChecker", FakeChecker({})):
+            await ex.photo_check({"type_code": "", "tms": []}, recent=True)
+        self.assertEqual(onec.asked, [(None, _days_ago(30))])
 
     async def test_brief_answers_from_the_journal_without_a_walk(self):
         """Полный отчёт идёт в 1С и на сайт около минуты; сводка уже посчитана ежедневной

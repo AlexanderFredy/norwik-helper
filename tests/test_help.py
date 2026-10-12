@@ -69,7 +69,9 @@ class HelpTextTest(unittest.TestCase):
         admin = {c.command for c in ADMIN_COMMANDS}
         # Сводка «сколько ждут фото» — в ОБЩЕМ меню: фото добавляют менеджеры, им и нужно
         # видеть, сколько работы осталось (решение админа 30.09.2026).
-        self.assertEqual(common, {"start", "help", "no_photo_summury"})
+        # Глубина «недавно добавленных» — тоже всем, кто спрашивает агента про фото
+        # (решение админа 12.10.2026).
+        self.assertEqual(common, {"start", "help", "no_photo_summury", "photo_days"})
         self.assertTrue(common < admin)
         self.assertIn("prices", admin)
         # Команды отключённого потока в меню не показываем: то, что не отвечает, хуже
