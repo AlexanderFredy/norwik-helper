@@ -202,11 +202,14 @@ TOOL_DEFINITIONS = [
     {
         "name": "find_items_without_photo",
         "description": (
-            "Новые товары, у которых на сайте нет ни одного фото. Отвечает на вопросы "
-            "вида «покажи, где не добавлены фото», «у каких новых товаров нет "
-            "фотографий». Смотрит только товары, заведённые за последние месяцы "
-            "(months, по умолчанию 3) и выгружаемые на сайт; tm сужает до одной марки, "
-            "если менеджер её назвал. "
+            "Товары, выгружаемые на сайт, у которых там нет ни одного фото. Отвечает на "
+            "вопросы «где не хватает фото», «где не добавлены фото». КАТЕГОРИЯ ТОВАРА "
+            "ОБЯЗАТЕЛЬНА (product_type: ламинат, керамогранит, керамическая плитка, …): "
+            "по всему каталогу проверка не делается. Не назвал менеджер категорию — спроси "
+            "её, не вызывая инструмент. tms — марки, если назвали (одна или несколько). "
+            "months — только если спрашивают про НОВЫЕ товары: тогда смотрим заведённые за "
+            "последние months месяцев; без него — весь ассортимент категории на сайте. "
+            "Проверка категории идёт минуту-другую — предупреди об этом. "
             "СПИСОК УЖЕ ОТПРАВЛЕН менеджеру — отдельным сообщением или файлом Excel, "
             "смотря по длине. Тебе возвращаются ТОЛЬКО ЧИСЛА: ответь по ним одной "
             "фразой и не пересказывай список, не придумывай наименования и ссылки."
@@ -214,10 +217,14 @@ TOOL_DEFINITIONS = [
         "input_schema": {
             "type": "object",
             "properties": {
+                "product_type": {"type": "string",
+                                 "description": "категория товара — обязательна для списка"},
+                "tms": {"type": "array", "items": {"type": "string"},
+                        "description": "торговые марки, если менеджер их назвал"},
                 "tm": {"type": "string",
-                       "description": "торговая марка, если менеджер её назвал"},
+                       "description": "одна торговая марка (устарело — используй tms)"},
                 "months": {"type": "integer",
-                           "description": "за сколько последних месяцев, по умолчанию 3"},
+                           "description": "только новые: за сколько последних месяцев"},
                 "brief": {
                     "type": "boolean",
                     "description": (
@@ -454,50 +461,63 @@ class ToolExecutor:
     # ------------------------------------------------ фото на сайте (решение 30.09.2026)
 
     async def _photos_missing(self, inp: dict) -> str:
-        """Новые товары без фото на сайте.
+        """Товары без фото на сайте — по КАТЕГОРИИ, марки по желанию (решение 11.10.2026).
 
-        ТОТАЛЬНОГО ОБХОДА КАТАЛОГА ЗДЕСЬ НЕТ — это решение админа, а не упрощение: вопрос
-        про недавно заведённые товары, а «все товары без фото» будет отдельным
-        инструментом. Отбор идёт по `ДатаСоздания` на стороне 1С, иначе пришлось бы тянуть
-        каталог каждой марки целиком, чтобы отбросить его почти весь.
+        ТОТАЛЬНОГО ОБХОДА КАТАЛОГА НЕТ И НЕ БУДЕТ: категория обязательна, и проверяет это код.
+        Прежний режим «новые товары всех категорий» агенту больше не отдаётся; журнал
+        прогресса по-прежнему наполняет ежедневная проверка (`photo_scan.scan`).
         """
         if self._onec is None:
             return "Проверка фото недоступна: интеграция с 1С не настроена."
 
-        months = max(1, min(12, int(inp.get("months") or 3)))
-        since = _months_ago(months)
         wanted = (inp.get("tm") or "").strip()
+        tms = [str(t).strip() for t in (inp.get("tms") or []) if str(t).strip()]
+        if wanted and wanted not in tms:
+            tms.append(wanted)
 
         if inp.get("brief"):
-            return await self._photo_digest(wanted)
+            return await self._photo_digest(tms[0] if len(tms) == 1 else "")
 
-        # ПОЗИЦИИ ИЗ ЖУРНАЛА, ВЫПАВШИЕ ИЗ ОКНА НОВИЗНЫ, проверяем тоже — но только когда
-        # спрашивают про весь каталог. Вопрос про одну марку не должен тащить за собой
-        # чужие: человек спросил про Classen и ждёт ответ про Classen.
-        extra = []
-        if self._watch is not None and not wanted:
-            extra = [{"ref": w.ref, "site_id": w.site_id, "tm": w.tm,
-                      "collection": w.collection, "name": w.name, "created": w.created}
-                     for w in await self._watch.open_ids()]
+        # КАТЕГОРИЯ ОБЯЗАТЕЛЬНА — РЕШАЕТ КОД, а не промпт (решение админа 11.10.2026):
+        # проверка всего каталога запрещена, она стоила бы минут на каждый вопрос.
+        from src.price_tool import product_types
+        try:
+            type_code, type_name = product_types.resolve(inp.get("product_type"))
+        except ValueError as exc:
+            return str(exc)
+        return await self._photos_in_category(type_code, type_name, tms,
+                                              months=inp.get("months"))
 
-        found = await photo_scan.scan(self._onec, since=since, tm=wanted, extra=extra)
+    async def _photos_in_category(self, type_code: str, type_name: str, tms: list[str],
+                                  months=None) -> str:
+        """Товары категории без фото: только выгружаемые на сайт, марки по желанию."""
+        since = _months_ago(max(1, min(12, int(months)))) if months else ""
+        found = await photo_scan.scan_category(self._onec, type_code=type_code,
+                                               type_name=type_name, tms=tms, since=since)
         if found.problem:
             return found.problem
-        if not found.checked:
-            return (f"Новых товаров с {since} нет — проверять нечего "
-                    f"(марок просмотрено {found.marks}).")
-
-        # ЖУРНАЛ НАПОЛНЯЕТСЯ ПОПУТНО: обход уже сделан, и записать его итог стоит одного
-        # обращения к базе. Без этого прогресс считать было бы не из чего.
-        progress = None
-        if self._watch is not None:
+        scope = ", ".join(tms) if tms else ""
+        if self._watch is not None and found.observations:
             await self._watch.observe(found.observations)
-            progress = await self._watch.progress()
 
         text = photo_report.render(found.rows, since=since, checked=found.checked,
                                    marks=found.marks, no_card=found.no_card,
-                                   failed=found.failed, scope=wanted, progress=progress)
-        return self._deliver(text, found.rows, since, found.lost)
+                                   failed=found.failed, scope=scope, category=type_name)
+        tail = ""
+        if found.unknown_tms:
+            tail += " Не нашёл среди выгружаемых марок: " + ", ".join(
+                f"«{t}»" for t in found.unknown_tms) + "."
+        if found.note:
+            tail += " " + found.note
+        if not found.checked:
+            return (f"В категории «{type_name}»" + (f" по маркам {scope}" if scope else "")
+                    + " нет товаров, выгружаемых на сайт, — проверять нечего." + tail)
+        answer = self._deliver(text, found.rows, since, found.lost)
+        if found.rows:
+            answer = answer.replace(f"среди заведённых с {since}",
+                                    f"в категории «{type_name}»"
+                                    + (f", заведённых с {since}" if since else ""))
+        return answer + tail
 
     async def _photo_digest(self, tm: str = "") -> str:
         """Короткая сводка по маркам — ТА ЖЕ, что уходит подписчикам по понедельникам.

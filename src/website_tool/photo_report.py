@@ -64,7 +64,7 @@ def overdue(rows: list[Row], days: int = 30, today: str | None = None) -> int:
 
 def render(rows: list[Row], *, since: str, checked: int, marks: int,
            no_card: int = 0, failed: int = 0, scope: str = "",
-           progress=None, today: str | None = None) -> str:
+           progress=None, today: str | None = None, category: str = "") -> str:
     """Текст для чата. Группировка по «марка / коллекция», внутри — наименование и ссылка.
 
     `progress` — числа из журнала наблюдений (`storage/photo_watch`). Без них отчёт остаётся
@@ -72,16 +72,26 @@ def render(rows: list[Row], *, since: str, checked: int, marks: int,
     новых завели», а спрашивают обычно именно про это.
     """
     where = f" по марке «{scope}»" if scope else ""
+    # КАТЕГОРИЯ — ВЕСЬ ЕЁ АССОРТИМЕНТ НА САЙТЕ, а не только новые (решение админа
+    # 11.10.2026); `since` тогда необязателен и сужает до заведённых с даты.
+    kind = f" категории «{category}»" if category else ""
+    fresh = "новые " if since else ""
     if not rows:
-        head = f"Все новые товары{where} с фото."
+        head = f"Все {fresh}товары{kind}{where} с фото."
     else:
         late = overdue(rows, today=today)
         head = f"Без фото на сайте: {len(rows)} поз."
         if late:
             head += f", дольше месяца — {late}"
 
-    lines = [head, "",
-             f"Проверено{where}: {checked} новых позиций (с {_ru(since)}), марок {marks}."]
+    if category:
+        span = f", заведённых с {_ru(since)}" if since else ""
+        checked_line = (f"Проверено{where}: {checked} позиций{kind}, выгружаемых на сайт"
+                        f"{span}, марок {marks}.")
+    else:
+        checked_line = (f"Проверено{where}: {checked} новых позиций (с {_ru(since)}), "
+                        f"марок {marks}.")
+    lines = [head, "", checked_line]
 
     if progress is not None and (progress.closed_month or progress.median_days):
         moving = (f"Фото добавлено: за неделю {progress.closed_week}, "

@@ -17,13 +17,13 @@ from src.website_tool import photo_report, photos
 
 def item(ref="T1", site_id="1001", created="2026-09-01", name="Ламинат Classen Дуб Авола",
          parent="Adventure WR 1290x193x8", size="1290x193x8", collection="",
-         not_exported=False, tm="Classen / Классен"):
+         not_exported=False, tm="Classen / Классен", type_ref="000000003"):
     return NomItem(
         ref=ref, id=site_id, name=name, article="", unit="м2", size=size,
         product_type="Ламинат", collection=collection, parent=parent,
         collection_ref="F1", alt_units={}, purchase=None, retail=None, rrc=None,
         site_name=name, not_exported=not_exported, created=created, tm=tm,
-        tm_code="1")
+        tm_code="1", product_type_ref=type_ref)
 
 
 class MonthsAgoTest(unittest.TestCase):
@@ -196,9 +196,10 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
         return ToolExecutor(mail=None, norwik=None, onec=onec)
 
     async def run_tool(self, onec, verdicts, inp=None):
+        """Категория обязательна (решение админа 11.10.2026) — по умолчанию ламинат."""
         ex = self.executor(onec)
         with patch.object(photos, "PhotoChecker", FakeChecker(verdicts)):
-            answer = await ex._photos_missing(inp or {})
+            answer = await ex._photos_missing({"product_type": "ламинат", **(inp or {})})
         return ex, answer
 
     async def test_list_goes_to_the_manager_not_through_the_model(self):
@@ -228,22 +229,28 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
         """Старый by-tm.bsl параметр не заметит и отдаст всё — отбор повторяем у себя."""
         onec = FakeOnec({None: [item(site_id="1001", created="2020-01-01"),
                                 item(site_id="1002", created=_months_ago(1))]})
-        ex, answer = await self.run_tool(onec, {"1001": photos.NONE, "1002": photos.NONE})
+        ex, answer = await self.run_tool(onec, {"1001": photos.NONE, "1002": photos.NONE},
+                                         {"months": 3})
         text, _ = ex.take_pending()
         self.assertIn("item/1002", text)
         self.assertNotIn("item/1001", text)
 
-    async def test_no_dates_at_all_is_an_error_not_an_empty_answer(self):
-        """«Новых нет» читалось бы как «всё в порядке», а поле просто не выложено."""
-        onec = FakeOnec({None: [item(created=""), item(created="")]})
-        _, answer = await self.run_tool(onec, {})
-        self.assertIn("не отдаёт дату создания", answer)
-        self.assertIn("by-tm.bsl", answer)
+    async def test_without_months_the_whole_category_is_checked(self):
+        """Категория — весь её ассортимент на сайте (решение админа 11.10.2026): дата
+        заведения не нужна вовсе, старые позиции тоже в отчёте."""
+        onec = FakeOnec({None: [item(site_id="1001", created=""),
+                                item(site_id="1002", created="2020-01-01")]})
+        ex, answer = await self.run_tool(onec, {"1001": photos.NONE, "1002": photos.NONE})
+        self.assertEqual(onec.asked, [(None, None)], "окна новизны нет")
+        text, _ = ex.take_pending()
+        self.assertIn("item/1001", text)
+        self.assertIn("item/1002", text)
+        self.assertIn("категории «Ламинат»", text)
 
     async def test_discontinued_are_skipped(self):
         onec = FakeOnec({None: [item(site_id="1001", not_exported=True)]})
         _, answer = await self.run_tool(onec, {"1001": photos.NONE})
-        self.assertIn("Новых товаров", answer)
+        self.assertIn("нет товаров, выгружаемых на сайт", answer)
 
     async def test_items_without_a_card_are_not_listed(self):
         onec = FakeOnec({None: [item(site_id="1001"), item(site_id="1002")]})
@@ -273,7 +280,7 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
                         marks=[TradeMark(name=f"Марка {i}", code=str(i))
                                for i in range(166)])
         await self.run_tool(onec, {"1001": photos.HAS})
-        self.assertEqual(onec.asked, [(None, _months_ago(3))])
+        self.assertEqual(onec.asked, [(None, None)])
 
     async def test_mark_name_comes_from_the_item(self):
         """Без внешнего цикла по маркам группировать по ТМ больше не по чему — имя
@@ -283,12 +290,13 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
         text, _ = ex.take_pending()
         self.assertIn("Peli / Adventure WR", text)
 
-    async def test_old_bsl_refuses_the_tm_less_request(self):
-        """Старый by-tm.bsl отвечает пустым списком с tm_missing — принять это за «новых
-        товаров нет» нельзя."""
-        onec = FakeOnec({}, old_bsl=True)
-        _, answer = await self.run_tool(onec, {})
-        self.assertIn("не принимает запрос без марки", answer)
+    async def test_old_bsl_falls_back_to_walking_marks(self):
+        """Старый by-tm.bsl без марки не отвечает (tm_missing) — принять это за «товаров
+        нет» нельзя: обходим помеченные марки и говорим, что ускорится после выкладки."""
+        onec = FakeOnec({"1": [item(site_id="1001")]}, old_bsl=True)
+        _, answer = await self.run_tool(onec, {"1001": photos.NONE})
+        self.assertEqual([code for code, _ in onec.asked], [None, "1"])
+        self.assertIn("Найдено 1", answer)
         self.assertIn("by-tm.bsl", answer)
 
     async def test_mark_filter(self):
@@ -301,12 +309,52 @@ class ToolTest(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_mark(self):
         onec = FakeOnec({})
         _, answer = await self.run_tool(onec, {}, {"tm": "нетакой"})
-        self.assertIn("нет среди выгружаемых", answer)
+        self.assertIn("нет марок: «нетакой»", answer)
 
     async def test_lost_positions_are_named_to_the_model(self):
         onec = FakeOnec({None: [item()]}, errors=3)
         _, answer = await self.run_tool(onec, {"1001": photos.NONE})
         self.assertIn("не отдала 3", answer)
+
+    async def test_category_is_required(self):
+        """Анализ всей товарной массы запрещён — и проверяет это КОД, а не промпт."""
+        onec = FakeOnec({None: [item()]})
+        answer = await self.executor(onec)._photos_missing({})
+        self.assertIn("Назови категорию", answer)
+        self.assertEqual(onec.asked, [], "в 1С не ходили")
+
+    async def test_unknown_category_is_named(self):
+        onec = FakeOnec({})
+        answer = await self.executor(onec)._photos_missing({"product_type": "космолёты"})
+        self.assertIn("«космолёты»", answer)
+        self.assertEqual(onec.asked, [])
+
+    async def test_other_categories_are_dropped(self):
+        """Старый BSL фильтр вида мог не применить — отбор повторяем у себя."""
+        onec = FakeOnec({None: [item(site_id="1001"),
+                                item(site_id="1002", type_ref="999999999")]})
+        ex, _ = await self.run_tool(onec, {"1001": photos.NONE, "1002": photos.NONE})
+        text, _ = ex.take_pending()
+        self.assertIn("item/1001", text)
+        self.assertNotIn("item/1002", text)
+
+    async def test_items_without_site_id_are_not_checked(self):
+        """Без id сайта товар на сайт не выгружался — «фото нет» про него не новость."""
+        onec = FakeOnec({None: [item(site_id=""), item(site_id="1002")]})
+        ex, _ = await self.run_tool(onec, {"1002": photos.NONE})
+        self.assertIn("1 позиций", ex.take_pending()[0])
+
+    async def test_marks_list_and_unknown_mark_named(self):
+        onec = FakeOnec({"1": [item(site_id="1001")],
+                         "2": [item(site_id="1002", tm="Peli")]},
+                        marks=[TradeMark(name="Classen / Классен", code="1"),
+                               TradeMark(name="Peli", code="2"),
+                               TradeMark(name="Kronotex", code="3")])
+        _, answer = await self.run_tool(onec, {"1001": photos.NONE, "1002": photos.NONE},
+                                        {"tms": ["Классен", "peli", "нетакой"]})
+        self.assertEqual(sorted(code for code, _ in onec.asked), ["1", "2"])
+        self.assertIn("Найдено 2", answer)
+        self.assertIn("«нетакой»", answer)
 
     async def test_brief_answers_from_the_journal_without_a_walk(self):
         """Полный отчёт идёт в 1С и на сайт около минуты; сводка уже посчитана ежедневной
