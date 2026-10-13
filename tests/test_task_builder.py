@@ -855,6 +855,19 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         # верил этому списку больше, чем числу найденных, и заводил позицию заново.
         self.assertNotIn("артикулы_заняты_другой_коллекцией", got)
 
+    async def test_normalization_coverage_is_counted_by_the_file(self):
+        """Эггер, 13.10.2026: модель сверила один раздел, а прайс закрывает больше. По
+        следу сверок марка выглядела чужой, и нормализация молча не заводилась."""
+        tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([
+            self.nom("A1", "3309", collection="Vintage"),
+            self.nom("B1", "3310", collection="Classic"),
+            self.nom("C1", "9999", collection="Kingsize"),
+        ]))
+        await self.compare(tools, ["3309"], collection="Vintage")
+        self.assertEqual(tools.mark_coverage("T1"), (1, 3))
+        self.assertEqual(tools.mark_coverage_in_file("T1"), (2, 3))
+        self.assertEqual(tools._normalization_coverage("T1"), (2, 3))
+
     async def test_folder_name_identifies_the_own_collection(self):
         """Свойство «Classic 8-32V», папка «8/32 Classic 4V» — агент адресует папкой."""
         tools = TaskBuilderTools(price_workbook(), "Прайс.xlsx", onec=self.onec([

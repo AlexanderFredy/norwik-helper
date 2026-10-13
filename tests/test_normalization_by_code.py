@@ -19,7 +19,7 @@ class FakeTools:
         self.collected = []
         self.asked = []
 
-    def mark_coverage(self, code):
+    def _normalization_coverage(self, code):
         return self._coverage.get(code, (0, 0))
 
     def _add(self, inp):

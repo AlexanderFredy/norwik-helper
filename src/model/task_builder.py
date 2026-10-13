@@ -1020,6 +1020,33 @@ class TaskBuilderTools:
         covered = self._touched.get(tm_code, set())
         return len(live & covered), len(live)
 
+    def mark_coverage_in_file(self, tm_code: str) -> tuple[int, int]:
+        """То же, но ПО САМОМУ ФАЙЛУ: коллекция закрыта, если хоть один её артикул есть в
+        прайсе. Для НОРМАЛИЗАЦИИ (бой 13.10.2026, Эггер): прайс закрывает 7 из 12 живых
+        коллекций, а сверки модель звала по разделам, и раздел прайса ложится на две
+        коллекции 1С — по следу сверок выходило меньше половины, и задача молча не
+        заводилась. «Агент не сверял» — не «в прайсе нет», то же правило, что `_in_price`.
+        Для снятия остаётся `mark_coverage`: там решение необратимо, и судить по следу
+        сверки строже.
+        """
+        items = self._items_cache.get(tm_code) or ()
+        live: dict[str, bool] = {}
+        for i in items:
+            name = collection_of(i)
+            if i.not_exported or not name:
+                continue
+            live.setdefault(name, False)
+            if not live[name] and i.article and len(norm_article(i.article)) >= 3 \
+                    and self._in_price("", [i.article]):
+                live[name] = True
+        return sum(live.values()), len(live)
+
+    def _normalization_coverage(self, tm_code: str) -> tuple[int, int]:
+        """Доля для нормализации — большая из двух оценок: по следу сверок и по файлу."""
+        by_trace = self.mark_coverage(tm_code)
+        by_file = self.mark_coverage_in_file(tm_code)
+        return max(by_trace, by_file, key=lambda pair: (pair[0], -pair[1]))
+
     def _in_price(self, collection: str, articles) -> bool:
         """Встречается ли коллекция в прайсе — по артикулам и по имени.
 
@@ -1996,7 +2023,7 @@ class TaskBuilderTools:
             # снятия: доля закрытых коллекций. Агент принял заводскую пометку «Завод AGT»
             # за бренд и заказал нормализацию ВСЕГО каталога AGT — марки, о которой прайс
             # Вестерхофа говорит двумя коллекциями из семи (бой 24.09.2026).
-            covered, whole = self.mark_coverage(mark.code)
+            covered, whole = self._normalization_coverage(mark.code)
             if whole and covered * 2 < whole:
                 return self._refuse(
                     f"Прайс закрыл {covered} из {whole} коллекций марки «{tm}» — это не "
@@ -2299,7 +2326,7 @@ def _add_normalization_by_code(tools) -> list[str]:
         if any(t.kind == TaskKind.NORMALIZE_NAMES and t.address.tm.code == tm_code
                for t in tools.collected):
             continue
-        covered, live = tools.mark_coverage(tm_code)
+        covered, live = tools._normalization_coverage(tm_code)
         if live and covered * 2 < live:
             continue                # не его марка — `_add` отказал бы тем же
         name = tools._tm_names.get(tm_code, "") or tm_code
