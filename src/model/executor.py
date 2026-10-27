@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import re
+import weakref
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -1327,6 +1328,93 @@ class _PriceText:
         return bool(self.flat)
 
 
+#: Выгрузка марки для переноса в снятые: подключение → {код марки → (когда взята, позиции,
+#: дерево папок)}. Ключ — само подключение по слабой ссылке: память живёт, пока жив клиент
+#: 1С, и два клиента одну память не делят.
+_MARK_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _mark_memory(onec) -> dict:
+    try:
+        return _MARK_CACHE.setdefault(onec, {})
+    except TypeError:               # клиент без слабых ссылок — живём без памяти
+        return {}
+#: Сколько секунд выгрузка марки годится для следующей задачи на снятие.
+MARK_CACHE_SECONDS = 15 * 60
+#: Разобранный текст прайса: хеш содержимого → текст. Файл за пачку не меняется.
+_TEXT_CACHE: dict[str, "_PriceText"] = {}
+
+
+async def _mark_snapshot(onec, tm_code: str):
+    """Позиции марки со снятыми и дерево её папок — ОДНА ВЫГРУЗКА НА ПАЧКУ (бой 27.10.2026).
+
+    Перенос в снятые — один запрос записи, но перед ним задача выгружала весь каталог
+    марки вместе со снятыми: у Atlas Concorde это 53 страницы по 128 позиций, по VPN
+    3–19 с страница, то есть 4–6 минут, — и так в КАЖДОЙ задаче пачки. Запроса «позиции
+    одной папки» у 1С нет, а без всех позиций не узнать ни папку коллекции, ни чужие
+    коллекции внутри неё. Поэтому выгрузка живёт `MARK_CACHE_SECONDS`, а после каждого
+    переноса правится на месте (`_mark_moved`): следующей задаче нужна картина ПОСЛЕ
+    записи, и спрашивать её у 1С заново незачем — мы сами знаем, что сдвинули.
+    """
+    import time
+
+    memory = _mark_memory(onec)
+    taken = memory.get(tm_code)
+    if taken and time.monotonic() - taken[0] < MARK_CACHE_SECONDS:
+        return taken[1], taken[2]
+    nom = await asyncio.to_thread(onec.by_tm_all, tm_code, include_not_exported=True)
+    tree = await asyncio.to_thread(onec.folders, tm=tm_code)
+    memory[tm_code] = (time.monotonic(), list(nom.items), list(tree.items))
+    return memory[tm_code][1], memory[tm_code][2]
+
+
+def _mark_take(onec, tm_code: str):
+    """Снять выгрузку марки из памяти ПЕРЕД записью. Запись упала или вернула ошибку —
+    память так и останется пустой, и следующая задача выгрузит марку заново, а не
+    продолжит по картине, которой в 1С, возможно, уже нет."""
+    return _mark_memory(onec).pop(tm_code, None)
+
+
+def _mark_moved(onec, tm_code: str, taken, item_refs=(), folder_ref: str = "") -> None:
+    """Вернуть выгрузку в память, поправив её после переноса: перенесённое больше не живое.
+
+    Позиции убираются вовсе (они уехали в чужую ветку и коллекцию больше не составляют),
+    папка остаётся, но помеченной снятой — повтор той же задачи ответит «уже снята», а не
+    сдвинет её второй раз.
+    """
+    if not taken:
+        return
+    memory = _mark_memory(onec)
+    when, items, folders = taken
+    gone = set(item_refs)
+    items = [i for i in items if i.ref not in gone
+             and not (folder_ref and getattr(i, "collection_ref", "") == folder_ref)]
+    if folder_ref:
+        folders = [_as_discontinued(f) if f.ref == folder_ref else f for f in folders]
+    memory[tm_code] = (when, items, folders)
+
+
+def _as_discontinued(folder):
+    """Копия папки с пометкой «не выгружать» — исходный объект общий и не трогается."""
+    import copy
+
+    marked = copy.copy(folder)
+    object.__setattr__(marked, "not_exported", True)
+    return marked
+
+
+def _price_text(content: bytes, filename: str) -> "_PriceText":
+    """`_price_haystack` с памятью: прайс Артисаны — 12 870 строк на каждую задачу пачки."""
+    import hashlib
+
+    key = hashlib.sha1(content or b"").hexdigest()
+    if key not in _TEXT_CACHE:
+        if len(_TEXT_CACHE) > 8:
+            _TEXT_CACHE.clear()
+        _TEXT_CACHE[key] = _price_haystack(content, filename)
+    return _TEXT_CACHE[key]
+
+
 def _price_haystack(content: bytes, filename: str = "price.xlsx") -> _PriceText:
     """Весь текст прайса без разделителей и регистра — и набор кодов из него.
 
@@ -1416,8 +1504,7 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
         return (TaskStatus.TODO,
                 "У задачи нет кода марки или имени коллекции — переносить нечего.")
 
-    nom = await asyncio.to_thread(onec.by_tm_all, tm_code, include_not_exported=True)
-    tree = await asyncio.to_thread(onec.folders, tm=tm_code)
+    every, folders = await _mark_snapshot(onec, tm_code)
     # КОЛЛЕКЦИЯ — ПО ЛЮБОМУ ИМЕНИ АДРЕСА И ПО КОДУ ПАПКИ (бой 08.10.2026). Адрес несёт и
     # имя из 1С, и имя из прайса; задачи, собранные раньше, — только прайсовое («8/32
     # Классик» при «Classic 8-32V» в 1С). Код папки точнее имени, когда он есть.
@@ -1425,9 +1512,9 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
     code = (task.address.subject.code or "").strip()
     # КОД ПАПКИ СНЯТЫХ — НЕ КОД КОЛЛЕКЦИИ (бой 27.10.2026, задача 1265): по нему в
     # коллекцию попало бы всё, что лежит в корне снятых, чужие позиции включительно.
-    if code and any(f.ref == code and f.kind == "discontinued" for f in tree.items):
+    if code and any(f.ref == code and f.kind == "discontinued" for f in folders):
         code = ""
-    mine = [i for i in nom.items
+    mine = [i for i in every
             if nz.collection_of(i).casefold() in names
             or (code and (getattr(i, "collection_ref", "") or "") == code)]
 
@@ -1436,10 +1523,10 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
     # Дуб Даннингтон темный»). Все они в ОДНОЙ коллекции 1С — значит это она; в разных —
     # гадать нельзя, переносим только по имени.
     if not mine:
-        owner = _collection_by_articles(nom.items, task.description)
+        owner = _collection_by_articles(every, task.description)
         if owner:
             names.add(owner.casefold())
-            mine = [i for i in nom.items if nz.collection_of(i).casefold() == owner.casefold()]
+            mine = [i for i in every if nz.collection_of(i).casefold() == owner.casefold()]
             wanted = owner
     live = [i for i in mine if not i.not_exported]
 
@@ -1447,7 +1534,7 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
     # всё равно нужно: позиции коллекции могли уже уехать в снятые по одной — так вышло с
     # Brilliant, — и тогда папка висит в живой ветке пустой, а узнать о ней можно только
     # оттуда.
-    folder, why = _collection_folder(tree.items, task.address.subject, wanted, live)
+    folder, why = _collection_folder(folders, task.address.subject, wanted, live)
 
     if folder is not None and folder.not_exported:
         return (TaskStatus.DONE,
@@ -1457,7 +1544,7 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
     # дальше брался вид у несуществующей папки, и ответ «у позиции не заполнен вид
     # товара» отправлял админа искать карточку, которой нет.
     if not mine and folder is None:
-        known = sorted({nz.collection_of(i) for i in nom.items
+        known = sorted({nz.collection_of(i) for i in every
                         if not i.not_exported and nz.collection_of(i)})
         return (TaskStatus.TODO,
                 f"У марки нет ни позиций, ни папки коллекции «{wanted}» — вероятно, в 1С "
@@ -1466,7 +1553,7 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
 
     # ЧТО ИЗ КОЛЛЕКЦИИ ЕЩЁ СТОИТ В ПРАЙСЕ. Необратимая операция обязана опираться на
     # файл, а не на формулировку задачи: её писала модель.
-    haystack = _price_haystack(content, filename)
+    haystack = _price_text(content, filename)
     if live and not haystack:
         return (TaskStatus.TODO,
                 "Прайс не разобрался — проверить, ушла ли коллекция из него, нечем. "
@@ -1518,9 +1605,12 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
             return TaskStatus.TODO, _unplaced_text(unplaced, dc)
 
         guard()
+        before = _mark_take(onec, tm_code)
         result = await asyncio.to_thread(onec.set_items, ops)
         errors = result.get("errors") or []
         moved = [i for i, target in placed if target]
+        if not errors:
+            _mark_moved(onec, tm_code, before, item_refs=[i.ref for i in moved])
         targets = sorted({target for _, target in placed if target})
         # КОДЫ 1С — в отчёте, а не только имена (просьба админа 08.10.2026): по ним
         # перенесённое находится в справочнике и, если надо, возвращается.
@@ -1568,7 +1658,7 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
                 "потому что по одной это оставило бы пустую папку в живой ветке.")
 
     # ПАПКА ДОЛЖНА БЫТЬ НАША ЦЕЛИКОМ: перенос утащит всё, что внутри.
-    strangers = sorted({nz.collection_of(i) for i in nom.items
+    strangers = sorted({nz.collection_of(i) for i in every
                         if i.collection_ref == folder.ref
                         and nz.collection_of(i).casefold() not in names})
     if strangers:
@@ -1578,11 +1668,14 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
                 "Разберите папку либо перенесите позиции по одной.")
 
     guard()
+    before = _mark_take(onec, tm_code)
     result = await asyncio.to_thread(
         onec.set_items,
         [{"op": "update_folder", "ref": folder.ref, "parent_ref": target}])
 
     errors = result.get("errors") or []
+    if not errors:
+        _mark_moved(onec, tm_code, before, folder_ref=folder.ref)
     if errors:
         return (TaskStatus.TODO,
                 f"Папку «{folder.name}» перенести не удалось: "

@@ -645,6 +645,28 @@ class DiscontinueTest(unittest.IsolatedAsyncioTestCase):
                                      "parent_ref": self.TARGET}])
         self.assertEqual(status, TaskStatus.DONE)
 
+    async def test_a_batch_downloads_the_mark_once(self):
+        """БОЙ 27.10.2026: каждая задача пачки заново выгружала каталог Atlas Concorde со
+        снятыми — 53 страницы, 4–6 минут, — хотя запись одна. Вторая задача по той же
+        марке берёт выгрузку из памяти и видит, что первая уже сдвинула."""
+        onec = self.onec([self.item_in("R1"), self.item_in("R2", collection="Quick",
+                                                             folder="F-Q")],
+                         [self.Folder("F-BR", "Brilliant"), self.Folder("F-Q", "Quick")])
+        calls, written = [], []
+        real, write = onec.by_tm_all, onec.set_items
+        onec.by_tm_all = lambda *a, **kw: calls.append(1) or real(*a, **kw)
+        onec.set_items = lambda ops: written.extend(ops) or write(ops)
+
+        await run_discontinue(onec, self.task_for(code="F-BR"), allow, self.price())
+        await run_discontinue(onec, self.task_for(name="Quick", code="F-Q"), allow,
+                              self.price())
+        status, text = await run_discontinue(onec, self.task_for(code="F-BR"), allow,
+                                             self.price())
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([op["ref"] for op in written], ["F-BR", "F-Q"])
+        self.assertIn("уже помечена невыгружаемой", text)
+
     async def test_article_glued_to_the_title_is_still_found(self):
         """Обратная сторона: артикул, слепленный с названием и размером, по-прежнему
         находится — «CO 512», «LE-266-32», «EPL075Дуб»."""
