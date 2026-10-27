@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
@@ -99,6 +100,9 @@ class OnecProvider(Listener):
         self._messages: list[dict] = []
         # Куда класть файлы прайсов, загруженные из формы 1С, до их приёма службой.
         self._inbox = Path(inbox_dir) if inbox_dir else Path("data") / "incoming"
+        # Хеш содержимого файла прайса по пути. Принятый файл не меняется, поэтому
+        # считается один раз на процесс, а не на каждый снимок.
+        self._hashes: dict[str, str] = {}
         # Хранилище связок «команда очереди → команда 1С» (`src/storage/sent_commands.py`).
         # Без него провайдер работает по-старому, в памяти: это годится для тестов, но не
         # для боевой работы — перезапуск процесса запирает форму навсегда.
@@ -420,6 +424,10 @@ class OnecProvider(Listener):
                 # листов двойным щелчком по имени файла. Иначе пришлось бы искать формат
                 # по имени файла, а имена меняются каждый месяц.
                 "signature": sp.signature or "",
+                # ХЕШ СОДЕРЖИМОГО ФАЙЛА (решение админа 27.10.2026): по нему форма перед
+                # загрузкой узнаёт, что ровно этот файл уже есть в модели, и переспрашивает.
+                # Именно содержимое, а не имя: «Прайс.xlsx» приходит каждый месяц новым.
+                "file_hash": await self._file_hash(sp.file_path),
                 # ВАЛЮТА ПРАЙСА И ЕЁ КУРС: форма брендов показывает их и даёт поправить.
                 # Код — по международному классификатору («978» EUR), по нему 1С находит
                 # элемент `Справочники.Валюты`. Пусто означает «рубль, как раньше»; курс без
@@ -568,6 +576,20 @@ class OnecProvider(Listener):
             # прежняя дата всё равно была пустой.
             "run_at": task.run_at,
         }
+
+    async def _file_hash(self, path_text: str) -> str:
+        """SHA-256 файла прайса, строчные hex. Файла нет — пусто, и форма не спросит."""
+        from src.storage import price_files
+
+        if not path_text:
+            return ""
+        if path_text not in self._hashes:
+            try:
+                data = await asyncio.to_thread(price_files.to_path(path_text).read_bytes)
+            except OSError:
+                return ""
+            self._hashes[path_text] = hashlib.sha256(data).hexdigest()
+        return self._hashes[path_text]
 
     async def _supplier_name(self, supplier_id: int) -> str:
         """Имя поставщика для колонки «Поставщик».

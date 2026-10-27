@@ -118,6 +118,28 @@ class UploadTest(Base):
         self.assertIn("более свежий", final[0]["message"])
 
 
+class FileHashTest(Base):
+    """Хеш содержимого в снимке — по нему форма узнаёт повторно загружаемый файл."""
+
+    def price(self, path):
+        from src.model.price import Price, SupplierPrice
+        return Price(supplier_price=SupplierPrice(supplier_id=1, file_id=1,
+                                                  file_path=str(path), filename="Прайс.xlsx"),
+                     id=568)
+
+    async def test_snapshot_carries_sha256_of_the_content(self):
+        import hashlib
+        path = self.root / "p.xlsx"
+        path.write_bytes(b"XLS-bytes")
+        provider = OnecProvider(UploadOnec(), FakeService([self.price(path)]))
+        row = (await provider.snapshot())[0]
+        self.assertEqual(row["file_hash"], hashlib.sha256(b"XLS-bytes").hexdigest())
+
+    async def test_missing_file_gives_empty_hash_not_an_error(self):
+        provider = OnecProvider(UploadOnec(), FakeService([self.price(self.root / "нет.xlsx")]))
+        self.assertEqual((await provider.snapshot())[0]["file_hash"], "")
+
+
 class ServiceUploadTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_service_submits_and_removes_the_temp_file(self):
