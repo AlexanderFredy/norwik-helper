@@ -1,6 +1,7 @@
 """Точка входа: запуск Telegram-бота."""
 import asyncio
 import logging
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 
@@ -425,7 +426,14 @@ async def main() -> None:
         # между «принята» и исходом иначе запирает форму навсегда (24.09.2026).
         sent_commands = SentCommands(config.db_path)
         await sent_commands.init()
-        onec_provider = OnecProvider(onec, model, supplier_store, sent=sent_commands)
+        # Сообщения агента для формы 1С — очередь в базе, доставка провайдером (27.10.2026:
+        # Telegram с сервера пропал на полдня, и в форме не было видно ни одного ответа).
+        from src.storage.onec_outbox import OnecOutbox
+        outbox = OnecOutbox(config.db_path)
+        await outbox.init()
+        onec_provider = OnecProvider(onec, model, supplier_store, sent=sent_commands,
+                                     outbox=outbox,
+                                     inbox_dir=Path(config.db_path).parent / "incoming")
         providers.append(onec_provider)
         model.events.subscribe(onec_provider)
         logger.info("Форма 1С подключена как второй визуал")

@@ -41,6 +41,8 @@ class TelegramListener(Listener):
     def __init__(self, bot, chat_ids) -> None:
         self._bot = bot
         self._chats = list(chat_ids)
+        # Ссылки на фоновые отправки: без них сборщик мусора вправе снять задачу на лету.
+        self._pending: set = set()
 
     async def notify(self, event: Event) -> None:
         # ПУСТОЙ ТЕКСТ — СОБЫТИЕ НЕ ДЛЯ ЧЕЛОВЕКА, а для зеркал: так переименование
@@ -53,8 +55,20 @@ class TelegramListener(Listener):
         # Иначе админ получил бы весь текст дважды.
         if event.kind == EventKind.PRICE_SUMMARY:
             return
+        # ОТПРАВКА — В ФОНЕ (бой 27.10.2026). Событие публикуется посреди работы модели, и
+        # пока Telegram с сервера недоступен, каждое сообщение держало бы сборку или задачу
+        # до таймаута сети. Доставка в Telegram — уведомление, а не часть работы.
+        task = asyncio.create_task(self._deliver(event.text))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+
+    async def _deliver(self, text: str) -> None:
         for chat in self._chats:
-            await self._bot.send_message(chat, event.text)
+            try:
+                await self._bot.send_message(chat, text)
+            except Exception:                           # noqa: BLE001
+                logger.warning("Сообщение админу в Telegram не доставлено: %s", text[:80],
+                               exc_info=True)
 
 
 class ManagerListener(Listener):

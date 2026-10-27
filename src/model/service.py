@@ -263,8 +263,35 @@ class PriceListService:
             return await self._set_signature_marks(command)
         if kind == CommandKind.SET_SIGNATURE_FORMAT:
             return await self._set_signature_format(command)
+        if kind == CommandKind.SUBMIT_PRICE:
+            return await self._submit_uploaded(command)
 
         logger.warning("Неизвестная команда: %s", kind)
+
+    async def _submit_uploaded(self, command: Command) -> None:
+        """Прайс, загруженный из формы 1С (решение админа 27.10.2026).
+
+        Файл уже лежит на диске агента — его скачал провайдер при разборе команды, — а
+        здесь обычный приём, тот же `submit`, что у Telegram. Отказ (устаревший прайс и
+        прочее) публикуется самим `submit` и закрывает команду в 1С отказом.
+        """
+        from pathlib import Path
+
+        data = command.payload or {}
+        path = Path(str(data.get("path") or ""))
+        if not path.is_file():
+            return await self._reject(command, "файл прайса не найден на диске агента — "
+                                               "загрузите его ещё раз")
+        try:
+            await self.submit(path.read_bytes(), str(data.get("filename") or path.name),
+                              supplier_hint=str(data.get("supplier") or "").strip(),
+                              force=bool(data.get("force")), actor=command.actor)
+        finally:
+            # Копия на диске агента своё отслужила: принятый прайс `submit` сохранил сам.
+            try:
+                path.unlink()
+            except OSError:
+                logger.warning("Временный файл %s не удалился", path, exc_info=True)
 
     async def _set_signature_sheets(self, command: Command) -> None:
         """Какие листы разбирать у формата прайса (решение админа 02.10.2026).

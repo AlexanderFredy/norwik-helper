@@ -787,6 +787,24 @@ class OnecClient:
         """
         return self._post_json("/get-products/agent-commands-state", {"commands": items})
 
+    def agent_file(self, command_id: str) -> dict:
+        """Файл, приложенный к команде «принять прайс» из формы 1С (решение 27.10.2026).
+
+        Ответ: `{"name", "supplier", "data"}`, `data` — base64. Нет файла — `{"error":
+        "not_found"}`. Ждём дольше обычного: прайс бывает на 20 МБ, а в base64 он на треть
+        тяжелее.
+        """
+        r = self._get("/get-products/agent-file", params={"id": command_id}, timeout=180)
+        text = r.content.decode("utf-8-sig", errors="replace")
+        if "<!DOCTYPE" in text[:500] or "<html" in text[:500].lower():
+            raise RuntimeError(f"1С вернул HTML вместо JSON (HTTP {r.status_code})")
+        r.raise_for_status()
+        return json.loads(text)
+
+    def agent_messages(self, items: list[dict]) -> dict:
+        """Положить в 1С сообщения агента для формы (то же, что уходит админу в Telegram)."""
+        return self._post_json("/get-products/agent-messages", {"messages": items})
+
     def set_model_state(self, prices: list[dict],
                         sheets: list[dict] | None = None,
                         marks: list[dict] | None = None) -> dict:

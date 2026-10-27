@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from datetime import datetime, timezone
 
 from src.model.commands import Command, CommandKind
@@ -86,10 +87,18 @@ class OnecProvider(Listener):
     этом можно только от модели. Признак «менялось» ставит `notify`, снимает `collect`.
     """
 
-    def __init__(self, onec, service, suppliers=None, sent=None) -> None:
+    def __init__(self, onec, service, suppliers=None, sent=None, outbox=None,
+                 inbox_dir=None) -> None:
         self._onec = onec
         self._service = service
         self._suppliers = suppliers
+        # СООБЩЕНИЯ АГЕНТА ДЛЯ ФОРМЫ (решение админа 27.10.2026): то же, что уходит админу в
+        # Telegram. Очередь в базе (`storage/onec_outbox.py`) — без неё копим в памяти,
+        # этого хватает тестам.
+        self._outbox = outbox
+        self._messages: list[dict] = []
+        # Куда класть файлы прайсов, загруженные из формы 1С, до их приёма службой.
+        self._inbox = Path(inbox_dir) if inbox_dir else Path("data") / "incoming"
         # Хранилище связок «команда очереди → команда 1С» (`src/storage/sent_commands.py`).
         # Без него провайдер работает по-старому, в памяти: это годится для тестов, но не
         # для боевой работы — перезапуск процесса запирает форму навсегда.
@@ -134,9 +143,25 @@ class OnecProvider(Listener):
 
     async def notify(self, event: Event) -> None:
         self._changes += 1
-        if event.kind == EventKind.COMMAND_REJECTED:
+        # Отказ ПРИЁМА прайса — тоже отказ команды: «принять прайс» из формы адресована
+        # ни прайсу, ни задаче, и ключ (инициатор, None, None) у них совпадает.
+        if event.kind in (EventKind.COMMAND_REJECTED, EventKind.PRICE_REJECTED):
             key = (event.actor, event.price_id, event.task_id)
             self._refusals[key] = event.text
+        # Пустой текст — событие для зеркал, не для человека; сводка менеджерам — не админу.
+        if (event.text or "").strip() and event.kind != EventKind.PRICE_SUMMARY:
+            row = {"text": event.text.strip(), "kind": event.kind,
+                   "price_id": event.price_id, "task_id": event.task_id}
+            if self._outbox is not None:
+                try:
+                    await self._outbox.add(**row)
+                except Exception:                       # noqa: BLE001
+                    logger.warning("Сообщение для 1С не сохранилось", exc_info=True)
+            else:
+                self._messages.append({**row, "id": str(len(self._messages) + 1),
+                                       "at": _utcnow().isoformat(),
+                                       "price_id": event.price_id or 0,
+                                       "task_id": event.task_id or 0})
 
     # -------------------------------------------------------------------- оборот
 
@@ -158,6 +183,11 @@ class OnecProvider(Listener):
             logger.warning("Снимок состояния не доехал до 1С", exc_info=True)
 
         try:
+            await self._push_messages()
+        except Exception:                               # noqa: BLE001
+            logger.warning("Сообщения агента не доехали до 1С", exc_info=True)
+
+        try:
             await self._finish_sent(queue)
         except Exception:                               # noqa: BLE001
             logger.warning("Не удалось подтвердить команды 1С", exc_info=True)
@@ -166,6 +196,59 @@ class OnecProvider(Listener):
             await self._pull_commands(queue)
         except Exception:                               # noqa: BLE001
             logger.warning("Команды из 1С не забрались", exc_info=True)
+
+    # -------------------------------------------------------- сообщения агента
+
+    async def _push_messages(self) -> None:
+        """Доставить накопленные сообщения в форму. Снимаются ТОЛЬКО после ответа 1С."""
+        if self._outbox is not None:
+            batch = await self._outbox.pending()
+        else:
+            batch = list(self._messages[:50])
+        if not batch:
+            return
+        answer = await asyncio.to_thread(self._onec.agent_messages, batch)
+        # Старый BSL такого маршрута не знает и отвечает ошибкой — тогда НЕ снимаем:
+        # сообщения дождутся выкладки, а не пропадут.
+        if isinstance(answer, dict) and answer.get("error"):
+            logger.warning("1С не приняла сообщения агента: %s", answer.get("error"))
+            return
+        if self._outbox is not None:
+            await self._outbox.forget(m["id"] for m in batch)
+        else:
+            del self._messages[:len(batch)]
+
+    # --------------------------------------------------- файл прайса из формы
+
+    async def _fetch_upload(self, raw: dict) -> str:
+        """Скачать файл команды «принять прайс» к себе. Возвращает причину отказа либо "".
+
+        ФАЙЛ ИДЁТ МИМО ОЧЕРЕДИ, ПУТЬ — ЧЕРЕЗ НЕЁ (решение 27.10.2026). В очереди команда
+        живёт строкой JSON, и двадцать мегабайт в ней — это та же строка в каждом её чтении;
+        поэтому файл ложится на диск агента, а команда несёт путь. Приём выполняет служба
+        обычной командой: он тут же собирает задачи, это минуты работы модели, и делать их
+        здесь, в опросе 1С, значило бы встать всем циклом — без прерывания и без опроса.
+        """
+        import base64
+
+        external = str(raw.get("id") or "")
+        answer = await asyncio.to_thread(self._onec.agent_file, external)
+        if answer.get("error"):
+            return f"файл команды в 1С не найден ({answer['error']})"
+        name = str(answer.get("name") or "").strip() or "прайс.xlsx"
+        content = base64.b64decode(answer.get("data") or "")
+        if not content:
+            return "файл пустой"
+
+        self._inbox.mkdir(parents=True, exist_ok=True)
+        path = self._inbox / f"{external}{Path(name).suffix.lower()}"
+        path.write_bytes(content)
+        payload = dict(raw.get("payload") or {})
+        payload.update({"path": str(path), "filename": name,
+                        "supplier": str(answer.get("supplier") or payload.get("supplier")
+                                        or "")})
+        raw["payload"] = payload
+        return ""
 
     # ---------------------------------------------------------- судьба команд
 
@@ -553,6 +636,18 @@ class OnecProvider(Listener):
             external = str(raw.get("id") or "")
             if not external:
                 continue
+            if str(raw.get("kind") or "").strip() == CommandKind.SUBMIT_PRICE.value:
+                try:
+                    why = await self._fetch_upload(raw)
+                except Exception:                       # noqa: BLE001
+                    # Сеть моргнула — команда остаётся «ждёт» и приедет следующим опросом.
+                    logger.warning("Файл команды %s не скачан из 1С", external,
+                                   exc_info=True)
+                    continue
+                if why:
+                    refused.append({"id": external, "state": "отклонена",
+                                    "message": why})
+                    continue
             parsed = self._parse(raw)
             if parsed is None:
                 refused.append({"id": external, "state": "отклонена",
