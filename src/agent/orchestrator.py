@@ -15,6 +15,26 @@ logger = logging.getLogger(__name__)
 MODEL = "claude-haiku-5-5"
 MAX_TOKENS = 16000
 MAX_ITERATIONS = 30
+#: Сколько раз за ход подхватываем ответ, оборванный на `MAX_TOKENS`. Дальше — как раньше:
+#: что успело прийти, то и ответ; бесконечно просить «короче» незачем.
+MAX_TRUNCATIONS = 2
+
+
+def _append_to_last_user(messages: list[dict], block: dict) -> None:
+    """Дописать блок в последнее сообщение пользователя (строку превращаем в блоки)."""
+    last = messages[-1] if messages else None
+    if last is None or last.get("role") != "user":
+        messages.append({"role": "user", "content": [block]})
+        return
+    content = last["content"]
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    messages[-1] = {"role": "user", "content": list(content) + [block]}
+TRUNCATED_NOTE = (
+    "Твой предыдущий ответ оборвался на пределе длины и в него не вошло ничего, кроме "
+    "уже выполненных выше вызовов; последний вызов (если был) отброшен — повтори его. "
+    "Продолжай КОРОТКО: не рассуждай и не пиши длинного текста, делай работу вызовами "
+    "инструментов порциями — не больше 10 вызовов за ответ.")
 
 # Модели ДО 4.6 адаптивного рассуждения не знают: на `thinking: adaptive` они отвечают 400.
 # Им рассуждение задаётся бюджетом, а веб-поиск — базовой версией инструмента. Список по
@@ -162,6 +182,7 @@ class Orchestrator:
         messages = list(messages)
         tools = tools_for(self.model, (list(TOOL_DEFINITIONS) if base_tools else [])
                           + list(extra_tools or []))
+        truncations = 0
 
         for iteration in range(1, MAX_ITERATIONS + 1):
             response = await self._client.messages.create(
@@ -195,6 +216,39 @@ class Orchestrator:
                 logger.warning("Модель отклонила запрос: %s", response.stop_details)
                 return "Не могу обработать этот запрос. Попробуйте переформулировать.", messages
 
+            if response.stop_reason == "max_tokens" and truncations < MAX_TRUNCATIONS:
+                # ОБРЫВ ПО ДЛИНЕ — НЕ ОКОНЧАТЕЛЬНЫЙ ОТВЕТ (бой 26.10.2026, сборка Артисаны:
+                # 16 000 выходных токенов без единого `add_task`, и цикл принял обрубок за
+                # итог — задач не завелось ни одной). Целые вызовы выполняем, последний
+                # (он мог оборваться посреди входа) отбрасываем, и просим продолжить короче.
+                truncations += 1
+                logger.warning("Ответ модели оборвался на пределе %d токенов (%d-й раз)",
+                               MAX_TOKENS, truncations)
+                blocks = list(response.content)
+                last_call = max((i for i, b in enumerate(blocks) if b.type == "tool_use"),
+                                default=None)
+                if last_call is not None:
+                    # Реплика ДО последнего вызова — целиком, с рассуждением: при вызовах
+                    # инструментов API требует вернуть блоки thinking той же реплики.
+                    head = blocks[:last_call]
+                else:
+                    # Вызовов нет — оборвалось рассуждение или текст. Рассуждение без
+                    # подписи вернуть нельзя, текст — можно и полезно: модель увидит, где
+                    # остановилась.
+                    head = [b for b in blocks if b.type == "text"]
+                calls = [b for b in head if b.type == "tool_use"]
+                note = {"type": "text", "text": TRUNCATED_NOTE}
+                if head:
+                    messages.append({"role": "assistant",
+                                     "content": [b.model_dump() for b in head]})
+                    results = await self._run_tools(calls, on_tool, extra_executor)
+                    messages.append({"role": "user", "content": results + [note]})
+                else:
+                    # Ответить нечем — дописываем пояснение в прошлое сообщение
+                    # пользователя: две реплики пользователя подряд API не примет как есть.
+                    _append_to_last_user(messages, note)
+                continue
+
             tool_uses = [b for b in response.content if b.type == "tool_use"]
             if response.stop_reason != "tool_use" or not tool_uses:
                 messages.append({"role": "assistant", "content": content})
@@ -202,27 +256,32 @@ class Orchestrator:
                 return (text.strip() or "Не удалось сформировать ответ. Попробуйте ещё раз."), messages
 
             messages.append({"role": "assistant", "content": content})
-            results = []
-            for tool in tool_uses:
-                logger.info("Инструмент %s: %s", tool.name, tool.input)
-                if on_tool:
-                    await on_tool(tool.name, tool.input)
-                if extra_executor is not None and extra_executor.handles(tool.name):
-                    output = await extra_executor.execute(tool.name, tool.input)
-                else:
-                    output = await self._executor.execute(tool.name, tool.input)
-                results.append(
-                    {
-                        # output — строка ЛИБО список блоков: read_price_file прикладывает
-                        # к тексту баннеры из прайса картинками, прочитать их может только
-                        # модель. Не сводить к str().
-                        "type": "tool_result",
-                        "tool_use_id": tool.id,
-                        "content": output,
-                    }
-                )
+            results = await self._run_tools(tool_uses, on_tool, extra_executor)
             messages.append({"role": "user", "content": results})
 
         logger.error("Превышен лимит итераций (%d)", MAX_ITERATIONS)
         return ("Запрос оказался слишком сложным, не удалось завершить поиск. "
                 "Попробуйте уточнить запрос."), messages
+
+    async def _run_tools(self, tool_uses, on_tool, extra_executor) -> list[dict]:
+        """Выполнить вызовы инструментов одного ответа модели → блоки `tool_result`."""
+        results = []
+        for tool in tool_uses:
+            logger.info("Инструмент %s: %s", tool.name, tool.input)
+            if on_tool:
+                await on_tool(tool.name, tool.input)
+            if extra_executor is not None and extra_executor.handles(tool.name):
+                output = await extra_executor.execute(tool.name, tool.input)
+            else:
+                output = await self._executor.execute(tool.name, tool.input)
+            results.append(
+                {
+                    # output — строка ЛИБО список блоков: read_price_file прикладывает
+                    # к тексту баннеры из прайса картинками, прочитать их может только
+                    # модель. Не сводить к str().
+                    "type": "tool_result",
+                    "tool_use_id": tool.id,
+                    "content": output,
+                }
+            )
+        return results
