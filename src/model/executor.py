@@ -26,6 +26,8 @@ import logging
 import re
 import weakref
 from dataclasses import dataclass
+
+from src.price_tool import naming
 from datetime import date
 from decimal import Decimal
 
@@ -1403,19 +1405,39 @@ def _as_discontinued(folder):
     return marked
 
 
-def _price_text(content: bytes, filename: str) -> "_PriceText":
-    """`_price_haystack` с памятью: прайс Артисаны — 12 870 строк на каждую задачу пачки."""
+def _price_text(content: bytes, filename: str, sheets=None) -> "_PriceText":
+    """`_price_haystack` с памятью: прайс Артисаны — 12 870 строк на каждую задачу пачки.
+
+    `sheets` — прайс, СУЖЕННЫЙ ТАК ЖЕ, КАК У СБОРЩИКА (решение админа 27.10.2026):
+    отмеченные листы и строки отмеченных брендов. Ключ памяти тогда — и сам этот набор:
+    один файл с разным выбором брендов — это разные тексты.
+    """
     import hashlib
 
-    key = hashlib.sha1(content or b"").hexdigest()
+    key = hashlib.sha1(content or b"").hexdigest() + (f":{id(sheets)}" if sheets is not None
+                                                      else "")
     if key not in _TEXT_CACHE:
         if len(_TEXT_CACHE) > 8:
             _TEXT_CACHE.clear()
-        _TEXT_CACHE[key] = _price_haystack(content, filename)
+        _TEXT_CACHE[key] = _price_haystack(content, filename, sheets)
     return _TEXT_CACHE[key]
 
 
-def _price_haystack(content: bytes, filename: str = "price.xlsx") -> _PriceText:
+def _collection_named(text: "_PriceText", names, tm_name: str = "") -> bool:
+    """Есть ли в прайсе ИМЯ коллекции — целыми словами, с размерным хвостом и без, с
+    приставкой марки и без (`collection_keys`). Ищется среди кодов прайса, а не подстрокой:
+    «Nid» подстрокой нашлось бы внутри любого слова."""
+    for name in names:
+        for key in nz.collection_keys(name, tm_name):
+            pieces = _PIECE.findall(key.lower())
+            if 0 < len(pieces) <= _ARTICLE_PIECES and len("".join(pieces)) >= 3 \
+                    and "".join(pieces) in text.codes:
+                return True
+    return False
+
+
+def _price_haystack(content: bytes, filename: str = "price.xlsx",
+                    sheets=None) -> _PriceText:
     """Весь текст прайса без разделителей и регистра — и набор кодов из него.
 
     Артикул в ячейке слеплен с названием и размером («…Альфа PELI (CO 512) 1290*190*8мм»),
@@ -1427,13 +1449,14 @@ def _price_haystack(content: bytes, filename: str = "price.xlsx") -> _PriceText:
     подстрокой в склеенном прайсе Артисаны (12 870 строк) нашёл «APP6» внутри «Lapp.
     60x120» — и позиция, которой в прайсе нет, «осталась жить», удержав папку коллекции.
     """
-    if not content:
-        return _PriceText("", frozenset())
-    try:
-        sheets = parse_price_table(content, filename or "price.xlsx") or []
-    except Exception:                                   # noqa: BLE001
-        logger.warning("Прайс не разобрался при проверке снятия", exc_info=True)
-        return _PriceText("", frozenset())
+    if sheets is None:
+        if not content:
+            return _PriceText("", frozenset())
+        try:
+            sheets = parse_price_table(content, filename or "price.xlsx") or []
+        except Exception:                               # noqa: BLE001
+            logger.warning("Прайс не разобрался при проверке снятия", exc_info=True)
+            return _PriceText("", frozenset())
 
     parts, codes = [], set()
     for sheet in sheets:
@@ -1452,7 +1475,7 @@ def _price_haystack(content: bytes, filename: str = "price.xlsx") -> _PriceText:
     return _PriceText(" ".join(parts), frozenset(codes))
 
 
-def _seen_in_price(item, text: _PriceText) -> bool:
+def _seen_in_price(item, text: _PriceText, titles: bool = True) -> bool:
     """Стоит ли позиция в прайсе — по артикулу, а у позиции без артикула — по названию.
 
     **ЕСТЬ АРТИКУЛ — РЕШАЕТ ОН** (бой 27.10.2026), то же правило, что у сверки
@@ -1463,6 +1486,9 @@ def _seen_in_price(item, text: _PriceText) -> bool:
 
     Артикулы короче трёх знаков не проверяем: «12» найдётся в любом размере. Расцветка —
     от четырёх букв: короткие слова совпадают случайно.
+
+    `titles=False` — название не доказывает ничего (см. `run_discontinue`, правило для
+    керамики): позиция без артикула тогда считается отсутствующей.
     """
     if not text:
         return False
@@ -1470,6 +1496,8 @@ def _seen_in_price(item, text: _PriceText) -> bool:
     key = norm_article(getattr(item, "article", ""))
     if key:
         return len(key) >= 3 and key in text.codes
+    if not titles:
+        return False
 
     title = getattr(item, "site_name", "") or ""
     flat = "".join(ch for ch in title.lower() if ch.isalnum())
@@ -1477,7 +1505,8 @@ def _seen_in_price(item, text: _PriceText) -> bool:
 
 
 async def run_discontinue(onec, task, guard, content: bytes = b"",
-                          filename: str = "price.xlsx", elsewhere: dict | None = None):
+                          filename: str = "price.xlsx", elsewhere: dict | None = None,
+                          sheets=None):
     """Перенос ЦЕЛОЙ коллекции в снятые — кодом, одним вызовом (§6.2).
 
     **«ЦЕЛОЙ» ПРОВЕРЯЕТСЯ ПО ПРАЙСУ, А НЕ ПРИНИМАЕТСЯ НА ВЕРУ.** Задача приходит с адресом
@@ -1553,13 +1582,27 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
 
     # ЧТО ИЗ КОЛЛЕКЦИИ ЕЩЁ СТОИТ В ПРАЙСЕ. Необратимая операция обязана опираться на
     # файл, а не на формулировку задачи: её писала модель.
-    haystack = _price_text(content, filename)
+    haystack = _price_text(content, filename, sheets)
     if live and not haystack:
         return (TaskStatus.TODO,
                 "Прайс не разобрался — проверить, ушла ли коллекция из него, нечем. "
                 "Перенос не делал: он необратим, а гадать тут нельзя.")
 
-    staying = [i for i in live if _seen_in_price(i, haystack)]
+    # КЕРАМИКА: НАЗВАНИЕ РАСЦВЕТКИ ДОКАЗЫВАЕТ ЧТО-ТО, ТОЛЬКО ЕСЛИ В ПРАЙСЕ ЕСТЬ ИМЯ
+    # КОЛЛЕКЦИИ (решение админа 27.10.2026, «Nid» у Артисаны). У «Nid» артикулов нет ни у
+    # одной позиции, а названия — «Cashmere», «Light», «Natural» — находились в чужих
+    # коллекциях той же марки: Symphonyx Cashmere, Boost Natural. Нет ни артикулов, ни
+    # имени коллекции — коллекция считается ушедшей, и папка переносится. Решение принято
+    # ДЛЯ ПЛИТКИ (керамика и керамогранит, тот же признак `size_in_name`, что у правил
+    # наименования); у прочих видов название по-прежнему засчитывается само.
+    tm_name = next(iter(task.address.tm.names or ()), "")
+    named = _collection_named(haystack, names, tm_name)
+
+    def titles_count(item) -> bool:
+        return named or not naming.size_in_name(getattr(item, "product_type", ""),
+                                                getattr(item, "product_type_ref", ""))
+
+    staying = [i for i in live if _seen_in_price(i, haystack, titles_count(i))]
     leaving = [i for i in live if i not in staying]
 
     # ВОЗИТ ДРУГОЙ ПОСТАВЩИК — НЕ СНИМАЕМ (бой 08.10.2026). Журнал встреч сверялся только
@@ -1849,8 +1892,12 @@ def task_brief(price, task, terms=None, purchase_in_price: bool = False,
 async def run(orchestrator, onec, price, task, content: bytes, guard,
               scope=None, usage_labels: dict | None = None, offers=None,
               supplier_name: str = "", terms=None, purchase_in_price: bool = False,
-              admin_note: str = ""):
+              admin_note: str = "", price_sheets=None):
     """Выполнить задачу. Возвращает (статус, текст результата).
+
+    `price_sheets` — прайс, суженный так же, как у сборщика (отмеченные листы и бренды):
+    по нему перенос в снятые проверяет, что из коллекции ещё стоит в прайсе. Нет — весь
+    файл, как раньше.
 
     `guard` — функция без аргументов, бросающая `WriteRefused`, если прогон потерял право
     писать. Зовётся перед каждой записью в 1С.
@@ -1885,7 +1932,8 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
                         "Журнал встреч не прочитался — проверить, возит ли позиции другой "
                         "поставщик, нечем. Перенос не делал: он необратим.")
         return await run_discontinue(onec, task, guard, content,
-                                     price.supplier_price.filename, elsewhere=elsewhere)
+                                     price.supplier_price.filename, elsewhere=elsewhere,
+                                     sheets=price_sheets)
 
     tools = TaskTools(onec, content, price.supplier_price.filename, guard,
                       scope=scope, kind=task.kind, offers=offers,

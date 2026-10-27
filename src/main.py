@@ -327,6 +327,60 @@ async def main() -> None:
                               for s in sheets)
         return shapes[key]
 
+    narrowed: dict[tuple, list] = {}
+
+    async def _narrowed_sheets(price, content, tm_code: str = ""):
+        """Прайс, суженный ТАК ЖЕ, КАК У СБОРЩИКА: отмеченные листы и строки отмеченных
+        брендов (решение админа 27.10.2026). По нему перенос в снятые проверяет, что из
+        коллекции ещё стоит в прайсе: по всему файлу Артисаны (38 брендов, 12 870 строк)
+        общие слова — «Natural», «Cashmere» — находились у чужих коллекций всегда.
+
+        **И ДАЛЬШЕ — ДО БРЕНДОВ МАРКИ ЗАДАЧИ** (решение админа того же дня): задача
+        адресована одной марке, строки Porcelanosa задаче по Atlas Concorde ни к чему.
+        Связь «бренд → марка» — колонка «Марка» в форме формата. Ни один отмеченный бренд
+        к марке задачи не привязан — остаётся сужение по всем отмеченным, а не пустота:
+        «проверять не по чему» обернулось бы переносом всего подряд.
+
+        Сужает тот же код сборщика (`TaskBuilderTools.sheets`), а не своя копия правил:
+        разойдись они — сборщик заводил бы задачу по одному прайсу, а исполнитель проверял
+        бы другой. Логотипы — только из памяти (модель здесь не зовём), справочник марок —
+        для разделителей «по справочнику». Помним на файл и выбор: пачке он нужен один.
+        Не вышло — `None`, и проверка идёт по всему файлу, как раньше.
+        """
+        from src.model.logo_intake import name_logos
+        from src.model.task_builder import TaskBuilderTools
+        from src.storage.suppliers import PRICE_BRAND
+
+        signature = price.supplier_price.signature or ""
+        try:
+            only_sheets = await supplier_store.sheets_for(signature)
+            marks = await supplier_store.marks_for(signature)
+            only_marks = None
+            if any(m.rows and m.brand != PRICE_BRAND for m in marks):
+                only_marks = [m.brand for m in marks if m.parse]
+                own = [m.brand for m in marks
+                       if m.parse and tm_code and (m.tm_code or "").strip() == tm_code]
+                if own:
+                    only_marks = own
+            key = (price.supplier_price.file_path, only_sheets,
+                   tuple(only_marks) if only_marks is not None else None)
+            if key not in narrowed:
+                logos = await name_logos(None, supplier_store, signature, content,
+                                         price.supplier_price.filename)
+                catalogue = await asyncio.to_thread(onec.selling_tm) if onec else []
+                tools = TaskBuilderTools(content, price.supplier_price.filename,
+                                         only_sheets=only_sheets, only_marks=only_marks,
+                                         logos=logos, catalogue=catalogue)
+                tools.row_limit = 0
+                # Пачка чередует марки — держим несколько вариантов, а не один.
+                if len(narrowed) > 8:
+                    narrowed.clear()
+                narrowed[key] = tools.sheets
+            return narrowed[key]
+        except Exception:                               # noqa: BLE001
+            logger.warning("Прайс для проверки снятия не сузился", exc_info=True)
+            return None
+
     async def run_task(price, task, content, guard):
         """Выполнение задачи агентом (§6.2) — С НАСТОЯЩЕЙ ЗАПИСЬЮ в 1С.
 
@@ -382,8 +436,14 @@ async def main() -> None:
                            await _admin_notes(price.supplier_price.signature or "")
                            if code and tm == code), "")
 
+        from src.model.enums import TaskKind, TaskSubject
+        price_sheets = None
+        if task.kind == TaskKind.MOVE_DISCONTINUED and task.subject == TaskSubject.COLLECTION:
+            price_sheets = await _narrowed_sheets(price, content,
+                                                  (task.address.tm.code or "").strip())
+
         return await run(orchestrator, onec, price, task, content, guard, scope=scope,
-                         admin_note=admin_note,
+                         admin_note=admin_note, price_sheets=price_sheets,
                          usage_labels={"kind": "model_task",
                                        "price_doc": price.supplier_price.filename},
                          offers=sightings,

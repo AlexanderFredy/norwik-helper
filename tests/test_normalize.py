@@ -645,6 +645,46 @@ class DiscontinueTest(unittest.IsolatedAsyncioTestCase):
                                      "parent_ref": self.TARGET}])
         self.assertEqual(status, TaskStatus.DONE)
 
+    def tile(self, ref, title, collection="Nid"):
+        """Позиция керамогранита БЕЗ артикула — как у «Nid» в 1С."""
+        it = self.item_in(ref, collection=collection)
+        object.__setattr__(it, "product_type", "Керамогранит")
+        object.__setattr__(it, "product_type_ref", "000000011")
+        object.__setattr__(it, "article", "")
+        object.__setattr__(it, "site_name", title)
+        return it
+
+    async def test_tile_without_articles_and_name_is_gone(self):
+        """БОЙ 27.10.2026, «Nid» у Артисаны (решение админа: правило для плитки). Артикулов
+        у позиций нет, имени коллекции в прайсе нет, а названия «Natural» и «Cashmere» есть —
+        у Boost Natural и Symphonyx Cashmere. Это не доказательство: папка уезжает."""
+        onec = self.onec([self.tile("R1", "Natural"), self.tile("R2", "Cashmere")],
+                         [self.Folder("F-BR", "Nid")])
+        await run_discontinue(onec, self.task_for(name="Nid", code="F-BR"), allow,
+                              self.price(("A65T", "Boost Natural Umber 60x120", 6716),
+                                         ("+37687", "Symphonyx Cashmere 80x160 Lapp", 5922)))
+        self.assertEqual([op["op"] for op in onec.ops], ["update_folder"])
+
+    async def test_tile_title_counts_when_the_collection_is_named(self):
+        """Имя коллекции в прайсе есть — название расцветки снова доказательство."""
+        onec = self.onec([self.tile("R1", "Natural"), self.tile("R2", "Cashmere")],
+                         [self.Folder("F-BR", "Nid")])
+        await run_discontinue(onec, self.task_for(name="Nid", code="F-BR"), allow,
+                              self.price(("", "Nid Natural 15x90", 4000)))
+        self.assertEqual(onec.ops, [{"op": "update_item", "ref": "R2",
+                                     "parent_ref": onec.ops[0]["parent_ref"]}])
+
+    async def test_laminate_title_still_counts_alone(self):
+        """Правило принято ДЛЯ ПЛИТКИ. У ламината название по-прежнему засчитывается само —
+        COSMO у Вестерхофа (24.09.2026) держится именно на нём."""
+        alive = self.named(self.item_in("R1"), "Альфа")
+        gone = self.named(self.item_in("R2"), "Бета")
+        onec = self.onec([alive, gone], [self.Folder("F-BR", "Brilliant")])
+        await run_discontinue(onec, self.task_for(code="F-BR"), allow,
+                              self.price(("", "Ламинат Альфа PELI", 1290)))
+        self.assertEqual(onec.ops, [{"op": "update_item", "ref": "R2",
+                                     "parent_ref": self.TARGET}])
+
     async def test_a_batch_downloads_the_mark_once(self):
         """БОЙ 27.10.2026: каждая задача пачки заново выгружала каталог Atlas Concorde со
         снятыми — 53 страницы, 4–6 минут, — хотя запись одна. Вторая задача по той же
