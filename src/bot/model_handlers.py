@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 
@@ -153,19 +154,59 @@ async def handle_document(message: Message, model, is_admin: bool,
         await message.answer("Файл слишком большой (лимит 20 МБ).")
         return
 
-    note = await message.answer("Принимаю прайс...")
-    buf = io.BytesIO()
-    info = await message.bot.get_file(doc.file_id)
-    await message.bot.download_file(info.file_path, destination=buf)
+    note = await _say(message, "Принимаю прайс...")
+    content = await _download(message.bot, doc.file_id)
+    if content is None:
+        # СБОЙ СКАЧИВАНИЯ НАЗЫВАЕТСЯ ВСЛУХ (бой 27.10.2026). Связь сервера с Telegram рвалась
+        # весь день, файл не скачался за 64 с — и бот промолчал: админ час ждал разбора,
+        # которого не было. Сообщение может не дойти по той же причине, но попытаться обязаны.
+        logger.error("Файл прайса %s не скачан из Telegram за %d попыток",
+                     doc.file_name, len(DOWNLOAD_PAUSES) + 1)
+        await _say(message, f"Файл «{doc.file_name}» не получен: связь сервера с Telegram "
+                            "сейчас нестабильна. Разбор не начат — пришлите файл ещё раз "
+                            "через несколько минут.")
+        return
 
     # Подпись к файлу — главный признак поставщика (§2.2).
-    await model.submit(buf.getvalue(), doc.file_name,
+    await model.submit(content, doc.file_name,
                        supplier_hint=(message.caption or "").strip(),
                        force=force, actor=_actor(message))
     try:
-        await note.delete()
+        if note is not None:
+            await note.delete()
     except Exception:                                   # noqa: BLE001
         pass
+
+
+#: Паузы между попытками скачать файл из Telegram. Обрывы на сервере идут волнами по
+#: минуте-две (журнал 27.10.2026), поэтому повтор тут же бесполезен, а ждать дольше пары
+#: минут — значит держать админа в неведении.
+DOWNLOAD_PAUSES = (5, 20, 60)
+
+
+async def _download(bot, file_id: str) -> bytes | None:
+    """Скачать файл из Telegram с повторами. None — так и не вышло."""
+    for attempt, pause in enumerate((*DOWNLOAD_PAUSES, None), 1):
+        try:
+            info = await bot.get_file(file_id)
+            buf = io.BytesIO()
+            await bot.download_file(info.file_path, destination=buf)
+            return buf.getvalue()
+        except Exception:                               # noqa: BLE001
+            logger.warning("Файл из Telegram не скачан (попытка %d)", attempt, exc_info=True)
+            if pause is None:
+                return None
+            await asyncio.sleep(pause)
+    return None
+
+
+async def _say(message: Message, text: str):
+    """Ответить, не роняя обработчик: связь с Telegram та же, что у скачивания."""
+    try:
+        return await message.answer(text)
+    except Exception:                                   # noqa: BLE001
+        logger.warning("Сообщение в Telegram не отправлено: %s", text[:80], exc_info=True)
+        return None
 
 
 @router.message(CommandFilter("model_force"))
