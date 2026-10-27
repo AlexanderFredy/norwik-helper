@@ -404,9 +404,16 @@ class OnecProvider(Listener):
         snapshot = await self.snapshot()
         # Доставленным отмечаем ТОЛЬКО ПОСЛЕ успешной отправки: исключение оставит его
         # недоставленным, и следующий оборот повторит попытку.
-        await asyncio.to_thread(self._onec.set_model_state, snapshot,
-                                await self.sheets_snapshot(),
-                                await self.marks_snapshot())
+        answer = await asyncio.to_thread(self._onec.set_model_state, snapshot,
+                                         await self.sheets_snapshot(),
+                                         await self.marks_snapshot())
+        # ОШИБКА ПРИХОДИТ С КОДОМ 200 (бой 27.10.2026): приёмник ловит исключение и отвечает
+        # `{"error": "apply_failed", "message": …}`, чтобы IIS не подменил текст страницей
+        # 500. Не прочитав тело, мы считали снимок доставленным, а форма его не видела:
+        # принятый прайс не появлялся в списке, и в журнале не было ни строки.
+        if isinstance(answer, dict) and answer.get("error"):
+            raise RuntimeError(f"1С не применила снимок: {answer.get('error')} "
+                               f"{answer.get('detail') or answer.get('message') or ''}".strip())
         self._delivered = taken
 
     async def snapshot(self) -> list[dict]:

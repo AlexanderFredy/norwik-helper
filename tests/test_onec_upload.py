@@ -153,6 +153,24 @@ class FileHashTest(Base):
         self.assertEqual((await provider.snapshot())[0]["file_hash"], "")
 
 
+class SnapshotErrorTest(Base):
+    """Ошибка приёмника приходит с кодом 200 — снимок НЕ доставлен и уедет снова."""
+
+    async def test_error_in_body_keeps_snapshot_undelivered(self):
+        class Failing(UploadOnec):
+            def set_model_state(self, prices, sheets=None, marks=None):
+                return {"changed": 0, "error": "apply_failed",
+                        "message": "Поле объекта не обнаружено (ХешФайла)"}
+
+        provider = self.provider(Failing())
+        provider._changes += 1
+        before = provider._delivered
+        with self.assertRaises(RuntimeError) as caught:
+            await provider._push_state()
+        self.assertIn("ХешФайла", str(caught.exception))
+        self.assertEqual(provider._delivered, before)
+
+
 class ServiceUploadTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_service_submits_and_removes_the_temp_file(self):
