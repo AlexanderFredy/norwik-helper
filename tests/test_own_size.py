@@ -74,5 +74,55 @@ class PlanTest(unittest.TestCase):
         self.assertTrue(any("убран размер" in w for w in item.warnings))
 
 
+class FullNameSizeTest(unittest.TestCase):
+    """У керамики размер — в конце и ПОЛНОГО наименования (решение админа 27.10.2026)."""
+
+    BASE = {"tm_code": "000000132", "tm_name": "Porcelanosa", "collection": "Persia"}
+    CERAMIC = {"product_type": "000000010", "product_type_name": "Керамическая плитка"}
+
+    def card(self, **kw):
+        fields = dict(ref="P1", id="", name="old", article="", unit="м2", size="333x1000x10",
+                      product_type="Керамическая плитка", collection="Persia",
+                      parent="Persia", collection_ref="F", alt_units={}, purchase=None,
+                      retail=None, rrc=None, site_name="Bone", product_type_ref="000000010",
+                      length_from=1000, length_to=1000, width_from=333, width_to=333,
+                      thickness=10)
+        fields.update(kw)
+        return NomItem(**fields)
+
+    def full(self, row, kind=None, card=None):
+        plan = plan_collection({**self.BASE, **(kind or self.CERAMIC), "items": [row]},
+                               [card or self.card()], [])
+        return plan.items[0].full_name
+
+    def test_size_is_appended_to_a_full_name_without_it(self):
+        self.assertEqual(
+            self.full({"op": "update", "ref": "P1", "title": "Bone", "tail": "333x1000x10",
+                       "full_name": "Керамическая плитка Porcelanosa Persia Bone"}),
+            "Керамическая плитка Porcelanosa Persia Bone 333x1000x10")
+
+    def test_size_written_otherwise_is_not_doubled(self):
+        """«33,3x100» в сантиметрах — тот же размер: снимаем и ставим в конец один раз."""
+        self.assertEqual(
+            self.full({"op": "update", "ref": "P1", "title": "Bone", "tail": "333x1000x10",
+                       "full_name": "Керамическая плитка Porcelanosa Persia Bone 33,3x100"}),
+            "Керамическая плитка Porcelanosa Persia Bone 333x1000x10")
+
+    def test_already_at_the_end_stays_as_is(self):
+        self.assertEqual(
+            self.full({"op": "update", "ref": "P1", "title": "Bone", "tail": "333x1000x10"}),
+            "Керамическая плитка Porcelanosa Persia Bone 333x1000x10")
+
+    def test_laminate_full_name_gets_no_size(self):
+        """У ламината размер живёт в имени папки, а не в карточке (§19.5)."""
+        laminate = {"product_type": "000000003", "product_type_name": "Ламинат"}
+        card = self.card(product_type="Ламинат", product_type_ref="000000003",
+                         size="1290x190x8")
+        self.assertEqual(
+            self.full({"op": "update", "ref": "P1", "title": "Bone", "tail": "1290x190x8",
+                       "full_name": "Ламинат Porcelanosa Persia Bone"}, laminate, card),
+            "Ламинат Porcelanosa Persia Bone")
+
+
 if __name__ == "__main__":
     unittest.main()

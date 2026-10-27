@@ -116,6 +116,11 @@ def build_name(product_type: str, tm: str, collection: str, title: str,
     return tidy(ensure_type_prefix(body, product_type))
 
 
+def _size_key(text: str) -> str:
+    """Размер для сравнения: без пробелов и регистра, кириллическая «х» = латинская «x»."""
+    return "".join(str(text or "").split()).casefold().replace("х", "x").replace("*", "x")
+
+
 def site_name(title: str, tail: str = "") -> str:
     """Наименование для сайта — только название расцветки (§19.5).
 
@@ -399,6 +404,16 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
             build_name(type_name, tm_name, collection, title, tail), article)
         full = drop_own_article(
             str(raw.get("full_name") or "").strip() or name, article)
+        # У КЕРАМИКИ РАЗМЕР — В КОНЦЕ И ПОЛНОГО НАИМЕНОВАНИЯ (решение админа 27.10.2026). Из
+        # нормализации полное и так равно имени, а вот исполнитель передаёт его сам — и без
+        # размера: «Керамическая плитка Porcelanosa Persia Ivory». Свой размер, стоявший в
+        # тексте в другом виде («33,3x100»), снимаем, чтобы не задвоить. `tail` здесь уже
+        # пуст у всех видов, кроме керамики.
+        if tail:
+            size = drop_zero_size(tail)
+            if not _size_key(full).endswith(_size_key(size)):
+                body, _ = drop_own_size(full, own_l, own_w, own_t)
+                full = f"{body or full} {size}".strip()
         site = drop_own_article(site_name(title), article)
 
         for bad in violations(name):
