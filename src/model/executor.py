@@ -1631,7 +1631,11 @@ def _collection_folder(folders, subject, wanted: str, positions=()):
 
     by_ref = {f.ref: f for f in folders}
     code = (subject.code or "").strip()
-    if code and code in by_ref:
+    # ПАПКА СНЯТЫХ — НЕ ПАПКА КОЛЛЕКЦИИ (бой 27.10.2026, задача 1265). Сборщик записал в
+    # адрес код корня «!Номенклатура снятая с производства», взяв его у снятой позиции
+    # той же коллекции, и перенос ответил «коллекция уже снята» про 11 живых позиций.
+    # Такой код игнорируем и ищем папку дальше — по живым позициям и по имени.
+    if code and code in by_ref and by_ref[code].kind != "discontinued":
         return by_ref[code], ""
 
     refs = {i.collection_ref for i in positions if getattr(i, "collection_ref", "")}

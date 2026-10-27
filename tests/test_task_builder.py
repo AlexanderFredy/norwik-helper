@@ -1206,6 +1206,50 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(TaskKind.MOVE_DISCONTINUED, kinds)
         self.assertIn("Паркет-Холл", notes[0])
 
+    async def test_discontinued_candidate_gets_the_live_folder_code(self):
+        """БОЙ 27.10.2026, задача 1265. У «Dolmen Pro» 13 давно снятых позиций лежат в корне
+        «!Номенклатура снятая с производства» и 11 живых — в своей папке. Код папки брался
+        у первой попавшейся позиции, снятые включительно, и задача ушла с кодом корня
+        снятых: исполнитель ответил «коллекция уже снята», живые остались на месте."""
+        from dataclasses import replace
+
+        from src.model.task_builder import _add_discontinued_candidates
+
+        dead = [replace(self.nom(f"D{n}", f"OLD{n}", collection="Dolmen Pro",
+                                 not_exported=True), collection_ref="ROOT-SNYATYE")
+                for n in range(3)]
+        live = [replace(self.nom(f"L{n}", f"NEW{n}", collection="Dolmen Pro"),
+                        collection_ref="DOLMEN-PRO") for n in range(2)]
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=self.onec(
+            dead + live + [self.nom("R1", "3309", collection="Millenium Pro")]))
+        await self.compare(tools, ["3309"], collection="Миллениум Про")
+        await tools.execute("add_task", {"kind": "изменение цен", "tm": "Egger",
+                                         "tm_code": "T1", "collection": "Millenium Pro",
+                                         "description": "цены"})
+
+        _add_discontinued_candidates(tools)
+        moves = [t for t in tools.collected if t.kind == TaskKind.MOVE_DISCONTINUED]
+        self.assertEqual([t.address.subject.code for t in moves], ["DOLMEN-PRO"])
+
+    def test_executor_ignores_a_discontinued_folder_code(self):
+        """Задачи, уже собранные с кодом корня снятых, обязаны найти живую папку сами."""
+        from types import SimpleNamespace
+
+        from src.model.executor import _collection_folder
+        from src.model.refs import Ref
+        from src.onec.client import Folder
+
+        rest = {"deleted": False, "product_type_ref": "", "tm_ref": "", "tm_share": 1.0}
+        tree = [Folder(ref="ROOT", name="!Номенклатура снятая с производства",
+                       parent_ref="", kind="discontinued", level=1, not_exported=True,
+                       **rest),
+                Folder(ref="DP", name="Dolmen Pro", parent_ref="TM", kind="collection",
+                       level=3, not_exported=False, **rest)]
+        live = [SimpleNamespace(collection_ref="DP")]
+        folder, _ = _collection_folder(tree, Ref.make(code="ROOT", names=["Dolmen Pro"]),
+                                       "Dolmen Pro", live)
+        self.assertEqual(folder.ref, "DP")
+
     async def test_collection_from_another_sheet_is_not_discontinued(self):
         """СЛУЧАЙ С БОЯ (24.09.2026). Прайс Westerhof на три листа, агент сверил не все,
         и коллекции со второго листа выглядели снятыми: COSMO, Shine, Aristocrat — живые,

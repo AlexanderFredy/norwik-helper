@@ -2394,10 +2394,14 @@ def _add_discontinued_candidates(tools) -> list[str]:
         # неё, а к моменту выполнения могут уехать поодиночке, и папку придётся угадывать
         # по имени. Имена папок разнородны — «Коллекция Brilliant - 10 декоров» рядом с
         # «Provence», — так что угадывание однажды промахнётся.
-        folders = {}
-        for item in tools._items_cache.get(tm_code, ()):
-            if item.collection_ref:
-                folders.setdefault(collection_of(item), item.collection_ref)
+        #
+        # ТОЛЬКО ПО ЖИВЫМ ПОЗИЦИЯМ — через `_collection_code` (бой 27.10.2026, задача 1265).
+        # Прежде код брался у ПЕРВОЙ попавшейся позиции с этим значением «Коллекции», снятые
+        # включительно: у «Dolmen Pro» 13 давно снятых позиций лежат прямо в корне
+        # «!Номенклатура снятая с производства», шли в выгрузке первыми — и в адрес задачи
+        # уехал код корня снятых. Исполнитель честно ответил «папка уже помечена
+        # невыгружаемой — коллекция снята», а 11 живых позиций остались на месте.
+        folders = {name: tools._collection_code(tm_code, name) for name in names}
 
         for name in names:
             met = next((tools._elsewhere[k] for k in articles.get(name, ())
