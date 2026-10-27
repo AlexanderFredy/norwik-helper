@@ -103,6 +103,9 @@ class OnecProvider(Listener):
         # Хеш содержимого файла прайса по пути. Принятый файл не меняется, поэтому
         # считается один раз на процесс, а не на каждый снимок.
         self._hashes: dict[str, str] = {}
+        # Доступность Telegram и Anthropic (`src/bot/health.py`): приходит при смене
+        # состояния и уезжает со снимком.
+        self._services: list[dict] = []
         # Хранилище связок «команда очереди → команда 1С» (`src/storage/sent_commands.py`).
         # Без него провайдер работает по-старому, в памяти: это годится для тестов, но не
         # для боевой работы — перезапуск процесса запирает форму навсегда.
@@ -144,6 +147,11 @@ class OnecProvider(Listener):
     @property
     def _dirty(self) -> bool:
         return self._changes != self._delivered
+
+    def services_changed(self, services: list[dict]) -> None:
+        """Сменилась доступность Telegram/Anthropic — отправить со следующим снимком."""
+        self._services = list(services)
+        self._changes += 1
 
     async def notify(self, event: Event) -> None:
         self._changes += 1
@@ -404,9 +412,10 @@ class OnecProvider(Listener):
         snapshot = await self.snapshot()
         # Доставленным отмечаем ТОЛЬКО ПОСЛЕ успешной отправки: исключение оставит его
         # недоставленным, и следующий оборот повторит попытку.
+        extra = {"services": self._services} if self._services else {}
         answer = await asyncio.to_thread(self._onec.set_model_state, snapshot,
                                          await self.sheets_snapshot(),
-                                         await self.marks_snapshot())
+                                         await self.marks_snapshot(), **extra)
         # ОШИБКА ПРИХОДИТ С КОДОМ 200 (бой 27.10.2026): приёмник ловит исключение и отвечает
         # `{"error": "apply_failed", "message": …}`, чтобы IIS не подменил текст страницей
         # 500. Не прочитав тело, мы считали снимок доставленным, а форма его не видела:
@@ -414,6 +423,11 @@ class OnecProvider(Listener):
         if isinstance(answer, dict) and answer.get("error"):
             raise RuntimeError(f"1С не применила снимок: {answer.get('error')} "
                                f"{answer.get('detail') or answer.get('message') or ''}".strip())
+        # Сервисы применяются в 1С отдельно: их сбой (нет регистра) снимок не роняет, но
+        # молчать о нём нельзя — надписи в форме иначе тихо застынут.
+        if isinstance(answer, dict) and answer.get("services_error"):
+            logger.warning("1С не записала доступность сервисов: %s",
+                           answer["services_error"])
         self._delivered = taken
 
     async def snapshot(self) -> list[dict]:

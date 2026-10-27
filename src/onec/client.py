@@ -807,7 +807,8 @@ class OnecClient:
 
     def set_model_state(self, prices: list[dict],
                         sheets: list[dict] | None = None,
-                        marks: list[dict] | None = None) -> dict:
+                        marks: list[dict] | None = None,
+                        services: list[dict] | None = None) -> dict:
         """Положить в 1С ПОЛНЫЙ снимок состояния модели (§3.3).
 
         Целиком, а не приращениями: снимок мал (десятки строк) и самоисцеляющийся —
@@ -831,6 +832,10 @@ class OnecClient:
         # отсутствующий ключ не трогает зеркало, пустой список его вычищает.
         if marks is not None:
             payload["marks"] = marks
+        # ДОСТУПНОСТЬ TELEGRAM И ANTHROPIC с сервера агента (27.10.2026) — для надписей в
+        # форме. 1С применяет её вне транзакции снимка: нет регистра — снимок цел.
+        if services:
+            payload["services"] = services
         return self._post_json("/get-products/set-model-state", payload)
 
     def by_tm_all(self, tm_code: str | None, size: int | None = None, max_pages: int = 500,

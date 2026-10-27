@@ -465,6 +465,15 @@ async def main() -> None:
     # модели, которому Telegram вообще не нужен (у формы 1С свой канал).
     jobs = [poll_forever(dp, bot), loop.run()]
     if onec is not None:
+        # ДОСТУПНОСТЬ TELEGRAM И ANTHROPIC — надписи в форме 1С (решение админа 27.10.2026).
+        # Только с 1С: показывать её больше негде — в Telegram о недоступном Telegram не
+        # скажешь.
+        from src.bot import health
+        watch = health.HealthWatch(
+            {health.TELEGRAM: health.telegram_probe(bot),
+             health.ANTHROPIC: health.anthropic_probe(config.anthropic_api_key)},
+            settings=pricing_store, on_change=onec_provider.services_changed)
+        jobs.append(watch.run_forever())
         # Ежедневная проверка фото наполняет журнал, по понедельникам шлёт админу
         # напоминание о просроченных. Без 1С брать список новых товаров неоткуда.
         jobs.append(photo_daily.run_forever(onec, photo_watch, bot,
