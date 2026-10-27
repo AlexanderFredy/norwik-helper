@@ -103,6 +103,19 @@ class UploadTest(Base):
         self.assertEqual(await self.queue.pending(), [])
         self.assertEqual(onec.states, [], "ни «принята», ни «отклонена»")
 
+    async def test_null_answer_is_refused_not_retried_forever(self):
+        """1С отвечает `null` (маршрут не тот) — отказ с причиной, а не вечное «ждёт»."""
+        class Null(UploadOnec):
+            def agent_file(self, command_id):
+                return None
+
+        onec = Null([self.upload()])
+        await self.provider(onec).collect(self.queue)
+        self.assertEqual(await self.queue.pending(), [])
+        states = [(i["state"], i["message"]) for b in onec.states for i in b]
+        self.assertEqual(states[0][0], "отклонена")
+        self.assertIn("agent-file", states[0][1])
+
     async def test_rejected_intake_closes_the_command_as_refused(self):
         """Отказ приёма (устаревший прайс) — отказ команды, с причиной."""
         onec = UploadOnec([self.upload()], files={"up1": ("ЭГГЕР.xls", b"x")})

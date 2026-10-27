@@ -237,6 +237,12 @@ class OnecProvider(Listener):
 
         external = str(raw.get("id") or "")
         answer = await asyncio.to_thread(self._onec.agent_file, external)
+        # Не объект — маршрут в 1С настроен не так (бой 27.10.2026: `null` на любой id).
+        # Это не сеть, повтор не поможет: отказываем с причиной, и форма её покажет, а не
+        # крутит «Обрабатывается» вечно.
+        if not isinstance(answer, dict):
+            return ("1С на запрос agent-file ответила не JSON-объектом — проверьте ветку "
+                    "agent-file в GET-обработчике HTTP-сервиса")
         if answer.get("error"):
             return f"файл команды в 1С не найден ({answer['error']})"
         name = str(answer.get("name") or "").strip() or "прайс.xlsx"
