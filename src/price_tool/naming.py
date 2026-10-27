@@ -436,7 +436,13 @@ def drop_own_size(title: str | None, length=None, width=None,
 
     # Висячие разделители после снятия: «Calacatta  -  Lapp.» → «Calacatta Lapp.».
     text = re.sub(r"\s+[-–—](?=\s|$)", " ", text)
-    return " ".join(text.split()).strip(" -–—"), found_thickness
+    # …И ЗАПЯТЫЕ СО СКОБКАМИ (бой 27.10.2026, Porcelanosa Oxford): из «NATURAL, 12.5мм,
+    # 33.3x100 (» после снятия размера и толщины оставалось «NATURAL, , (». Схлопываем
+    # пустые перечисления, снимаем запятые с краёв и скобку, оставшуюся без пары в конце.
+    text = re.sub(r"(\s*,)(\s*,)+", ",", text)
+    text = re.sub(r"\s+,", ",", text)
+    text = re.sub(r"[\s,]*\(\s*$", "", text)
+    return " ".join(text.split()).strip(" -–—,"), found_thickness
 
 
 def drop_zero_size(text: str | None) -> str:

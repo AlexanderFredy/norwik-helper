@@ -26,6 +26,16 @@ class DropOwnSizeTest(unittest.TestCase):
         self.assertEqual(drop_own_size("Grey 60x120 см", 1200, 600, 9)[0], "Grey")
         self.assertEqual(drop_own_size("Grey 1200x600x9 мм", 1200, 600, 9)[0], "Grey")
 
+    def test_leftover_commas_and_bracket_are_cleaned(self):
+        """Porcelanosa Oxford (27.10.2026): «NATURAL, 12.5мм, 33.3x100 (» оставляло
+        «NATURAL, , (» после снятия размера и толщины."""
+        self.assertEqual(drop_own_size("LISTON NATURAL, 12.5мм, 33.3x100 (", 1000, 330,
+                                       12.5)[0], "LISTON NATURAL")
+
+    def test_meaningful_commas_and_brackets_stay(self):
+        self.assertEqual(drop_own_size("Deco Topo (A)", 1500, 596, 11)[0], "Deco Topo (A)")
+        self.assertEqual(drop_own_size("Gris, Lappato", 1200, 600, 9)[0], "Gris, Lappato")
+
     def test_foreign_size_stays(self):
         """Чип мозаики на листе 300 × 300 — это описание товара, а не его размер."""
         self.assertEqual(drop_own_size("Mosaic 2,5x2,5", 300, 300, 8)[0], "Mosaic 2,5x2,5")

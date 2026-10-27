@@ -406,10 +406,111 @@ class PrefixCleanTest(unittest.TestCase):
         self.assertEqual(inputs[0]["items"][0]["title"], "Pearl")
         self.assertEqual(notes["cleaned"], {"Boost": 1})
 
-    def test_still_dirty_after_stripping_goes_to_the_admin(self):
+    def test_mark_inside_still_goes_to_the_admin(self):
+        """Коллекцию снимаем откуда угодно (27.10.2026), марку внутри — нет: «Venis» в
+        имени Porcelanosa — след переноса, а не повтор шаблона."""
         inputs, skipped, _, _ = nz.plan(
-            [item(site="Mark Grey Mark", collection="Mark")], "000000115", "Atlas Concorde")
-        self.assertEqual(len(skipped), 1)
+            [item(site="Dayton Croix Venis Sand", collection="Dayton")], "000000132",
+            "Venis")
+        self.assertEqual([why for _, why in skipped], [nz.Skipped.DIRTY_TITLE])
+
+
+class InnerCollectionTest(unittest.TestCase):
+    """Коллекция ВНУТРИ названия и название из одной коллекции (решение админа 27.10.2026,
+    нормализация Porcelanosa: 12 позиций уходили админу)."""
+
+    TM = "Porcelanosa"
+
+    def ceramic(self, ref, site, collection, size="596x1500x10", article=""):
+        return item(ref=ref, site=site, collection=collection, size=size, article=article,
+                    product_type="Керамическая плитка", product_type_ref=CERAMIC_CODE)
+
+    def test_collection_in_the_middle_is_stripped(self):
+        self.assertEqual(nz.strip_collection("STRIPE TARANTO GOLD 59,6x150", "Taranto"),
+                         "STRIPE GOLD 59,6x150")
+        self.assertEqual(nz.strip_collection("MADISON FONTANA MATT 45X120", "Fontana Matt"),
+                         "MADISON 45X120")
+
+    def test_whole_words_only(self):
+        self.assertEqual(nz.strip_collection("Tarantola Gold", "Taranto"), "")
+
+    def test_plan_cleans_element_names(self):
+        inputs, skipped, _, _ = nz.plan(
+            [self.ceramic("P1", "STRIPE TARANTO GOLD", "Taranto"),
+             self.ceramic("P2", "DECO TARANTO BIANCO", "Taranto")],
+            "000000132", self.TM)
+        self.assertEqual(skipped, [])
+        titles = sorted(i["title"] for i in inputs[0]["items"])
+        self.assertEqual(titles, ["DECO BIANCO", "STRIPE GOLD"])
+
+    def test_only_collection_becomes_decorless_ceramic(self):
+        inputs, skipped, _, _ = nz.plan(
+            [self.ceramic("P1", "Persia", "Persia", size="333x1000x10")], "000000132", self.TM)
+        self.assertEqual(skipped, [])
+        row = inputs[0]["items"][0]
+        self.assertEqual((row["title"], row.get("no_decor")), ("", True))
+
+    def test_decorless_needs_a_distinct_size(self):
+        """Без расцветки товар различает только размер — совпал, имена слились бы."""
+        inputs, skipped, _, _ = nz.plan(
+            [self.ceramic("P1", "Persia", "Persia", size="333x1000x10"),
+             self.ceramic("P2", "Persia Bone", "Persia", size="333x1000x10")],
+            "000000132", self.TM)
+        self.assertEqual([(i.ref, why) for i, why in skipped],
+                         [("P1", nz.Skipped.SAME_NAME)])
+
+    def test_old_full_name_in_the_title_goes_to_the_admin(self):
+        """Dayton, 27.10.2026: в поле — целое старое имя с видом товара и маркой Venis.
+        Сняв одну коллекцию, собрали бы «…Dayton Керамическая плитка Venis Croix Sand»."""
+        inputs, skipped, _, _ = nz.plan(
+            [self.ceramic("P1", "Керамическая плитка Venis Dayton Croix Sand 33,3x100",
+                          "Dayton", size="333x1000")],
+            "000000132", self.TM, marks=["Porcelanosa", "Venis"])
+        self.assertEqual([why for _, why in skipped], [nz.Skipped.DIRTY_TITLE])
+
+    def test_foreign_mark_inside_goes_to_the_admin(self):
+        inputs, skipped, _, _ = nz.plan(
+            [self.ceramic("P1", "Croix Dayton Venis Sand", "Dayton", size="333x1000")],
+            "000000132", self.TM, marks=["Porcelanosa", "Venis"])
+        self.assertEqual([why for _, why in skipped], [nz.Skipped.DIRTY_TITLE])
+
+    def test_inner_collection_is_not_stripped_for_laminate(self):
+        """Только керамика (решение админа 27.10.2026): у ламината коллекция внутри
+        названия — «Дуб Mark Светлый» — по-прежнему решает человек."""
+        inputs, skipped, _, _ = nz.plan(
+            [item(site="Дуб Mark Светлый", collection="Mark")], "000000115", "Atlas Concorde")
+        self.assertEqual([why for _, why in skipped], [nz.Skipped.DIRTY_TITLE])
+
+    def test_decorless_is_not_for_laminate(self):
+        """У ламината размера в имени нет — без расцветки имя одно на всю коллекцию."""
+        inputs, skipped, _, _ = nz.plan(
+            [item(site="Vintage", collection="Vintage", size="1290x190x8")],
+            "000000005", "Peli")
+        self.assertEqual([why for _, why in skipped], [nz.Skipped.DIRTY_TITLE])
+
+    def test_decorless_name_carries_the_size(self):
+        from src.price_tool import items as rules
+
+        current = [self.ceramic("P1", "Persia", "Persia", size="333x1000x10")]
+        inputs, _, _, _ = nz.plan(current, "000000132", self.TM)
+        plan = rules.plan_collection(inputs[0], current, [])
+        op = plan.ops()[0]
+        self.assertEqual(op["name"], "Керамическая плитка Porcelanosa Persia 333x1000x10")
+        self.assertEqual(op["site_name"], "Persia")
+
+    def test_empty_title_without_the_flag_is_still_refused(self):
+        """Случай 10.09.2026: пустое название по ошибке не переименовывает ничего."""
+        from src.price_tool import items as rules
+
+        current = [self.ceramic("P1", "Persia", "Persia", size="333x1000x10")]
+        plan = rules.plan_collection(
+            {"tm_code": "000000132", "tm_name": self.TM, "product_type": CERAMIC_CODE,
+             "product_type_name": "Керамическая плитка", "collection": "Persia",
+             "items": [{"op": "update", "ref": "P1", "title": "", "tail": "333x1000x10"}]},
+            current, [])
+        before = current[0].name
+        self.assertTrue(all(op.get("name") in (None, before) for op in plan.ops()),
+                        "имя осталось прежним")
 
     def test_report_names_what_was_stripped(self):
         text = nz.report(5, [], 0, 1, cleaned={"MARK": 5})

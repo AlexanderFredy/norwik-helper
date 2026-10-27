@@ -44,6 +44,8 @@ class Skipped:
     NO_TITLE = "нет названия расцветки (site_name пуст) — вывести его неоткуда"
     DIRTY_TITLE = "в названии расцветки марка или коллекция — сначала почистить его"
     NO_COLLECTION = "не заполнена коллекция — имя собрать не из чего"
+    SAME_NAME = ("в названии расцветки только коллекция, а размер у соседней позиции тот же "
+                 "— без расцветки имена совпали бы")
 
 
 #: Код свойства «Коллекция» в 1С. Выведенное из папки имя НИКОГДА не записывается в него —
@@ -187,6 +189,64 @@ def strip_prefix(title: str, tm_name: str, collection: str) -> str:
     return " ".join(words) if stripped else ""
 
 
+def _dirty(title: str, tm_name: str, collection: str) -> bool:
+    """Осталось ли в очищенном названии марки или коллекции (та же проверка, что у карточки)."""
+    return contaminated(type("Probe", (), {"site_name": title})(), tm_name, collection)
+
+
+#: Слова видов товара — их в названии расцветки быть не может; встретилось — в поле лежит
+#: целое наименование, и чистить его кусками нельзя.
+_TYPE_WORDS = ("плитка", "керамогранит", "ламинат", "паркет", "доска", "линолеум", "обои")
+
+
+def _foreign(title: str, product_type: str, marks=()) -> bool:
+    """Несёт ли название вид товара или имя чужой марки — признак целого наименования."""
+    words = {w.casefold().strip(".,;:()") for w in str(title or "").split()}
+    if any(w in words for w in _TYPE_WORDS):
+        return True
+    if product_type and _form(product_type) in _form(title):
+        return True
+    return bool(words & mark_words(marks))
+
+
+def strip_collection(title: str, collection: str) -> str:
+    """Снять имя КОЛЛЕКЦИИ из любого места названия, целыми словами. Пусто — нечего
+    снимать или не осталось ничего.
+
+    **ЗАЧЕМ (решение админа 27.10.2026, нормализация Porcelanosa).** У плитки поставщик
+    пишет `[элемент] [коллекция] [цвет]`: «STRIPE TARANTO GOLD», «DECO TERRA TOPO», «LISTON
+    OXFORD NATURAL». Коллекция тут не в начале, и `strip_prefix` её не брал — 12 позиций
+    уходили админу. Тип элемента (Stripe, Deco, Listón) значим: им бордюр отличается от
+    основной плитки, — поэтому снимается ТОЛЬКО коллекция, остальное остаётся.
+
+    Марку внутри названия по-прежнему решает человек: «Venis» в имени Porcelanosa — это
+    след переноса, а не повтор шаблона.
+    """
+    words = str(title or "").split()
+    parts = [w.casefold() for w in str(collection or "").split()]
+    if not words or not parts or len("".join(parts)) < 3:
+        return ""
+    low = [w.casefold().strip(".,;:") for w in words]
+    out, i, stripped = [], 0, False
+    while i < len(words):
+        if low[i:i + len(parts)] == parts:
+            i += len(parts)
+            stripped = True
+            continue
+        out.append(words[i])
+        i += 1
+    return " ".join(out) if stripped and out else ""
+
+
+def title_is_collection(title: str, tm_name: str, collection: str) -> bool:
+    """В названии расцветки нет НИЧЕГО, кроме коллекции (и, может быть, марки): «Persia»."""
+    rest = {w.casefold().strip(".,;:") for w in str(title or "").split()}
+    names = {w.casefold() for name in [collection, *str(tm_name or "").split("/")]
+             for w in str(name or "").split()}
+    return bool(rest) and rest <= names and any(
+        w.casefold() in rest for w in str(collection or "").split())
+
+
 def mark_words(marks) -> set[str]:
     """Слова, которыми зовутся МАРКИ, — из них и состоят заводские пометки.
 
@@ -280,6 +340,8 @@ def plan(items, tm_code: str, tm_name: str, only_collection: str = "",
     # а у очищенных — без марки и коллекции в начале (`strip_prefix`).
     titles: dict[str, str] = {}
     cleaned: dict[str, int] = {}
+    # Позиции, у которых расцветки нет вовсе — только коллекция (см. ниже).
+    decorless: set[str] = set()
 
     for item in items:
         # СНЯТЫЕ НЕ ТРОГАЕМ. Они лежат в невыгружаемых папках, на сайт не идут, и
@@ -307,15 +369,41 @@ def plan(items, tm_code: str, tm_name: str, only_collection: str = "",
             #
             # СВОЙ АРТИКУЛ ВПЕРЕДИ НИХ снимается первым: у Boost 96 названий вида «8B8P
             # Boost Pearl» — без этого коллекция стояла бы уже не в начале.
-            from src.price_tool.naming import drop_own_article
-            clean = strip_prefix(drop_own_article(title, item.article) or title,
-                                 tm_name, collection)
-            probe = type("Probe", (), {"site_name": clean})()
-            if not clean or contaminated(probe, tm_name, collection):
-                skipped.append((item, Skipped.DIRTY_TITLE))
-                continue
-            removed = title[: len(title) - len(clean)].strip() if title.endswith(clean) \
-                else title
+            from src.price_tool.naming import drop_own_article, size_in_name
+            base = drop_own_article(title, item.article) or title
+            clean = strip_prefix(base, tm_name, collection)
+            # ОБА ПРАВИЛА НИЖЕ — ТОЛЬКО ДЛЯ КЕРАМИКИ (керамическая плитка, керамогранит;
+            # решение админа 27.10.2026). Это те же виды, у которых размер стоит в имени
+            # (`size_in_name`): у плитки название вида `[элемент] [коллекция] [цвет]`, а у
+            # ламината коллекция внутри названия — случай, где мы скорее поняли строку
+            # неверно, и решает по-прежнему человек.
+            ceramic = size_in_name(product_type,
+                                   getattr(item, "product_type_ref", "") or None)
+            if not clean or _dirty(clean, tm_name, collection):
+                # КОЛЛЕКЦИЯ ВНУТРИ НАЗВАНИЯ — снимаем и её (решение админа 27.10.2026):
+                # «STRIPE TARANTO GOLD» → «STRIPE GOLD». Марку внутри — нет.
+                inner = strip_collection(clean or base, collection) if ceramic else ""
+                # ОСТАТОК НЕ ДОЛЖЕН НЕСТИ ВИД ТОВАРА ИЛИ ЧУЖУЮ МАРКУ (бой 27.10.2026,
+                # Dayton): в поле лежало старое полное имя «Керамическая плитка Venis
+                # Dayton Croix Sand», и сняв одну коллекцию, мы собирали «…Dayton
+                # Керамическая плитка Venis Croix Sand». Своя марка ловится `_dirty`, а
+                # чужую и вид товара он не знает — проверяем здесь.
+                if inner and _foreign(inner, product_type, marks):
+                    inner = ""
+                if inner and not _dirty(inner, tm_name, collection):
+                    clean = inner
+                elif (ceramic and title_is_collection(base, tm_name, collection)
+                      and (item.size or "").strip()):
+                    # ТОЛЬКО КОЛЛЕКЦИЯ — расцветки нет вовсе (решение админа 27.10.2026):
+                    # у керамики товар различает РАЗМЕР в наименовании, «Persia» →
+                    # «Керамическая плитка Porcelanosa Persia 33,3x100».
+                    decorless.add(item.ref)
+                    clean = ""
+                else:
+                    skipped.append((item, Skipped.DIRTY_TITLE))
+                    continue
+            removed = (title[: len(title) - len(clean)].strip()
+                       if clean and title.endswith(clean) else title)
             # В отчёт — без своего артикула: он у каждой позиции свой, и список «8B8P Boost,
             # AMH4 Boost, …» ничего бы не сказал админу.
             key = drop_own_article(removed, item.article) or removed
@@ -324,6 +412,20 @@ def plan(items, tm_code: str, tm_name: str, only_collection: str = "",
 
         titles[item.ref] = title
         groups.setdefault((collection, product_type), []).append(item)
+
+    # БЕЗ РАСЦВЕТКИ ТОВАР РАЗЛИЧАЕТ ТОЛЬКО РАЗМЕР — значит, он не должен совпасть с соседним
+    # в той же коллекции и виде. Совпал — имена вышли бы одинаковыми; решает человек.
+    for key, members in list(groups.items()):
+        sizes: dict[str, int] = {}
+        for i in members:
+            sizes[_form(i.size)] = sizes.get(_form(i.size), 0) + 1
+        clash = [i for i in members if i.ref in decorless and sizes[_form(i.size)] > 1]
+        for i in clash:
+            skipped.append((i, Skipped.SAME_NAME))
+            decorless.discard(i.ref)
+        groups[key] = [i for i in members if i not in clash]
+        if not groups[key]:
+            del groups[key]
 
     inputs = []
     found_noise: set[str] = set()
@@ -350,6 +452,10 @@ def plan(items, tm_code: str, tm_name: str, only_collection: str = "",
                 # Размер отдаём как есть: нужен он в имени или нет, решит
                 # `plan_collection` по виду товара (`size_in_name`), а не мы.
                 "tail": (i.size or "").strip(),
+                # Пустая расцветка ОСОЗНАННО: без этого признака `plan_collection` пустое
+                # название отвергает (случай 10.09.2026 — имена всей коллекции схлопнулись
+                # бы в одно).
+                **({"no_decor": True} if i.ref in decorless else {}),
             } for i in members],
         })
 
