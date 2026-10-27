@@ -23,6 +23,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 
@@ -1309,47 +1311,81 @@ async def run_normalization(onec, task, guard, scope=None):
     return status, text
 
 
-def _price_haystack(content: bytes, filename: str = "price.xlsx") -> str:
-    """Весь текст прайса одной строкой, без разделителей и регистра.
+#: Кусок текста ячейки: подряд идущие буквы либо подряд идущие цифры.
+_PIECE = re.compile(r"[^\W\d_]+|\d+")
+#: Из скольких соседних кусков может состоять артикул: «LE-266-32» — три, «A6R7» — четыре.
+_ARTICLE_PIECES = 6
+
+
+@dataclass(frozen=True)
+class _PriceText:
+    """Текст прайса в двух видах: склеенным (для названий) и кодами (для артикулов)."""
+    flat: str
+    codes: frozenset
+
+    def __bool__(self) -> bool:
+        return bool(self.flat)
+
+
+def _price_haystack(content: bytes, filename: str = "price.xlsx") -> _PriceText:
+    """Весь текст прайса без разделителей и регистра — и набор кодов из него.
 
     Артикул в ячейке слеплен с названием и размером («…Альфа PELI (CO 512) 1290*190*8мм»),
-    поэтому сравнение «ячейка = артикул» не находит ничего, а поиск по склеенному тексту —
-    находит.
+    поэтому сравнение «ячейка = артикул» не находит ничего.
+
+    **АРТИКУЛ — ЦЕЛЫМ КОДОМ, А НЕ КУСКОМ СКЛЕЕННОГО ТЕКСТА** (бой 27.10.2026, Dolmen Pro).
+    Ячейка режется на куски «буквы» и «цифры», и кодом считается любая склейка соседних
+    кусков: «CO 512» → «co512», «LE-266-32» → «le26632», «EPL075Дуб» → «epl075». Поиск
+    подстрокой в склеенном прайсе Артисаны (12 870 строк) нашёл «APP6» внутри «Lapp.
+    60x120» — и позиция, которой в прайсе нет, «осталась жить», удержав папку коллекции.
     """
     if not content:
-        return ""
+        return _PriceText("", frozenset())
     try:
         sheets = parse_price_table(content, filename or "price.xlsx") or []
     except Exception:                                   # noqa: BLE001
         logger.warning("Прайс не разобрался при проверке снятия", exc_info=True)
-        return ""
+        return _PriceText("", frozenset())
 
-    parts = []
+    parts, codes = [], set()
     for sheet in sheets:
         for row in sheet.rows:
             for cell in row:
                 text = str(cell or "")
-                if text.strip():
-                    parts.append("".join(ch for ch in text.lower() if ch.isalnum()))
-    return " ".join(parts)
+                if not text.strip():
+                    continue
+                parts.append("".join(ch for ch in text.lower() if ch.isalnum()))
+                pieces = _PIECE.findall(text.lower())
+                for start in range(len(pieces)):
+                    joined = ""
+                    for piece in pieces[start:start + _ARTICLE_PIECES]:
+                        joined += piece
+                        codes.add(joined)
+    return _PriceText(" ".join(parts), frozenset(codes))
 
 
-def _seen_in_price(item, haystack: str) -> bool:
-    """Стоит ли позиция в прайсе — по артикулу либо по названию расцветки.
+def _seen_in_price(item, text: _PriceText) -> bool:
+    """Стоит ли позиция в прайсе — по артикулу, а у позиции без артикула — по названию.
+
+    **ЕСТЬ АРТИКУЛ — РЕШАЕТ ОН** (бой 27.10.2026), то же правило, что у сверки
+    (`_by_title`). Название расцветки — общие слова цвета, и в склеенном прайсе на сорок
+    брендов они находятся всегда: «Grigio» у Dolmen Pro нашлось внутри «Marvel Grigio
+    Intenso», «Rosso» — внутри «Luxor Rosso». Позиции без артикула (COSMO, Westerhof
+    Vivace) проверяются названием, как и раньше: другого признака у них нет.
 
     Артикулы короче трёх знаков не проверяем: «12» найдётся в любом размере. Расцветка —
     от четырёх букв: короткие слова совпадают случайно.
     """
-    if not haystack:
+    if not text:
         return False
 
     key = norm_article(getattr(item, "article", ""))
-    if len(key) >= 3 and key in haystack:
-        return True
+    if key:
+        return len(key) >= 3 and key in text.codes
 
     title = getattr(item, "site_name", "") or ""
     flat = "".join(ch for ch in title.lower() if ch.isalnum())
-    return len(flat) >= 4 and flat in haystack
+    return len(flat) >= 4 and flat in text.flat
 
 
 async def run_discontinue(onec, task, guard, content: bytes = b"",
@@ -1381,11 +1417,16 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
                 "У задачи нет кода марки или имени коллекции — переносить нечего.")
 
     nom = await asyncio.to_thread(onec.by_tm_all, tm_code, include_not_exported=True)
+    tree = await asyncio.to_thread(onec.folders, tm=tm_code)
     # КОЛЛЕКЦИЯ — ПО ЛЮБОМУ ИМЕНИ АДРЕСА И ПО КОДУ ПАПКИ (бой 08.10.2026). Адрес несёт и
     # имя из 1С, и имя из прайса; задачи, собранные раньше, — только прайсовое («8/32
     # Классик» при «Classic 8-32V» в 1С). Код папки точнее имени, когда он есть.
     names = {n.casefold() for n in task.address.subject.names if n} or {wanted.casefold()}
     code = (task.address.subject.code or "").strip()
+    # КОД ПАПКИ СНЯТЫХ — НЕ КОД КОЛЛЕКЦИИ (бой 27.10.2026, задача 1265): по нему в
+    # коллекцию попало бы всё, что лежит в корне снятых, чужие позиции включительно.
+    if code and any(f.ref == code and f.kind == "discontinued" for f in tree.items):
+        code = ""
     mine = [i for i in nom.items
             if nz.collection_of(i).casefold() in names
             or (code and (getattr(i, "collection_ref", "") or "") == code)]
@@ -1406,7 +1447,6 @@ async def run_discontinue(onec, task, guard, content: bytes = b"",
     # всё равно нужно: позиции коллекции могли уже уехать в снятые по одной — так вышло с
     # Brilliant, — и тогда папка висит в живой ветке пустой, а узнать о ней можно только
     # оттуда.
-    tree = await asyncio.to_thread(onec.folders, tm=tm_code)
     folder, why = _collection_folder(tree.items, task.address.subject, wanted, live)
 
     if folder is not None and folder.not_exported:

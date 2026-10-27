@@ -624,6 +624,45 @@ class DiscontinueTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, TaskStatus.DONE)
         self.assertIn("папку не трогал", text)
 
+    async def test_article_inside_a_longer_word_does_not_keep_the_position(self):
+        """БОЙ 27.10.2026, Dolmen Pro у Артисаны. Поиск подстрокой нашёл «APP6» внутри
+        «Lapp. 60x120» чужой коллекции, а название «Grigio» — внутри «Marvel Grigio
+        Intenso»: шесть позиций «остались в прайсе», и папка не уехала. Есть артикул —
+        решает он, и только целым кодом."""
+        a = self.item_in("R1")
+        object.__setattr__(a, "article", "APP6")
+        object.__setattr__(a, "site_name", "Grigio")
+        b = self.item_in("R2")
+        object.__setattr__(b, "article", "APQK")
+        object.__setattr__(b, "site_name", "Rosso")
+        onec = self.onec([a, b], [self.Folder("F-BR", "Dolmen Pro")])
+        status, _ = await run_discontinue(
+            onec, self.task_for(code="F-BR"), allow,
+            self.price(("CH04BAL", "Calacatta Black SQ Lapp. 60x120", 5540),
+                       ("AORU", "Marvel Grigio Intenso 75x150 Lappato", 8113),
+                       ("LX01", "Luxor Rosso 20x20", 5244)))
+        self.assertEqual(onec.ops, [{"op": "update_folder", "ref": "F-BR",
+                                     "parent_ref": self.TARGET}])
+        self.assertEqual(status, TaskStatus.DONE)
+
+    async def test_article_glued_to_the_title_is_still_found(self):
+        """Обратная сторона: артикул, слепленный с названием и размером, по-прежнему
+        находится — «CO 512», «LE-266-32», «EPL075Дуб»."""
+        items = []
+        for ref, article in (("R1", "CO512"), ("R2", "LE-266-32"), ("R3", "EPL075")):
+            it = self.item_in(ref)
+            object.__setattr__(it, "article", article)
+            items.append(it)
+        gone = self.item_in("R4")
+        object.__setattr__(gone, "article", "ZZ999")
+        onec = self.onec(items + [gone], [self.Folder("F-BR", "Brilliant")])
+        status, _ = await run_discontinue(
+            onec, self.task_for(code="F-BR"), allow,
+            self.price(("", "…Альфа PELI (CO 512) 1290*190*8мм", 1),
+                       ("LE 266-32", "Дуб", 2), ("", "EPL075Дуб Даннингтон", 3)))
+        self.assertEqual(onec.ops, [{"op": "update_item", "ref": "R4",
+                                     "parent_ref": self.TARGET}])
+
     def typeless(self, ref, dead=False, name="Дуб"):
         """Позиция с ПУСТЫМ видом товара — у старых невыгружаемых карточек так бывает."""
         it = self.item_in(ref, dead=dead)
