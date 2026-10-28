@@ -1993,10 +1993,19 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
     # `run` читают три вызывающих и четыре теста, и расширять её ради поля, которое всё
     # равно хранится с задачей, значило бы менять контракт ради удобства одной ветки.
 
+    # ВОЗВРАТ, ЗАВЕДЁННЫЙ КАК «ПЕРЕНОС В СНЯТЫЕ» (бой 28.10.2026, задача 1403): описание
+    # «Вернуть из снятых YO-00074538», вид — перенос. Перенос исполняет код и описание не
+    # читает, — задача ответила «снимать нечего», не вернув ничего и не заметив правку
+    # админа. Такую задачу выполняем как «добавление новых»: через модель, по описанию.
+    from src.model.task_builder import is_return
+    kind = task.kind
+    if kind == TaskKind.MOVE_DISCONTINUED and is_return(task.description):
+        kind = TaskKind.ADD_NEW
+
     # ПЕРЕНОС ЦЕЛОЙ КОЛЛЕКЦИИ — тоже мимо модели: папка известна из позиций, целевая
     # папка снятых — из вида товара. Одна операция вместо N, и рассуждать не о чем.
     # Задача про ОДИН товар остаётся агенту: там надо понять, что именно снимают.
-    if (task.kind == TaskKind.MOVE_DISCONTINUED
+    if (kind == TaskKind.MOVE_DISCONTINUED
             and task.subject == TaskSubject.COLLECTION):
         # ЖУРНАЛ — НА МОМЕНТ ВЫПОЛНЕНИЯ, а не сборки: задачу могли собрать до того, как
         # пришёл прайс другого поставщика с теми же позициями.
@@ -2016,7 +2025,7 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
     # ВОЗВРАТ ПАПКИ ИЗ СНЯТЫХ — кодом и ДО модели (алгоритм админа 28.10.2026): двигать
     # папки модель не умеет, а без живой папки коллекции ей некуда вернуть позиции.
     returned = ""
-    if task.kind == TaskKind.ADD_NEW and task.subject == TaskSubject.COLLECTION:
+    if kind == TaskKind.ADD_NEW and task.subject == TaskSubject.COLLECTION:
         try:
             returned = await return_collection_folder(
                 onec, task, guard, content, price.supplier_price.filename, price_sheets)
@@ -2027,7 +2036,7 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
             returned = "Проверить, не лежит ли папка коллекции в снятых, не удалось."
 
     tools = TaskTools(onec, content, price.supplier_price.filename, guard,
-                      scope=scope, kind=task.kind, offers=offers,
+                      scope=scope, kind=kind, offers=offers,
                       supplier_id=price.supplier_price.supplier_id,
                       price_date=price.supplier_price.price_date,
                       supplier_name=supplier_name, terms=terms,
@@ -2035,6 +2044,12 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
 
     brief = task_brief(price, task, terms, purchase_in_price=purchase_in_price,
                        admin_note=admin_note)
+    if kind != task.kind:
+        # Вид в шапке задания — «перенос в снятые»; по сути это возврат, и модель должна
+        # работать по описанию как с «добавлением новых», а не снимать.
+        brief += ("\n\nПО СУТИ ЭТО ВОЗВРАТ ИЗ СНЯТЫХ, а не снятие: задача заведена не тем "
+                  "видом. Выполни описание как «добавление новых» — блок «ВОЗВРАТ РАНЕЕ "
+                  "СНЯТОГО»: верни указанные карточки сменой родителя, ничего не снимай.")
     if returned:
         # Модель должна знать, что папка уже на месте: иначе будет искать живую коллекцию.
         brief += f"\n\nСДЕЛАНО КОДОМ ДО ТЕБЯ: {returned}"

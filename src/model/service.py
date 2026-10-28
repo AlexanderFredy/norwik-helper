@@ -156,8 +156,12 @@ class PriceListService:
         Только у НАСТОЯЩЕЙ коллекции марки — с кодом марки 1С в адресе. У заглушки адрес —
         имя листа, и все пять её видов стоят на одном адресе.
         """
+        from src.model.task_builder import is_return
+
         if task.kind != TaskKind.MOVE_DISCONTINUED or not (task.address.tm.code or "").strip():
             return None
+        if is_return(task.description):
+            return None             # по сути возврат из снятых (задача 1403), не снятие
         return next((t for t in price.tasks
                      if t.kind == TaskKind.CHANGE_PROPERTIES and not t.closed
                      and t.address.matches(task.address)), None)

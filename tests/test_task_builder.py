@@ -1003,6 +1003,26 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Chrome", summary["название_совпало_размер_нет"][0])
         self.assertEqual(tools._present_refs, {"R2"})
 
+    async def test_return_is_filed_as_add_new_not_discontinue(self):
+        """БОЙ 28.10.2026, задача 1403: «Вернуть из снятых Oxford Natural» заведена как
+        «перенос в снятые» — её исполнил код переноса и ответил «снимать нечего»."""
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=self.onec([]))
+        await tools.execute("add_task", {
+            "kind": "перенос в снятые", "tm": "Porcelanosa", "tm_code": "T1",
+            "collection": "Oxford",
+            "description": "Вернуть из снятых 1 позицию Oxford: 100287934 OXFORD NATURAL."})
+        self.assertEqual([t.kind for t in tools.collected], [TaskKind.ADD_NEW])
+
+    def test_discontinue_descriptions_are_not_returns(self):
+        """Описания снятия, которые пишет код, за возврат приниматься не должны."""
+        from src.model.task_builder import is_return
+        self.assertFalse(is_return("Коллекция «Mark» в этом прайсе есть ЧАСТИЧНО: 3 поз. "
+                                   "не встретились. Перенести их в снятые."))
+        self.assertFalse(is_return("Коллекция «Nid» есть в 1С, но в этом прайсе не "
+                                   "встретилась ни одним артикулом."))
+        self.assertTrue(is_return("Вернуть из снятых 1 позицию Oxford"))
+        self.assertTrue(is_return("…\n\nВОЗВРАТ РАНЕЕ СНЯТОГО, не заведение заново."))
+
     async def test_product_type_comes_from_1c_when_the_collection_is_there(self):
         """БОЙ 28.10.2026, Артисана: модель взяла вид из колонки «Тип» («Пол»), и задача по
         керамике отклонилась как «не входит в категории». Коллекция в 1С есть — у её

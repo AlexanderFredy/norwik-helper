@@ -2219,6 +2219,13 @@ class TaskBuilderTools:
         # будет исполняться, и пересказ их моделью однажды разойдётся с ответом 1С
         # (проверено на шаблоне наименований: она его выдумывала дважды). Речь о задаче
         # «добавление новых», потому что именно там дубль и возникает.
+        #
+        # ВОЗВРАТ, ЗАВЕДЁННЫЙ КАК «ПЕРЕНОС В СНЯТЫЕ», — ЭТО «ДОБАВЛЕНИЕ НОВЫХ» (бой 28.10.2026,
+        # задача 1403, Oxford у Porcelanosa). Перенос коллекции исполняет КОД, описание он не
+        # читает, — и задача «вернуть из снятых YO-00074538» ответила «снимать нечего»,
+        # ничего не вернув, вместе с правкой админа в описании.
+        if kind == TaskKind.MOVE_DISCONTINUED and is_return(description):
+            kind = TaskKind.ADD_NEW
         if kind == TaskKind.ADD_NEW:
             back = self._revivals.get(normalize(collection))
             if back:
@@ -2682,6 +2689,16 @@ def owner_map(folders, marks) -> dict[str, set]:
             owners.setdefault(key, set()).add((mark["code"], mark["name"]))
 
     return owners
+
+
+#: Описание про ВОЗВРАТ из снятых, а не про перенос туда.
+_RETURN = re.compile(r"^\s*верн(?:уть|ём|и)\b|вернуть\s+из\s+снят|возврат\s+ранее\s+снят",
+                     re.IGNORECASE)
+
+
+def is_return(description: str | None) -> bool:
+    """Описание задачи говорит о возврате ИЗ снятых («Вернуть из снятых…»)."""
+    return bool(_RETURN.search(description or ""))
 
 
 def _size_agrees(item, line: str) -> bool | None:

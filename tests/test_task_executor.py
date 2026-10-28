@@ -727,6 +727,39 @@ class SilentAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "Обновлено 5 цен в коллекции.")
 
 
+class ReturnFiledAsDiscontinueTest(unittest.IsolatedAsyncioTestCase):
+    """Задача 1403: вид «перенос в снятые», описание — возврат с правкой админа. Код
+    переноса описание не читает и ответил «снимать нечего»; теперь её ведёт модель."""
+
+    async def test_it_goes_to_the_model_with_the_description(self):
+        from src.model.enums import TaskSubject
+
+        seen = []
+
+        class Orchestrator:
+            async def handle_turn(self, history, **kw):
+                seen.append(history[-1]["content"])
+                return "готово", history
+
+        class Onec(FakeOnec):
+            def folders(self, **kw):
+                from types import SimpleNamespace
+                return SimpleNamespace(items=[], errors=[])
+
+        task = make_task()
+        task.kind = TaskKind.MOVE_DISCONTINUED
+        task.subject_kind = TaskSubject.COLLECTION
+        task.address = type(task.address)(tm=task.address.tm, subject=task.address.subject,
+                                          subject_kind=TaskSubject.COLLECTION)
+        task.description = ("Вернуть из снятых 1 позицию Oxford: 100287934.\n\n"
+                            "Верни только YO-00074538")
+        await run(Orchestrator(), Onec(), make_price(), task, b"", allow)
+
+        self.assertEqual(len(seen), 1, "задачу вела модель, а не код переноса")
+        self.assertIn("Верни только YO-00074538", seen[0])
+        self.assertIn("ВОЗВРАТ ИЗ СНЯТЫХ", seen[0])
+
+
 class AdminEditTest(unittest.TestCase):
     """Правка админа старше рассуждений агента, и он должен это знать.
 

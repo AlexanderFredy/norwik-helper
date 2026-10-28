@@ -53,6 +53,14 @@ class ArticlesFirstTest(unittest.TestCase):
         self.assertIsNone(service.open_props_before(price, move),
                           "закрытая (в т.ч. частично) задача снятие не держит")
 
+    def test_return_described_as_discontinue_is_not_held(self):
+        """Задача 1403: вид «перенос в снятые», описание — возврат. Это не снятие."""
+        move = PriceTask(kind=TaskKind.MOVE_DISCONTINUED, address=address(), id=1,
+                         description="Вернуть из снятых 1 позицию Oxford: 100287934.")
+        props = PriceTask(kind=TaskKind.CHANGE_PROPERTIES, address=address(), id=2)
+        service, price = setup(move, props)
+        self.assertIsNone(service.open_props_before(price, move))
+
     def test_stub_addresses_are_not_held(self):
         """У заглушки адрес — имя листа без кода марки: все виды на одном адресе."""
         stub = address(tm="")
