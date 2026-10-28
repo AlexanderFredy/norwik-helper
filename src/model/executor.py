@@ -1396,6 +1396,84 @@ def _mark_moved(onec, tm_code: str, taken, item_refs=(), folder_ref: str = "") -
     memory[tm_code] = (when, items, folders)
 
 
+async def return_collection_folder(onec, task, guard, content: bytes = b"",
+                                   filename: str = "price.xlsx", sheets=None) -> str:
+    """Вернуть из снятых папку коллекции, уехавшую туда ЦЕЛИКОМ (алгоритм админа 28.10.2026).
+
+    Возврат шёл сменой родителя у ПОЗИЦИЙ — «на папку живой коллекции». Но перенос в снятые
+    умеет двигать папку целиком, и тогда живой папки коллекции больше нет: вернуть позицию
+    некуда. Поэтому перед задачей «добавление новых» код смотрит дерево марки: папка
+    коллекции задачи лежит ПРЯМО в папке снятых — значит, уехала целой, и едет назад.
+
+    **КУДА.** В живую папку марки под тем же узлом вида товара, что и папка снятых, где она
+    лежит: «*Номенклатура снятая (Керамическая плитка)» и «Atlas Concorde керамическая
+    плитка» висят под одним «Керамическая плитка». Это ответ дерева, а не похожесть имён;
+    таких папок не одна или ни одной — не двигаем и называем.
+
+    **ВОЗВРАЩАЕТСЯ ТОЛЬКО ТО, ЧТО ЕСТЬ В ПРАЙСЕ.** С папкой ожили бы все её позиции, а
+    поставщик мог привезти одну из двадцати. Позиции, которых в прайсе нет (та же проверка,
+    что у снятия), тем же вызовом уходят обратно в папку снятых — поштучно.
+
+    Возвращает строку для отчёта; пусто — возвращать было нечего.
+    """
+    tm_code = (task.address.tm.code or "").strip()
+    names = [n for n in task.address.subject.names if n]
+    if not tm_code or not names:
+        return ""
+    tm_name = next(iter(task.address.tm.names or ()), "")
+    every, folders = await _mark_snapshot(onec, tm_code)
+    by_ref = {f.ref: f for f in folders}
+    keys = set()
+    for name in names:
+        keys |= nz.collection_keys(name, tm_name)
+
+    moved = [f for f in folders
+             if f.kind == "collection"
+             and getattr(by_ref.get(f.parent_ref), "kind", "") == "discontinued"
+             and nz.collection_keys(f.name, tm_name) & keys]
+    if not moved:
+        return ""
+    if len(moved) > 1:
+        return ("В снятых несколько папок с именем этой коллекции ("
+                + ", ".join(f"«{f.name}» {f.ref}" for f in moved[:4])
+                + ") — какую возвращать, решите сами; папки не трогал.")
+    folder = moved[0]
+    shelf = by_ref[folder.parent_ref]
+    targets = [f for f in folders if f.kind == "tm" and not f.not_exported
+               and f.parent_ref == shelf.parent_ref]
+    if len(targets) != 1:
+        return (f"Папка «{folder.name}» ({folder.ref}) лежит в снятых целиком, но живую папку "
+                f"марки для возврата выбрать не могу: под тем же видом товара их "
+                f"{len(targets)}. Верните папку сами.")
+    target = targets[0]
+
+    inside = [i for i in every if getattr(i, "collection_ref", "") == folder.ref]
+    text = _price_text(content, filename, sheets)
+    named = _collection_named(text, names, tm_name)
+    gone = [i for i in inside
+            if not _seen_in_price(i, text, named or not naming.size_in_name(
+                getattr(i, "product_type", ""), getattr(i, "product_type_ref", "")))]
+    if text and len(gone) == len(inside):
+        return ""          # в прайсе из папки нет ничего — возвращать нечего
+
+    guard()
+    before = _mark_take(onec, tm_code)
+    ops = ([{"op": "update_folder", "ref": folder.ref, "parent_ref": target.ref}]
+           + [{"op": "update_item", "ref": i.ref, "parent_ref": shelf.ref} for i in gone])
+    result = await asyncio.to_thread(onec.set_items, ops)
+    errors = result.get("errors") or []
+    if errors:
+        return (f"Папку «{folder.name}» вернуть из снятых не удалось: "
+                + "; ".join(f"{e.get('code')} {e.get('message')}" for e in errors[:3]))
+    del before         # картину марки после записи спросим у 1С заново
+    out = (f"Папка «{folder.name}» ({folder.ref}) возвращена из снятых в «{target.name}» "
+           f"({target.ref}).")
+    if gone:
+        out += (f" {len(gone)} её позиц., которых в прайсе нет, оставлены в снятых: "
+                + ", ".join(i.ref for i in gone[:20]) + ("…" if len(gone) > 20 else ""))
+    return out
+
+
 def _as_discontinued(folder):
     """Копия папки с пометкой «не выгружать» — исходный объект общий и не трогается."""
     import copy
@@ -1935,6 +2013,19 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
                                      price.supplier_price.filename, elsewhere=elsewhere,
                                      sheets=price_sheets)
 
+    # ВОЗВРАТ ПАПКИ ИЗ СНЯТЫХ — кодом и ДО модели (алгоритм админа 28.10.2026): двигать
+    # папки модель не умеет, а без живой папки коллекции ей некуда вернуть позиции.
+    returned = ""
+    if task.kind == TaskKind.ADD_NEW and task.subject == TaskSubject.COLLECTION:
+        try:
+            returned = await return_collection_folder(
+                onec, task, guard, content, price.supplier_price.filename, price_sheets)
+        except WriteRefused:
+            raise
+        except Exception:                               # noqa: BLE001
+            logger.warning("Возврат папки из снятых сорвался", exc_info=True)
+            returned = "Проверить, не лежит ли папка коллекции в снятых, не удалось."
+
     tools = TaskTools(onec, content, price.supplier_price.filename, guard,
                       scope=scope, kind=task.kind, offers=offers,
                       supplier_id=price.supplier_price.supplier_id,
@@ -1942,17 +2033,21 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
                       supplier_name=supplier_name, terms=terms,
                       subject=task.address.subject)
 
+    brief = task_brief(price, task, terms, purchase_in_price=purchase_in_price,
+                       admin_note=admin_note)
+    if returned:
+        # Модель должна знать, что папка уже на месте: иначе будет искать живую коллекцию.
+        brief += f"\n\nСДЕЛАНО КОДОМ ДО ТЕБЯ: {returned}"
     answer, _ = await orchestrator.handle_turn(
-        [{"role": "user", "content": task_brief(price, task, terms,
-                                                purchase_in_price=purchase_in_price,
-                                                admin_note=admin_note)}],
+        [{"role": "user", "content": brief}],
         system=PROMPT, extra_tools=TOOLS, extra_executor=tools,
         base_tools=False, usage_labels=usage_labels)
 
     task.digest = dict(tools.digest)
 
     if tools.outcome is not None:
-        return tools.outcome
+        status, text = tools.outcome
+        return status, (f"{returned}\n{text}" if returned else text)
 
     # `finish` не вызван. Если в 1С что-то записано — это уже не «ничего не делали», и
     # прятать запись за статусом «к обработке» нельзя: админ повторит задачу и запишет

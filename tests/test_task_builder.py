@@ -976,6 +976,33 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
                          "коллекция нашлась, несмотря на приставку марки")
         self.assertEqual(got["сверка_по_названиям"]["нашлось_по_названию"], 2)
 
+    async def test_same_title_other_size_is_another_product(self):
+        """БОЙ 28.10.2026, Mark у Артисаны (алгоритм админа). «Mark Chrome 75x150» в прайсе и
+        «Chrome 600x600» в 1С — одно название, разный товар: артикул ставить нельзя. А
+        «Moka Gold Damask 40x80» и карточка 800×400 — тот же размер в см."""
+        from dataclasses import replace
+        import openpyxl
+        wb = openpyxl.Workbook()
+        sheet = wb.active
+        sheet.append(["Артикул", "Наименование", "Опт"])
+        sheet.append(["AS55", "Mark Chrome 75x150 R10", 2500])
+        sheet.append(["38702", "Mark Moka Gold Damask 40x80", 2536])
+        buf = BytesIO()
+        wb.save(buf)
+
+        chrome = replace(self.nom("R1", "", site="Chrome", collection="Mark"),
+                         length_from=600, width_from=600)
+        moka = replace(self.nom("R2", "", site="Moka Gold Damask", collection="Mark"),
+                       length_from=800, width_from=400)
+        tools = TaskBuilderTools(buf.getvalue(), "Прайс.xlsx", onec=self.onec([chrome, moka]))
+        got = await self.compare(tools, [], collection="Mark",
+                                 titles=["Chrome", "Moka Gold Damask"])
+
+        summary = got["сверка_по_названиям"]
+        self.assertEqual(summary["нашлось_по_названию"], 1)
+        self.assertIn("Chrome", summary["название_совпало_размер_нет"][0])
+        self.assertEqual(tools._present_refs, {"R2"})
+
     async def test_foreign_collection_is_not_pulled_in_by_stripping(self):
         """Снимается имя ИМЕННО ЭТОЙ марки и только целым словом: чужая коллекция от
         такого снятия притянуться не должна."""
@@ -1182,6 +1209,62 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         ]))
         await self.compare(tools, ["3309"], collection="Миллениум Про")
         self.assertEqual(tools.untouched_collections(), {})
+
+    def mark_price(self):
+        import openpyxl
+        wb = openpyxl.Workbook()
+        sheet = wb.active
+        sheet.append(["Артикул", "Наименование", "Опт"])
+        sheet.append(["AS55", "Mark Chrome 60x60", 2500])
+        buf = BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    async def mark_tools(self, elsewhere=None):
+        """Mark у Артисаны в миниатюре: одна позиция в прайсе, две — нет."""
+        tools = TaskBuilderTools(self.mark_price(), "Прайс.xlsx", onec=self.onec([
+            self.nom("R1", "AS55", site="Chrome", collection="Mark"),
+            self.nom("R2", "X999", site="Silver", collection="Mark"),
+            self.nom("R3", "", site="Cherry", collection="Mark"),
+        ]), elsewhere=elsewhere)
+        await self.compare(tools, ["AS55"], collection="Mark")
+        return tools
+
+    async def test_partially_present_collection_gets_a_discontinue_task(self):
+        """БОЙ 28.10.2026, Mark у Артисаны (алгоритм админа): три позиции в прайсе из
+        тридцати четырёх — снятия не было вовсе. Теперь его заводит код, по позициям."""
+        from src.model.task_builder import _add_discontinued_candidates
+
+        tools = await self.mark_tools()
+        _add_discontinued_candidates(tools)
+        moves = [t for t in tools.collected if t.kind == TaskKind.MOVE_DISCONTINUED]
+        self.assertEqual(len(moves), 1)
+        self.assertIn("R2", moves[0].description)
+        self.assertIn("R3", moves[0].description)
+        self.assertNotIn("R1", moves[0].description)
+        self.assertIn("ЧАСТИЧНО", moves[0].description)
+
+    async def test_partial_discontinue_spares_what_another_supplier_carries(self):
+        from src.model.task_builder import _add_discontinued_candidates
+        from src.storage.sightings import Sighting
+
+        tools = await self.mark_tools(elsewhere={"x999": Sighting(
+            supplier_id=9, supplier="Кераматика", collection="Mark",
+            price_date="2026-10-01")})
+        _add_discontinued_candidates(tools)
+        moves = [t for t in tools.collected if t.kind == TaskKind.MOVE_DISCONTINUED]
+        self.assertNotIn("R2", moves[0].description)
+        self.assertIn("R3", moves[0].description)
+
+    async def test_no_discontinue_for_a_mark_without_a_marked_brand(self):
+        """Сборщик видит лишь отмеченные бренды: марка без отмеченного бренда — не судим."""
+        from src.model.task_builder import _add_discontinued_candidates
+
+        tools = await self.mark_tools()
+        tools.brand_tms = {"ДРУГАЯ"}
+        notes = _add_discontinued_candidates(tools)
+        self.assertNotIn(TaskKind.MOVE_DISCONTINUED, [t.kind for t in tools.collected])
+        self.assertTrue(any("отмеченный бренд" in n for n in notes))
 
     async def test_collection_of_another_supplier_is_not_discontinued(self):
         """СЛУЧАЙ, РАДИ КОТОРОГО ЗАВЕДЁН ЖУРНАЛ. Коллекции нет в этом прайсе, но её возит

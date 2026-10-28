@@ -21,7 +21,7 @@ from src.model import locks as lk
 from src.model import price_list as pl
 from src.model import report
 from src.model.commands import Command, CommandKind, Rejected
-from src.model.enums import PriceStatus, TaskStatus
+from src.model.enums import PriceStatus, TaskKind, TaskStatus
 from src.model.events import Broadcaster, Event, EventKind
 from src.model.price import Price
 from src.model.task import PriceTask
@@ -123,6 +123,44 @@ class PriceListService:
             if found is not None:
                 return price, found
         return None, None
+
+    def articles_first(self, commands: list[Command]) -> list[Command]:
+        """В пачке снятие коллекции — ПОСЛЕ «изменения свойств» той же коллекции.
+
+        Алгоритм админа 28.10.2026 (Mark у Артисаны): позиции без артикула, опознанные по
+        названию и размеру, получают артикул задачей «изменение свойств» — и только потом
+        снятие решает, что ушло. В обратном порядке оно увезло бы позиции, которые в прайсе
+        есть, но ещё не опознаны. Общий порядок видов (снятие первым, решение 24.09.2026)
+        не меняется: переставляется лишь эта пара внутри одной пачки.
+        """
+        def task_of(command):
+            if command.kind != CommandKind.EXECUTE_TASK or command.task_id is None:
+                return None
+            return self.task(command.task_id)[1]
+
+        props = [t for t in map(task_of, commands)
+                 if t is not None and t.kind == TaskKind.CHANGE_PROPERTIES]
+
+        def waits(command) -> bool:
+            task = task_of(command)
+            return (task is not None and task.kind == TaskKind.MOVE_DISCONTINUED
+                    and (task.address.tm.code or "").strip()
+                    and any(p.address.matches(task.address) for p in props))
+
+        return ([c for c in commands if not waits(c)]
+                + [c for c in commands if waits(c)])
+
+    def open_props_before(self, price: Price, task: PriceTask) -> PriceTask | None:
+        """Открытая задача «изменение свойств» по той же коллекции — снятие ждёт её.
+
+        Только у НАСТОЯЩЕЙ коллекции марки — с кодом марки 1С в адресе. У заглушки адрес —
+        имя листа, и все пять её видов стоят на одном адресе.
+        """
+        if task.kind != TaskKind.MOVE_DISCONTINUED or not (task.address.tm.code or "").strip():
+            return None
+        return next((t for t in price.tasks
+                     if t.kind == TaskKind.CHANGE_PROPERTIES and not t.closed
+                     and t.address.matches(task.address)), None)
 
     def lock_of(self, price_id: int) -> lk.Lock | None:
         return self._locks.get(price_id)
@@ -496,6 +534,17 @@ class PriceListService:
 
         if task.status == TaskStatus.DONE:
             await self._reject(command, "задача уже выполнена, перечитайте состояние")
+            return
+
+        # АРТИКУЛЫ РАНЬШЕ СНЯТИЯ (алгоритм админа 28.10.2026): пока по коллекции открыта
+        # задача «изменение свойств», снятие увезло бы позиции, которые она опознала бы.
+        first = self.open_props_before(price, task)
+        if first is not None:
+            await self._reject(command, (
+                f"сначала выполните задачу №{first.id} «{first.label()}»: она проставляет "
+                f"артикулы и правит позиции этой коллекции, и без неё снятие увезло бы "
+                f"позиции, которые есть в прайсе. Не нужна — поставьте ей статус "
+                f"«выполнена» или «частично обработана»"))
             return
 
         lock = await self._take_lock(price, command.actor)

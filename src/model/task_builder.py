@@ -451,6 +451,14 @@ class TaskBuilderTools:
         self._items_cache: dict[str, list] = {}
         self._tm_names: dict[str, str] = {}     # код марки → её имя В 1С
         self._touched: dict[str, set] = {}      # код марки → коллекции 1С, закрытые сверкой
+        # Карточки, найденные сверкой в прайсе — по артикулу либо (без артикула) по
+        # названию и размеру: снятие по частичной коллекции их не трогает (28.10.2026).
+        self._present_refs: set[str] = set()
+        # Коды марок, к которым в форме привязан ОТМЕЧЕННЫЙ бренд прайса. Снятие заводится
+        # только по ним: сборщик видит лишь отмеченные листы и бренды, и коллекция на
+        # неотмеченном выглядела бы ушедшей (28.10.2026). `None` — у формата брендов нет,
+        # условие не применяется.
+        self.brand_tms: set | None = None
         self._last_sheet: str = ""              # лист, который агент читал последним
         self._price_cols: dict[str, dict] = {}  # имя листа → названные колонки цен
 
@@ -788,6 +796,43 @@ class TaskBuilderTools:
                 out[tm_code] = rest
         return out
 
+    def partial_leavers(self) -> dict[str, dict[str, list]]:
+        """Код марки → {коллекция → живые позиции, которых в прайсе нет} — по коллекциям,
+        которые сверка ЗАТРОНУЛА (`_touched`). Целиком ушедшие считает
+        `untouched_collections`; здесь — частично присутствующие (28.10.2026).
+
+        Наличие в прайсе — ТЕМ ЖЕ кодом, что у исполнителя переноса (`executor`), на
+        прайсе, суженном так же, как у сборщика: разойдись проверки, сборщик заводил бы
+        задачи, которые исполнитель отклоняет, и наоборот.
+        """
+        from src.model import executor as ex
+        from src.price_tool.naming import size_in_name
+
+        text = ex._price_text(self._content, self._filename, self.sheets)
+        if not text:
+            return {}
+        out: dict[str, dict[str, list]] = {}
+        for tm_code, names in self._touched.items():
+            tm_name = self._tm_names.get(tm_code, "")
+            items = self._items_cache.get(tm_code) or ()
+            for name in names:
+                live = [i for i in items if not i.not_exported and collection_of(i) == name]
+                named = ex._collection_named(text, [name], tm_name)
+                leaving = []
+                for item in live:
+                    if item.ref in self._present_refs:
+                        continue
+                    titles = named or not size_in_name(item.product_type,
+                                                       item.product_type_ref)
+                    if ex._seen_in_price(item, text, titles):
+                        continue
+                    if norm_article(item.article) in self._elsewhere:
+                        continue
+                    leaving.append(item)
+                if leaving:
+                    out.setdefault(tm_code, {})[name] = leaving
+        return out
+
     def _by_title(self, collection: str, live: list, titles, tm: str = "") -> dict | None:
         """ВТОРОЙ КЛЮЧ: сопоставление по названию расцветки. Строго в границах.
 
@@ -829,7 +874,7 @@ class TaskBuilderTools:
             if key:
                 by_code.setdefault(key, []).append(item)
 
-        matched, missing, unclear = [], [], []
+        matched, missing, unclear, misfit = [], [], [], []
         by_article = 0
         for title in wanted:
             code = norm_article(article_from_title(title))
@@ -840,19 +885,31 @@ class TaskBuilderTools:
                 continue
 
             hits = index.get(_flat(title)) or []
+            line = self._price_line(title) if hits else ""
+            single = None
             if len(hits) == 1:
-                matched.append(hits[0])
+                single = hits[0]
             elif hits:
                 # Неоднозначность снимаем СВОЙСТВАМИ, а не выбором наугад: у карточек в
                 # 1С есть толщина, класс, размер, и строка прайса про этот же декор их
                 # обычно называет. Решает только ОДИН уцелевший кандидат.
-                single = self._only_one_fits(hits, self._price_line(title))
-                if single is not None:
-                    matched.append(single)
-                else:
+                single = self._only_one_fits(hits, line)
+                if single is None:
                     unclear.append(title)
             else:
                 missing.append(title)
+
+            # РАЗМЕР ОБЯЗАН СОВПАСТЬ (алгоритм админа 28.10.2026, Mark у Артисаны). «Mark
+            # Chrome 75x150» в прайсе и «Mark Chrome 600x600» в 1С — одно название и РАЗНЫЙ
+            # товар; по такой паре агент проставил бы артикул чужой позиции, а по артикулу
+            # выбирается наименьшая цена между поставщиками. Размера нет с одной из сторон —
+            # судить нечем, поведение прежнее.
+            if single is not None:
+                if _size_agrees(single, line) is False:
+                    misfit.append(f"{title}: в прайсе «{line}», в 1С {single.ref} "
+                                  f"{_card_size(single)}")
+                else:
+                    matched.append(single)
 
         out = {"нашлось_по_названию": len(matched) - by_article,
                "позиций_в_1С": len(members)}
@@ -862,6 +919,12 @@ class TaskBuilderTools:
             out["нет_в_1С_по_названию"] = missing[:40]
         if unclear:
             out["неоднозначные_названия"] = unclear[:20]
+        if misfit:
+            # Название совпало, размер — нет: это ДРУГОЙ товар, артикул ему не ставить.
+            out["название_совпало_размер_нет"] = misfit[:20]
+        # Сопоставленное запоминаем: снятие по частичной коллекции его не тронет.
+        for item in matched:
+            self._present_refs.add(item.ref)
         out["как"] = ("колонки артикулов нет: сначала пробовали артикул, спрятанный В "
                       "НАЗВАНИИ расцветки, потом — само название внутри этой коллекции. "
                       "Имя слабее артикула: другое написание декора в следующем прайсе "
@@ -1377,6 +1440,10 @@ class TaskBuilderTools:
             if by_title:
                 out["сверка_по_названиям"] = by_title["сводка"]
                 found = by_title["позиции"]
+
+        # НАЙДЕННОЕ СВЕРКОЙ В ПРАЙСЕ ЕСТЬ — по артикулу или по названию с размером. Снятие
+        # по частичной коллекции его не тронет, как бы ни сложился поиск по тексту файла.
+        self._present_refs.update(i.ref for i in found)
 
         if not found and self.search_error:
             out["note"] = (f"1С НЕ ОТВЕТИЛА на поиск по всей номенклатуре "
@@ -2368,20 +2435,7 @@ def _add_discontinued_candidates(tools) -> list[str]:
     notes: list[str] = []
     for tm_code, names in tools.untouched_collections().items():
         mark_name = tools._tm_names.get(tm_code, "")
-
-        # ПРАЙС ОДНОЙ МАРКИ НИЧЕГО НЕ ГОВОРИТ О ЧУЖОЙ. Выгрузка марки попадает в кеш от
-        # любого вызова сверки: агент принял заводскую пометку прайса («Завод AGT»,
-        # «Peli») за бренд, а код сам переставил марку, найдя артикулы коллекции Effect
-        # под AGT. После этого ВЕСЬ каталог AGT, Peli и Kronparket поехал в снятие — 18
-        # задач по коллекциям, которых в прайсе Вестерхофа и быть не могло (бой
-        # 24.09.2026).
-        #
-        # Признак «прайс про эту марку» — ДОЛЯ закрытых коллекций. Закрыл меньше половины
-        # — значит прайс о ней не про неё, и судить об остальных нечем.
-        covered, live = tools.mark_coverage(tm_code)
-        if live and covered * 2 < live:
-            notes.append(f"«{mark_name or tm_code}»: прайс закрыл {covered} из {live} "
-                         f"коллекций — это не его марка, снятие по ней не предлагаю")
+        if not _may_discontinue(tools, tm_code, notes):
             continue
         mark = Ref.make(code=tm_code, names=[mark_name] if mark_name else [])
         if mark.empty:
@@ -2428,7 +2482,81 @@ def _add_discontinued_candidates(tools) -> list[str]:
                     f"тогда задачу просто закрыть."))
             if not any(t.matches(task) for t in tools.collected):
                 tools.collected.append(task)
+
+    _add_partial_discontinued(tools, notes)
     return notes
+
+
+def _may_discontinue(tools, tm_code: str, notes: list[str]) -> bool:
+    """Можно ли по этой марке предлагать снятие. Две проверки, обе с боя.
+
+    **ПРАЙС ОДНОЙ МАРКИ НИЧЕГО НЕ ГОВОРИТ О ЧУЖОЙ.** Выгрузка марки попадает в кеш от любого
+    вызова сверки: агент принял заводскую пометку прайса («Завод AGT», «Peli») за бренд, а
+    код сам переставил марку, найдя артикулы коллекции Effect под AGT. После этого ВЕСЬ
+    каталог AGT, Peli и Kronparket поехал в снятие — 18 задач по коллекциям, которых в
+    прайсе Вестерхофа и быть не могло (бой 24.09.2026). Признак «прайс про эту марку» — ДОЛЯ
+    закрытых коллекций: меньше половины — судить об остальных нечем.
+
+    **МАРКА ДОЛЖНА БЫТЬ ПРИВЯЗАНА К ОТМЕЧЕННОМУ БРЕНДУ** (алгоритм админа 28.10.2026).
+    Сборщик видит только отмеченные листы и бренды, и коллекция на неотмеченном выглядела
+    бы ушедшей. У формата без брендов (`brand_tms is None`) проверка не применяется.
+    """
+    mark_name = tools._tm_names.get(tm_code, "")
+    brand_tms = getattr(tools, "brand_tms", None)
+    if brand_tms is not None and tm_code not in brand_tms:
+        notes.append(f"«{mark_name or tm_code}»: ни один отмеченный бренд прайса не привязан "
+                     f"к этой марке — снятие по ней не предлагаю")
+        return False
+    covered, live = tools.mark_coverage(tm_code)
+    if live and covered * 2 < live:
+        notes.append(f"«{mark_name or tm_code}»: прайс закрыл {covered} из {live} "
+                     f"коллекций — это не его марка, снятие по ней не предлагаю")
+        return False
+    return True
+
+
+def _add_partial_discontinued(tools, notes: list[str]) -> None:
+    """Снятие по коллекции, которая в прайсе есть ЧАСТИЧНО (алгоритм админа 28.10.2026).
+
+    Случай Mark у Артисаны: в прайсе три позиции, в 1С тридцать четыре, и снятия не было
+    вовсе — код заводил его только по коллекциям, которых в прайсе нет СОВСЕМ, а модель
+    по правилу «нет в прайсе — кандидат, не приговор» задачу не завела.
+
+    Уходят живые позиции, которых нет: ни в прайсе (та же проверка, что у исполнителя —
+    `executor._seen_in_price`, артикул целым кодом, название по правилу для плитки), ни
+    среди сопоставленных по названию и размеру (`_present_refs`), ни у других поставщиков
+    (журнал встреч, только по артикулу — у позиции без артикула он пуст всегда, и это
+    «журнал пуст → снимаем», решение 21.09.2026). Решение о переносе по-прежнему за
+    исполнителем: он перепроверит прайс и журнал на месте и сдвинет поштучно.
+    """
+    for tm_code, leaving in tools.partial_leavers().items():
+        if not _may_discontinue(tools, tm_code, notes):
+            continue
+        mark_name = tools._tm_names.get(tm_code, "")
+        mark = Ref.make(code=tm_code, names=[mark_name] if mark_name else [])
+        if mark.empty:
+            continue
+        for name, items in leaving.items():
+            listed = "\n".join(f"— {i.ref} «{i.site_name or i.name}»"
+                               + (f" (арт. {i.article})" if i.article else "")
+                               for i in items[:40])
+            more = f"\n… и ещё {len(items) - 40}" if len(items) > 40 else ""
+            task = PriceTask(
+                kind=TaskKind.MOVE_DISCONTINUED,
+                address=TaskAddress(tm=mark,
+                                    subject=Ref.make(
+                                        code=tools._collection_code(tm_code, name),
+                                        names=[name]),
+                                    subject_kind=TaskSubject.COLLECTION),
+                description=(
+                    f"Коллекция «{name}» в этом прайсе есть ЧАСТИЧНО: {len(items)} поз. "
+                    f"не встретились ни в прайсе, ни у других поставщиков. Перенести их в "
+                    f"снятые; что в прайсе есть — остаётся.\n\n{listed}{more}\n\n"
+                    f"Сначала выполнить задачу на простановку артикулов по этой коллекции, "
+                    f"если она есть: позиция без артикула, опознанная по названию и "
+                    f"размеру, иначе уехала бы в снятые."))
+            if not any(t.matches(task) for t in tools.collected):
+                tools.collected.append(task)
 
 
 def owner_map(folders, marks) -> dict[str, set]:
@@ -2466,6 +2594,31 @@ def owner_map(folders, marks) -> dict[str, set]:
             owners.setdefault(key, set()).add((mark["code"], mark["name"]))
 
     return owners
+
+
+def _size_agrees(item, line: str) -> bool | None:
+    """Совпал ли размер карточки с размером в строке прайса.
+
+    Истина — в строке есть размер, и он свой (стороны совпали с полями карточки в мм или в
+    см, в любом порядке — тем же правилом, что `drop_own_size`). Ложь — размер в строке
+    есть, но чужой. `None` — судить нечем: в строке размера нет либо у карточки не
+    заполнены поля.
+    """
+    from src.price_tool.naming import _TITLE_SIZE, drop_own_size
+
+    length, width = getattr(item, "length_from", None), getattr(item, "width_from", None)
+    if not line or not length or not width or not _TITLE_SIZE.search(line):
+        return None
+    cleaned, _ = drop_own_size(line, length, width, getattr(item, "thickness", None))
+    return cleaned != line
+
+
+def _card_size(item) -> str:
+    """Размер карточки для глаз админа: «600x600 мм»."""
+    length, width = getattr(item, "length_from", None), getattr(item, "width_from", None)
+    if not length or not width:
+        return "без размера"
+    return f"{length:g}x{width:g} мм"
 
 
 def _flat(value: str) -> str:
@@ -2703,7 +2856,8 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
                 logos: dict | None = None, catalogue=None,
                 note=None, rivals: dict | None = None,
                 price_date: str | None = None,
-                admin_notes: list | None = None) -> tuple[list[PriceTask], str]:
+                admin_notes: list | None = None,
+                brand_tms: set | None = None) -> tuple[list[PriceTask], str]:
     """Прогон формирования задач. Возвращает (задачи, короткий ответ агента).
 
     Пустой список — не ошибка: агент мог не найти, за что зацепиться. Вызывающий решает,
@@ -2718,6 +2872,7 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
                              only_sheets=only_sheets, only_marks=only_marks,
                              discounts=discounts, currency=currency, logos=logos,
                              catalogue=catalogue, rivals=rivals, price_date=price_date)
+    tools.brand_tms = brand_tms
     task = f"Прайс «{filename}». Составь список задач по нему." + admin_notes_block(admin_notes)
 
     # РАЗБИРАТЬ НЕЧЕГО — МОДЕЛЬ НЕ ЗОВЁМ ВОВСЕ. Ради этого вся затея и нужна: прогон по

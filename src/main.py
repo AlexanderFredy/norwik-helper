@@ -231,6 +231,7 @@ async def main() -> None:
             logger.warning("Логотипы прайса %s не прочитаны", filename, exc_info=True)
 
         only_marks = None
+        brand_tms = None
         marks = []
         try:
             marks = await asyncio.to_thread(onec.selling_tm) if onec else []
@@ -238,6 +239,12 @@ async def main() -> None:
                                             filename, marks, logos)
             if summary["brands"]:
                 only_marks = await supplier_store.marks_wanted(signature)
+                # МАРКИ ОТМЕЧЕННЫХ БРЕНДОВ — снятие заводится только по ним (алгоритм
+                # админа 28.10.2026): сборщик видит лишь отмеченное, и марка вне него
+                # выглядела бы ушедшей целиком.
+                brand_tms = {(m.tm_code or "").strip()
+                             for m in await supplier_store.marks_for(signature)
+                             if m.parse and (m.tm_code or "").strip()}
         except Exception:                               # noqa: BLE001
             # Бренды не собрались — это не повод не собирать задачи: работаем как прежде,
             # по листам. Молча этого не оставляем, но и прогон не роняем.
@@ -286,7 +293,7 @@ async def main() -> None:
                            remember_columns=remember_columns,
                            only_sheets=only_sheets, only_marks=only_marks,
                            discounts=discounts, logos=logos, catalogue=marks,
-                           admin_notes=admin_notes,
+                           admin_notes=admin_notes, brand_tms=brand_tms,
                            currency={"code": price.supplier_price.currency_code,
                                      "name": price.supplier_price.currency_name,
                                      "rate": price.supplier_price.rate},

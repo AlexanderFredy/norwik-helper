@@ -645,6 +645,56 @@ class DiscontinueTest(unittest.IsolatedAsyncioTestCase):
                                      "parent_ref": self.TARGET}])
         self.assertEqual(status, TaskStatus.DONE)
 
+    def returning_tree(self):
+        """Дерево после переноса папкой: «Brilliant» лежит прямо в папке снятых."""
+        def node(ref, name, kind, parent, dead=False):
+            f = self.Folder(ref, name, kind=kind, not_exported=dead)
+            f.parent_ref = parent
+            return f
+        return [node("TYPE", "Ламинат", "type", "ROOT"),
+                node("SHELF", "*Снятая (Ламинат)", "discontinued", "TYPE", dead=True),
+                node("TM1", "Most Flooring ламинат", "tm", "TYPE"),
+                node("TMX", "Most Flooring старое", "tm", "OTHER"),
+                node("F-BR", "Brilliant", "collection", "SHELF", dead=True)]
+
+    async def test_folder_moved_whole_comes_back_with_what_is_in_the_price(self):
+        """Алгоритм админа 28.10.2026: коллекция уехала в снятые ЦЕЛОЙ ПАПКОЙ, поставщик
+        привёз одну позицию из двух. Папка возвращается в живую папку марки (под тем же
+        видом, что папка снятых), а позиция, которой в прайсе нет, остаётся в снятых."""
+        from src.model.executor import return_collection_folder
+
+        back = self.item_in("R1")
+        object.__setattr__(back, "article", "A999")
+        stays = self.item_in("R2")
+        object.__setattr__(stays, "article", "B777")
+        task = PriceTask(kind=TaskKind.ADD_NEW,
+                         address=TaskAddress(tm=Ref.make(code="000000311",
+                                                         names=["Most Flooring"]),
+                                             subject=Ref.make(names=["Brilliant"]),
+                                             subject_kind=TaskSubject.COLLECTION),
+                         description="вернуть", id=9)
+        onec = self.onec([back, stays], self.returning_tree())
+        text = await return_collection_folder(onec, task, allow, self.price())
+
+        self.assertEqual(onec.ops, [
+            {"op": "update_folder", "ref": "F-BR", "parent_ref": "TM1"},
+            {"op": "update_item", "ref": "R2", "parent_ref": "SHELF"}])
+        self.assertIn("возвращена", text)
+
+    async def test_nothing_returns_when_the_price_has_none_of_it(self):
+        from src.model.executor import return_collection_folder
+
+        gone = self.item_in("R2")
+        object.__setattr__(gone, "article", "B777")
+        task = PriceTask(kind=TaskKind.ADD_NEW,
+                         address=TaskAddress(tm=Ref.make(code="000000311"),
+                                             subject=Ref.make(names=["Brilliant"]),
+                                             subject_kind=TaskSubject.COLLECTION),
+                         description="", id=9)
+        onec = self.onec([gone], self.returning_tree())
+        self.assertEqual(await return_collection_folder(onec, task, allow, self.price()), "")
+        self.assertIsNone(onec.ops)
+
     def tile(self, ref, title, collection="Nid"):
         """Позиция керамогранита БЕЗ артикула — как у «Nid» в 1С."""
         it = self.item_in(ref, collection=collection)

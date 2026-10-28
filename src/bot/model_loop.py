@@ -110,6 +110,10 @@ class AgentLoop:
         # опросили раньше, — то самое, что правило «кто первый» (§7) и запрещает.
         for actor, commands in group_by_actor(batch):
             run, rejected = plan_batch(commands, self._service.busy_for(actor))
+            # Снятие коллекции — после «изменения свойств» той же коллекции (28.10.2026).
+            articles_first = getattr(self._service, "articles_first", None)
+            if articles_first is not None:
+                run = articles_first(run)
             for refusal in rejected:
                 await self._service.reject(refusal)
                 await self._queue.done(refusal.command.id)
