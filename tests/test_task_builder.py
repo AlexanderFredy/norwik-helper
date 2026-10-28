@@ -1003,6 +1003,32 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Chrome", summary["название_совпало_размер_нет"][0])
         self.assertEqual(tools._present_refs, {"R2"})
 
+    async def test_product_type_comes_from_1c_when_the_collection_is_there(self):
+        """БОЙ 28.10.2026, Артисана: модель взяла вид из колонки «Тип» («Пол»), и задача по
+        керамике отклонилась как «не входит в категории». Коллекция в 1С есть — у её
+        позиций вид известен, он и решает."""
+        from dataclasses import replace
+
+        tile = replace(self.nom("R1", "LE-263", collection="Vintage"),
+                       product_type="Керамогранит")
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=self.onec([tile]),
+                                 scope=["керамогранит"])
+        await self.compare(tools, ["LE-263"])
+        out = await tools.execute("add_task", {
+            "kind": "изменение цен", "tm": "Egger", "tm_code": "T1",
+            "collection": "Vintage", "product_type": "Пол", "description": "цены"})
+        self.assertNotIn("не входит", out)
+        self.assertEqual(len(tools.collected), 1)
+
+    async def test_unknown_collection_keeps_the_category_refusal(self):
+        """Подложка Линдервуда (28.09.2026): коллекции в 1С нет — отказ остаётся."""
+        tools = TaskBuilderTools(workbook(), "Прайс.xlsx", onec=self.onec([]),
+                                 scope=["ламинат"])
+        out = await tools.execute("add_task", {
+            "kind": "добавление новых", "tm": "Egger", "tm_code": "T1",
+            "collection": "Подложка", "product_type": "подложка", "description": "завести"})
+        self.assertIn("не входит", out)
+
     async def test_tile_matches_a_rounded_size(self):
         """Плитка: поставщик округлил 59,7x119,7 до «60x120» и дал толщину — тот же товар."""
         from dataclasses import replace
@@ -1723,6 +1749,61 @@ class BuildTest(unittest.IsolatedAsyncioTestCase):
         # стало сильнее: не «пиши проверить», а «сначала спроси, потом пиши числа».
         self.assertIn("сначала спроси", prompt)
         self.assertIn("ПИШИ ТО, ЧТО ЗНАЕШЬ, А НЕ ТО, ЧТО НАДО ПРОВЕРИТЬ", prompt)
+
+
+class NudgeTest(unittest.IsolatedAsyncioTestCase):
+    """Модель закончила раньше прайса — код просит продолжить (бой 28.10.2026, Артисана:
+    18 коллекций из ~140, Porcelanosa не тронута вовсе)."""
+
+    @staticmethod
+    def long_price() -> bytes:
+        import openpyxl
+        wb = openpyxl.Workbook()
+        sheet = wb.active
+        sheet.title = "Price"
+        sheet.append(["Артикул", "Наименование", "Опт", "Розн"])
+        for n in range(20):
+            sheet.append([f"A{n:03d}", f"Позиция {n}", 1000, 1500])
+        buf = BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    class Scripted:
+        """Первый ход сверяет две позиции; на просьбу продолжить — остальные."""
+        def __init__(self):
+            self.prompts = []
+
+        async def handle_turn(self, history, system=None, extra_tools=None,
+                              extra_executor=None, **kw):
+            self.prompts.append(history[-1]["content"])
+            first = len(self.prompts) == 1
+            codes = ["A000", "A001"] if first else [f"A{n:03d}" for n in range(2, 20)]
+            await extra_executor.execute("compare_with_1c", {
+                "tm_code": "T1", "collection": "Vintage", "articles": codes})
+            return ("первый ход" if first else "досверил"), history + [
+                {"role": "assistant", "content": "ok"}]
+
+    async def test_unfinished_check_is_continued(self):
+        orc = self.Scripted()
+        tasks, answer = await build(orc, self.long_price(), "Прайс.xlsx", onec=FakeOnec())
+        self.assertEqual(len(orc.prompts), 2, "ровно одна просьба продолжить")
+        self.assertIn("СВЕРКА НЕ ЗАКОНЧЕНА", orc.prompts[1])
+        self.assertIn("A002", orc.prompts[1])
+        self.assertEqual(answer, "досверил")
+
+    async def test_no_nudge_when_nothing_new_is_checked(self):
+        """Модель на просьбу ничего не сверила — второй раз не просим."""
+        class Stuck(self.Scripted):
+            async def handle_turn(self, history, **kw):
+                self.prompts.append(history[-1]["content"])
+                if len(self.prompts) == 1:
+                    await kw["extra_executor"].execute("compare_with_1c", {
+                        "tm_code": "T1", "collection": "Vintage", "articles": ["A000"]})
+                return "стоп", history + [{"role": "assistant", "content": "ok"}]
+
+        orc = Stuck()
+        await build(orc, self.long_price(), "Прайс.xlsx", onec=FakeOnec())
+        self.assertEqual(len(orc.prompts), 2)
 
 
 class ServiceFallbackTest(unittest.IsolatedAsyncioTestCase):

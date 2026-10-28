@@ -56,6 +56,7 @@ MAX_SHEET_ROWS = 200        # строк листа в один ответ ин�
 #: мерка по смыслу, что `BIG_PRICE_ROWS` в прайсовом потоке: сверх неё решает человек.
 BIG_BRAND_ROWS = 1500
 MAX_TASKS = 200             # потолок на прогон: защита от разгона, а не рабочий предел
+MAX_NUDGES = 3              # сколько раз просить модель досверить прайс (28.10.2026)
 
 
 def _price_notes_only(text: str | None) -> str:
@@ -454,6 +455,8 @@ class TaskBuilderTools:
         # Карточки, найденные сверкой в прайсе — по артикулу либо (без артикула) по
         # названию и размеру: снятие по частичной коллекции их не трогает (28.10.2026).
         self._present_refs: set[str] = set()
+        # Артикулы прайса, которые модель уже отдала в `compare_with_1c` (28.10.2026).
+        self._asked_articles: set[str] = set()
         # Коды марок, к которым в форме привязан ОТМЕЧЕННЫЙ бренд прайса. Снятие заводится
         # только по ним: сборщик видит лишь отмеченные листы и бренды, и коллекция на
         # неотмеченном выглядела бы ушедшей (28.10.2026). `None` — у формата брендов нет,
@@ -795,6 +798,57 @@ class TaskBuilderTools:
             if rest:
                 out[tm_code] = rest
         return out
+
+    def unchecked_note(self, sample: int = 15) -> str:
+        """Что в прайсе модель НЕ сверила — текстом для продолжения хода. Пусто — дошла.
+
+        **БОЙ 28.10.2026, Артисана.** Модель прочитала весь прайс (1 376 строк двух брендов),
+        сверила 18 коллекций Atlas Concorde из ~140 и сама закончила ход: до Porcelanosa не
+        дошла вовсе, задач по ней не завелось ни одной. Обрыва по длине не было — она сочла
+        работу сделанной. Судить об этом может только код: он знает, какие артикулы ушли в
+        сверку, и находит колонку артикула в прайсе (`guess_columns` или названное моделью).
+
+        Считаем строки с артикулом в отмеченных листах и брендах; несверенным считается
+        артикул, ни разу не переданный в `compare_with_1c`. Порог — пять процентов и не
+        меньше пяти строк: единичные промахи (подписи, итоговые строки) хода не стоят.
+        """
+        from src.model import price_check
+
+        missing, total = [], 0
+        for sheet in self.sheets:
+            spec = (self._price_cols.get(sheet.name) or self._known_columns.get(sheet.name)
+                    or price_check.guess_columns(sheet.rows))
+            if not spec or not spec.get("article"):
+                continue
+            raw = spec["article"]
+            if isinstance(raw, int) or str(raw).isdigit():
+                col = int(raw) - 1               # номера с единицы, как их называют люди
+            else:
+                columns = price_check.resolve_columns(sheet.rows, dict(spec))
+                if isinstance(columns, str):
+                    continue
+                col = columns.article
+            for number, row in enumerate(sheet.rows, 1):
+                value = row[col] if col < len(row) else None
+                key = norm_article(str(value or ""))
+                # Без цифры — не артикул: так отсеиваются строка заголовков и подписи. Строка
+                # из одной-двух ячеек — раздел («3D Wall» у Артисаны стоит в колонке кода).
+                if len(key) < 3 or not any(ch.isdigit() for ch in key):
+                    continue
+                if sum(1 for c in row if str(c or "").strip()) < 3:
+                    continue
+                total += 1
+                if key not in self._asked_articles:
+                    text = " ".join(str(c) for c in row if str(c or "").strip())
+                    missing.append((sheet.name, number, text[:100]))
+        if not missing or len(missing) <= max(5, total * 0.05):
+            return ""
+        first = "\n".join(f"— лист «{s}», строка {n}: {t}" for s, n, t in missing[:sample])
+        return (f"СВЕРКА НЕ ЗАКОНЧЕНА: из {total} позиций прайса с артикулом ты не сверил "
+                f"{len(missing)}. Первые несверенные:\n{first}\n\nПродолжай с них: читай "
+                f"прайс read_price (from_row с первой несверенной строки), сверяй "
+                f"compare_with_1c по их коллекциям и заводи задачи. Уже сверенное не повторяй. "
+                f"Раздел вне анализируемых категорий пропусти и назови одной строкой в итоге.")
 
     def partial_leavers(self) -> dict[str, dict[str, list]]:
         """Код марки → {коллекция → живые позиции, которых в прайсе нет} — по коллекциям,
@@ -1209,6 +1263,8 @@ class TaskBuilderTools:
             if key and key not in seen:
                 seen.add(key)
                 from_price.append((key, str(raw).strip()))
+        # Что модель уже отдала на сверку — по этому код судит, дошла ли она до конца.
+        self._asked_articles.update(seen)
 
         # МАРКУ ОПРЕДЕЛЯЕТ 1С, А НЕ ДОГАДКА МОДЕЛИ.
         self._collection_name = collection
@@ -2011,6 +2067,17 @@ class TaskBuilderTools:
                     break
         return out[:20]
 
+    def _kind_in_1c(self, tm_code: str, collection: str) -> str:
+        """Вид товара живых позиций коллекции в 1С — если он у них ОДИН. Пусто — коллекции
+        в выгрузке нет либо виды разные (тогда решать за модель нечем)."""
+        items = self._items_cache.get(tm_code) or ()
+        tm_name = self._tm_names.get(tm_code, "")
+        keys = _collection_keys(collection, tm_name)
+        kinds = {(i.product_type or "").strip() for i in items
+                 if not i.not_exported and (i.product_type or "").strip()
+                 and _collection_keys(collection_of(i), tm_name) & keys}
+        return kinds.pop() if len(kinds) == 1 else ""
+
     def _out_of_scope(self, product_type) -> str:
         """Причина отказа, если такой вид товара мы не анализируем. Пусто — можно.
 
@@ -2062,6 +2129,15 @@ class TaskBuilderTools:
         # называет модель, а решение принимает код. Это то же разделение, что и везде:
         # модель поставляет то, чего код не знает, решает код.
         refused = self._out_of_scope(inp.get("product_type"))
+        # КОЛЛЕКЦИЯ В 1С ЕСТЬ — ВИД У ЕЁ ПОЗИЦИЙ ГЛАВНЕЕ ПОДПИСИ ИЗ ПРАЙСА (бой 28.10.2026,
+        # Артисана). Модель брала вид из колонки «Тип» — «Пол», «Вставка», — и код отклонил
+        # пять задач по керамике как «не входит в категории». Подложка Линдервуда (28.09)
+        # по-прежнему отклоняется: такой коллекции в 1С нет, и вид знает только прайс.
+        if refused and collection:
+            known = self._kind_in_1c(str(inp.get("tm_code") or "").strip(), collection)
+            if known and not self._out_of_scope(known):
+                inp = {**inp, "product_type": known}
+                refused = ""
         if refused:
             return self._refuse(refused)
 
@@ -2908,9 +2984,31 @@ async def build(orchestrator, content: bytes, filename: str, onec=None,
                 logger.warning("Не удалось доложить о листах прайса", exc_info=True)
         return [], said
 
-    answer, _ = await orchestrator.handle_turn(
+    answer, history = await orchestrator.handle_turn(
         [{"role": "user", "content": task}], system=PROMPT, extra_tools=TOOLS,
         extra_executor=tools, base_tools=False, usage_labels=usage_labels)
+
+    # МОДЕЛЬ ЗАКОНЧИЛА РАНЬШЕ ПРАЙСА — ПРОСИМ ПРОДОЛЖИТЬ (бой 28.10.2026, Артисана: 18
+    # коллекций из ~140, до Porcelanosa не дошла). Что не сверено, знает код; список уходит
+    # ей той же историей. Не больше `MAX_NUDGES` раз, и не повторяем, если она за ход не
+    # сверила ничего нового — значит остаток не её работа (вне категорий, без артикулов).
+    for _ in range(MAX_NUDGES):
+        try:
+            nudge = await asyncio.to_thread(tools.unchecked_note)
+        except Exception:                               # noqa: BLE001
+            logger.warning("Не удалось проверить полноту сверки", exc_info=True)
+            break
+        if not nudge or not history:
+            break
+        asked = len(tools._asked_articles)
+        logger.info("Сверка не закончена, прошу продолжить: %s", nudge.splitlines()[0])
+        more, history = await orchestrator.handle_turn(
+            history + [{"role": "user", "content": nudge}], system=PROMPT,
+            extra_tools=TOOLS, extra_executor=tools, base_tools=False,
+            usage_labels=usage_labels)
+        answer = more or answer
+        if len(tools._asked_articles) == asked:
+            break
 
     # КОЛЛЕКЦИИ, КОТОРЫХ ПРАЙС НЕ КОСНУЛСЯ, — задача заводится КОДОМ.
     #
