@@ -1003,6 +1003,24 @@ class CompareTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Chrome", summary["название_совпало_размер_нет"][0])
         self.assertEqual(tools._present_refs, {"R2"})
 
+    async def test_tile_matches_a_rounded_size(self):
+        """Плитка: поставщик округлил 59,7x119,7 до «60x120» и дал толщину — тот же товар."""
+        from dataclasses import replace
+        import openpyxl
+        wb = openpyxl.Workbook()
+        sheet = wb.active
+        sheet.append(["Артикул", "Наименование", "Опт"])
+        sheet.append(["A1", "Boost Ivory 60x120x0,9", 5000])
+        buf = BytesIO()
+        wb.save(buf)
+
+        ivory = replace(self.nom("R1", "", site="Ivory", collection="Boost"),
+                        product_type="Керамогранит", product_type_ref="000000011",
+                        length_from=1197, width_from=597, thickness=10)
+        tools = TaskBuilderTools(buf.getvalue(), "Прайс.xlsx", onec=self.onec([ivory]))
+        got = await self.compare(tools, [], collection="Boost", titles=["Ivory"])
+        self.assertEqual(got["сверка_по_названиям"]["нашлось_по_названию"], 1)
+
     async def test_foreign_collection_is_not_pulled_in_by_stripping(self):
         """Снимается имя ИМЕННО ЭТОЙ марки и только целым словом: чужая коллекция от
         такого снятия притянуться не должна."""

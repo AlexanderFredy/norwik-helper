@@ -1653,8 +1653,7 @@ class TaskBuilderTools:
                 has_title = re.search(r"(?<!\w)" + r"\s+".join(map(re.escape, words))
                                       + r"(?!\w)", row.casefold())
                 has_size = (card.length_from and card.width_from
-                            and drop_own_size(row, card.length_from, card.width_from,
-                                              card.thickness)[0] != row)
+                            and _size_agrees(card, row) is True)
                 if has_title and has_size:
                     fits.append(card)
             if len(fits) == 1:
@@ -2603,12 +2602,17 @@ def _size_agrees(item, line: str) -> bool | None:
     см, в любом порядке — тем же правилом, что `drop_own_size`). Ложь — размер в строке
     есть, но чужой. `None` — судить нечем: в строке размера нет либо у карточки не
     заполнены поля.
+
+    **У ПЛИТКИ — СВОЁ ПРАВИЛО** (админ, 28.10.2026): толщина не важна, длина и ширина с
+    допуском ±1 см (`naming.tile_size_in`) — поставщики округляют до целых сантиметров.
     """
-    from src.price_tool.naming import _TITLE_SIZE, drop_own_size
+    from src.price_tool.naming import _TITLE_SIZE, drop_own_size, size_in_name, tile_size_in
 
     length, width = getattr(item, "length_from", None), getattr(item, "width_from", None)
     if not line or not length or not width or not _TITLE_SIZE.search(line):
         return None
+    if size_in_name(getattr(item, "product_type", ""), getattr(item, "product_type_ref", "")):
+        return tile_size_in(line, length, width)
     cleaned, _ = drop_own_size(line, length, width, getattr(item, "thickness", None))
     return cleaned != line
 

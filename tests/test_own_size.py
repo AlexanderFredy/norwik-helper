@@ -74,6 +74,33 @@ class PlanTest(unittest.TestCase):
         self.assertTrue(any("убран размер" in w for w in item.warnings))
 
 
+class TileSizeTest(unittest.TestCase):
+    """Плитка: толщина не важна, длина и ширина ±1 см (правило админа 28.10.2026)."""
+
+    def test_rounded_and_precise_sizes_are_the_same(self):
+        from src.price_tool.naming import tile_size_in
+        self.assertTrue(tile_size_in("Mark Ivory 60x120", 1197, 597))
+        self.assertTrue(tile_size_in("Mark Ivory 59,7x119,7", 1200, 600))
+        self.assertTrue(tile_size_in("Mark Ivory 600x1200 мм", 1197, 597))
+
+    def test_thickness_does_not_matter(self):
+        from src.price_tool.naming import tile_size_in
+        self.assertTrue(tile_size_in("Boost 60x120x0,9 Lapp", 1200, 600))
+        self.assertTrue(tile_size_in("Boost 60x120x2", 1200, 600))
+
+    def test_tolerance_is_one_centimetre(self):
+        from src.price_tool.naming import tile_size_in
+        self.assertTrue(tile_size_in("61x120", 1200, 600))
+        self.assertFalse(tile_size_in("62x120", 1200, 600))
+
+    def test_another_format_is_not_the_same(self):
+        """Mark Chrome: 75x150 в прайсе и 600x600 в 1С — разный товар."""
+        from src.price_tool.naming import tile_size_in
+        self.assertFalse(tile_size_in("Mark Chrome 75x150 R10", 600, 600))
+        self.assertIsNone(tile_size_in("Mark Chrome R10", 600, 600))
+        self.assertIsNone(tile_size_in("Mark Chrome 75x150", None, None))
+
+
 class SizeInCentimetresTest(unittest.TestCase):
     """В полях — мм, в наименовании — см с одним разрядом, если он не ноль (28.10.2026)."""
 

@@ -424,6 +424,45 @@ _TITLE_SIZE = re.compile(rf"(?<![\w.,])({_NUM})\s*[xх×*]\s*({_NUM})(?:\s*[xх�
 _TITLE_THICK = re.compile(rf"(?:\s[-–—])?\s*({_NUM})\s*(?:mm|мм)(?![\w])", re.I)
 
 
+#: Допуск сравнения длины и ширины ПЛИТКИ, мм (правило админа 28.10.2026).
+TILE_SIZE_TOLERANCE_MM = 10
+
+
+def tile_size_in(text: str | None, length, width) -> bool | None:
+    """Есть ли в тексте размер ПЛИТКИ, совпадающий с полями карточки (правило админа
+    28.10.2026). Только длина и ширина, ТОЛЩИНА НЕ ВАЖНА, допуск ±1 см на сторону, в любом
+    порядке: одни поставщики округляют до целых сантиметров («60x120»), другие пишут
+    миллиметры после запятой («59,7x119,7»), а это один и тот же размер.
+
+    Единицы — из подписи («см», «мм»), без неё пробуем обе: «60x120» — сантиметры,
+    «600x1200» — миллиметры. `None` — судить нечем: размера в тексте нет либо у карточки
+    не заполнены поля; Ложь — размер в тексте есть, но не её.
+    """
+    try:
+        own_l, own_w = float(length), float(width)
+    except (TypeError, ValueError):
+        return None
+    if not own_l or not own_w or not text:
+        return None
+    sizes = list(_TITLE_SIZE.finditer(str(text)))
+    if not sizes:
+        return None
+
+    def close(a: float, b: float) -> bool:
+        return abs(a - b) <= TILE_SIZE_TOLERANCE_MM
+
+    for found in sizes:
+        a, b = _f(found.group(1)), _f(found.group(2))
+        unit = (found.group(4) or "").lower()
+        scales = [10.0] if unit in ("см", "cm") else [1.0] if unit in ("мм", "mm") \
+            else [1.0, 10.0]
+        for scale in scales:
+            x, y = a * scale, b * scale
+            if close(x, own_l) and close(y, own_w) or close(x, own_w) and close(y, own_l):
+                return True
+    return False
+
+
 def _f(text) -> float:
     return float(str(text).replace(",", "."))
 
