@@ -44,7 +44,7 @@ TITLES = {
     "parent_ref": "папка",
     "collection": "коллекция",
     "article": "артикул",
-    "art": "Арт (код поставщика)",
+    "art": "артикул магазина (код поставщика)",
     "unit": "единица",
     "pack_coefficient": "коэффициент упаковки",
     "length_from": "длина",
@@ -473,7 +473,7 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
         wanted = {
             "parent_ref": str(raw.get("parent_ref") or "").strip(),
             "article": article,
-            # Внутренний код поставщика в реквизит «Арт» (Артисана, «+37687», 28.10.2026).
+            # Внутренний код поставщика в реквизит «АртикулМагазина» (Артисана, «+37687», 28.10.2026).
             # Подставляет КОД по строке прайса, а не модель.
             "art": str(raw.get("art") or "").strip(),
             "unit": str(raw.get("unit") or "").strip(),
