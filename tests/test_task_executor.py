@@ -727,6 +727,32 @@ class SilentAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "Обновлено 5 цен в коллекции.")
 
 
+class FindRowsTest(unittest.TestCase):
+    """Задача 1403: ради одной строки модель семь раз листала прайс по 200 строк."""
+
+    def test_contains_returns_only_matching_rows_with_header(self):
+        import openpyxl
+        from io import BytesIO
+        from src.model.executor import TaskTools
+
+        wb = openpyxl.Workbook()
+        sheet = wb.active
+        sheet.title = "Price"
+        sheet.append(["Артикул", "Наименование", "Опт", "Розн"])
+        for n in range(300):
+            sheet.append([f"10028{n:04d}", f"Плитка {n}", 1000, 1500])
+        sheet.append(["100 287 934", "OXFORD NATURAL 29,4x120", 6147, 8606])
+        buf = BytesIO()
+        wb.save(buf)
+
+        tools = TaskTools(FakeOnec(), buf.getvalue(), "price.xlsx", allow)
+        out = tools._read({"contains": ["100287934"]})
+        self.assertIn("OXFORD NATURAL", out)
+        self.assertIn("шапка: Артикул", out)
+        self.assertNotIn("Плитка 5\t", out)
+        self.assertIn("в прайсе нет", tools._read({"contains": ["ZZZ999"]}))
+
+
 class ReturnFiledAsDiscontinueTest(unittest.IsolatedAsyncioTestCase):
     """Задача 1403: вид «перенос в снятые», описание — возврат с правкой админа. Код
     переноса описание не читает и ответил «снимать нечего»; теперь её ведёт модель."""

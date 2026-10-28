@@ -99,11 +99,15 @@ TOOLS = [
         "name": "read_price",
         "description": (
             "Показать лист прайса. Параметры: sheet (имя листа; без него — первый), "
-            "from_row (с какой непустой строки, с 1). За раз до 200 строк."),
+            "from_row (с какой непустой строки, с 1). За раз до 200 строк. "
+            "contains — список артикулов или кусков названия: вернёт ТОЛЬКО строки с ними "
+            "по всем листам, с номерами и шапкой. Нужны конкретные позиции — ищи ими, "
+            "а не листай прайс целиком."),
         "input_schema": {
             "type": "object",
             "properties": {"sheet": {"type": "string"},
-                           "from_row": {"type": "integer"}},
+                           "from_row": {"type": "integer"},
+                           "contains": {"type": "array", "items": {"type": "string"}}},
             "additionalProperties": False,
         },
     },
@@ -449,10 +453,48 @@ class TaskTools:
         wanted = (inp.get("sheet") or "").strip().lower()
         sheet = next((s for s in self.sheets if s.name.lower() == wanted), None) \
             or self.sheets[0]
+        # ПОИСК СТРОК, А НЕ ЛИСТАНИЕ (бой 28.10.2026, задача 1403): ради одной строки с
+        # артикулом 100287934 модель семь раз листала прайс Артисаны по 200 строк — больше
+        # минуты на задачу из одной позиции. Ищем по всем листам: где лежит строка, она не
+        # знает.
+        wanted_text = [str(t).strip() for t in (inp.get("contains") or []) if str(t).strip()]
+        if wanted_text:
+            return self._find_rows(wanted_text)
         start = max(1, int(inp.get("from_row") or 1))
         head = (f"Листы: {', '.join(s.name for s in self.sheets)}\n"
                 f"=== Лист: {sheet.name} === (со строки {start})\n")
         return head + render_preview(sheet, max_rows=MAX_SHEET_ROWS, start=start)
+
+    def _find_rows(self, wanted: list[str], limit: int = 60) -> str:
+        """Строки прайса, где встречается хоть одно из `wanted`, — с номером и шапкой.
+
+        Артикул сравнивается и без разделителей («100 287 934» = «100287934»), текст —
+        вхождением без регистра. Шапка (первые строки листа до первой с тремя ячейками
+        и она сама) идёт сверху: без названий колонок модель не поймёт, где закупка.
+        """
+        keys = [(w.casefold(), norm_article(w)) for w in wanted]
+        out, found = [], 0
+        for sheet in self.sheets:
+            hits = []
+            for number, row in enumerate(sheet.rows, 1):
+                text = "\t".join(str(c) for c in row if str(c or "").strip())
+                low, flat = text.casefold(), norm_article(text)
+                if any(k in low or (len(a) >= 3 and a in flat) for k, a in keys):
+                    hits.append(f"{number}: {text}")
+            if not hits:
+                continue
+            header = next((r for r in sheet.rows
+                           if sum(1 for c in r if str(c or "").strip()) >= 3), [])
+            out.append(f"=== Лист: {sheet.name} ===\nшапка: "
+                       + "\t".join(str(c) for c in header if str(c or "").strip()))
+            out.extend(hits[:limit - found])
+            found += len(hits)
+            if found >= limit:
+                out.append(f"… показаны первые {limit} совпадений — уточни поиск")
+                break
+        if not out:
+            return "Строк с " + ", ".join(f"«{w}»" for w in wanted) + " в прайсе нет."
+        return "\n".join(out)
 
     def _with_source(self, payload: list) -> list:
         """Приписать к записи цены, ЧЕЙ прайс её дал (§6.4).
@@ -1421,16 +1463,27 @@ async def return_collection_folder(onec, task, guard, content: bytes = b"",
     if not tm_code or not names:
         return ""
     tm_name = next(iter(task.address.tm.names or ()), "")
-    every, folders = await _mark_snapshot(onec, tm_code)
-    by_ref = {f.ref: f for f in folders}
     keys = set()
     for name in names:
         keys |= nz.collection_keys(name, tm_name)
 
-    moved = [f for f in folders
-             if f.kind == "collection"
-             and getattr(by_ref.get(f.parent_ref), "kind", "") == "discontinued"
-             and nz.collection_keys(f.name, tm_name) & keys]
+    def moved_in(folders):
+        by_ref = {f.ref: f for f in folders}
+        return [f for f in folders
+                if f.kind == "collection"
+                and getattr(by_ref.get(f.parent_ref), "kind", "") == "discontinued"
+                and nz.collection_keys(f.name, tm_name) & keys]
+
+    # СПЕРВА ТОЛЬКО ДЕРЕВО — один запрос (бой 28.10.2026, задача 1403): папка в снятых
+    # лежит редко, а выгрузка каталога Porcelanosa со снятыми стоила 36 с на задачу, где
+    # возвращать папку было нечего. Каталог берём, лишь когда папка нашлась.
+    taken = _mark_memory(onec).get(tm_code)
+    tree = taken[2] if taken else (await asyncio.to_thread(onec.folders, tm=tm_code)).items
+    if not moved_in(tree):
+        return ""
+    every, folders = await _mark_snapshot(onec, tm_code)
+    by_ref = {f.ref: f for f in folders}
+    moved = moved_in(folders)
     if not moved:
         return ""
     if len(moved) > 1:
