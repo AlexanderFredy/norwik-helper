@@ -37,13 +37,14 @@ from src.price_tool.naming import (collection_case, collection_from_folder,
                                    title_case, tm_for_name, uniform_size, violations)
 
 # Поля, изменение которых показывается админу и менеджерам поимённо (§19.9).
-WATCHED = ("parent_ref", "collection", "article", "unit", "pack_coefficient",
+WATCHED = ("parent_ref", "collection", "article", "art", "unit", "pack_coefficient",
            "length_from", "length_to", "width_from", "width_to", "thickness")
 
 TITLES = {
     "parent_ref": "папка",
     "collection": "коллекция",
     "article": "артикул",
+    "art": "Арт (код поставщика)",
     "unit": "единица",
     "pack_coefficient": "коэффициент упаковки",
     "length_from": "длина",
@@ -472,6 +473,9 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
         wanted = {
             "parent_ref": str(raw.get("parent_ref") or "").strip(),
             "article": article,
+            # Внутренний код поставщика в реквизит «Арт» (Артисана, «+37687», 28.10.2026).
+            # Подставляет КОД по строке прайса, а не модель.
+            "art": str(raw.get("art") or "").strip(),
             "unit": str(raw.get("unit") or "").strip(),
             # Пишем СРАЗУ округлённым: база всё равно отбросит хвост, а так в журнале
             # правок и в 1С стоит одно и то же число.

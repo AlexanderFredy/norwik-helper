@@ -88,6 +88,9 @@ class NomItem:
     #: марке поле дублирует то, что вызывающий и так знает, — и это не повод его не слать.
     tm: str = ""
     tm_code: str = ""
+    #: Реквизит «Арт» — внутренний код поставщика («+37687» у Артисаны, 28.10.2026). `None` —
+    #: старый by-tm.bsl или реквизита нет: значение неизвестно, и это не «пусто».
+    art: str | None = None
 
 
 @dataclass(frozen=True)
@@ -566,6 +569,7 @@ class OnecClient:
                     created=str(it.get("created") or ""),
                     tm=str(it.get("tm") or ""),
                     tm_code=str(it.get("tm_code") or ""),
+                    art=(None if it.get("art") is None else str(it.get("art")).strip()),
                 )
             )
         return NomenclaturePage(
