@@ -405,6 +405,18 @@ class TaskTools:
                 self._sheets = []
         return self._sheets
 
+    @property
+    def plus_codes(self) -> dict:
+        """Заводской артикул → внутренний код поставщика на «+» (колонка «Код» Артисаны)."""
+        if getattr(self, "_plus_codes", None) is None:
+            from src.model.supplier_codes import plus_codes
+            try:
+                self._plus_codes = plus_codes(self.sheets)
+            except Exception:                           # noqa: BLE001
+                logger.warning("Колонка «Код» прайса не разобралась", exc_info=True)
+                self._plus_codes = {}
+        return self._plus_codes
+
     # ------------------------------------------------------------ диспетчер
 
     def handles(self, name: str) -> bool:
@@ -912,6 +924,13 @@ class TaskTools:
         if dropped:
             note += f"\n⚠️ {dropped}."
 
+        # ВНУТРЕННИЙ КОД ПОСТАВЩИКА — В «АРТ», и подставляет его КОД (Артисана, решение
+        # админа 28.10.2026): по строке прайса с тем же заводским артикулом. У прайсов без
+        # колонки «Код» на «+» не делает ничего.
+        from src.model.supplier_codes import fill_art
+        inp["items"] = [dict(x) for x in inp.get("items") or []]
+        fill_art(inp["items"], self.plus_codes, {i.ref: i for i in current})
+
         # Правила сборки — общие с прайсовым потоком: имена, категории, что считать
         # значимой правкой. Свой второй набор разошёлся бы с первым молча.
         plan = item_rules.plan_collection(inp, current, self._scope)
@@ -1276,7 +1295,8 @@ PROMPT = """Ты — контент-менеджер интернет-магаз
 Не приписывай себе того, чего не делал: админ видит только твой текст."""
 
 
-async def run_normalization(onec, task, guard, scope=None):
+async def run_normalization(onec, task, guard, scope=None, content: bytes = b"",
+                            filename: str = "price.xlsx"):
     """Нормализация наименований кодом (§6.2, вариант «без LLM»).
 
     Модель не участвует: вход для `plan_collection` собирается из полей 1С, сборка имени —
@@ -1319,6 +1339,22 @@ async def run_normalization(onec, task, guard, scope=None):
                 f"В 1С не нашлось позиций для нормализации"
                 + (f" в коллекции «{only}»." if only else " по этой марке.")
                 + (f" Снятых с производства: {discontinued}." if discontinued else ""))
+
+    # «АРТ» — ВНУТРЕННИЙ КОД ПОСТАВЩИКА, и при нормализации тоже (Артисана, решение админа
+    # 28.10.2026): по строке прайса с тем же заводским артикулом, что у карточки. Прайса
+    # нет или в нём нет колонки «Код» на «+» — ничего не дописываем.
+    if content:
+        from src.model.supplier_codes import fill_art, plus_codes
+        try:
+            codes = plus_codes(parse_price_table(content, filename) or [])
+        except Exception:                               # noqa: BLE001
+            logger.warning("Колонка «Код» прайса не разобралась", exc_info=True)
+            codes = {}
+        if codes:
+            cards = {i.ref: i for i in nom.items}
+            for inp in inputs:
+                inp["items"] = [dict(x) for x in inp.get("items") or []]
+                fill_art(inp["items"], codes, cards)
 
     written = 0
     failed: list[str] = []
@@ -2040,7 +2076,8 @@ async def run(orchestrator, onec, price, task, content: bytes, guard,
     # неё не нужен вовсе, — а значит и решать нечего: имя собирается по шаблону из полей
     # самой карточки. Платить за круги цикла и терпеть непредсказуемость незачем.
     if task.kind == TaskKind.NORMALIZE_NAMES:
-        return await run_normalization(onec, task, guard, scope=scope)
+        return await run_normalization(onec, task, guard, scope=scope, content=content,
+                                       filename=price.supplier_price.filename)
 
     # ДАЙДЖЕСТ КЛАДЁТСЯ НА САМУ ЗАДАЧУ, а не возвращается третьим значением: подпись
     # `run` читают три вызывающих и четыре теста, и расширять её ради поля, которое всё
