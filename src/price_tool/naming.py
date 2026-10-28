@@ -370,6 +370,48 @@ def format_size(length, width, thickness=None) -> str:
     return "x".join(parts)
 
 
+def _cm(mm: float) -> str:
+    """Миллиметры → сантиметры для ИМЕНИ: один знак после запятой, если он не ноль."""
+    value = round(mm / 10, 1)
+    return (f"{value:.0f}" if value == int(value) else f"{value:.1f}").replace(".", ",")
+
+
+def size_in_cm(tail: str | None, length=None, width=None, thickness=None) -> str:
+    """Размер в конце наименования — В САНТИМЕТРАХ (правило админа 28.10.2026).
+
+    Поля размеров в номенклатуре — в мм, а в наименовании все размеры в см, с одним
+    разрядом после запятой, если он не ноль: «33,3x100», «60x120», толщина 9 мм — «0,9».
+    Нормализация брала хвост из поля `size` карточки, которое 1С собирает из полей в мм, и
+    переименовала «Dayton Sand 33,3x100» в «Porcelanosa Dayton Sand 333x1000».
+
+    Пересчитываем ТОЛЬКО свой размер: стороны хвоста совпали с полями позиции в мм (или уже
+    в см) в любом порядке. Полей нет или числа чужие — хвост остаётся как был: угадывать
+    единицы по одним числам значило бы однажды разделить на десять сантиметры.
+    """
+    text = drop_zero_size(str(tail or "").strip())
+    found = _TITLE_SIZE.fullmatch(text) if text else None
+    if not found:
+        return text
+    try:
+        own_l, own_w = float(length), float(width)
+    except (TypeError, ValueError):
+        return text
+    if not own_l or not own_w:
+        return text
+    a, b = _f(found.group(1)), _f(found.group(2))
+    if _same(a, own_l) and _same(b, own_w) or _same(a, own_w) and _same(b, own_l):
+        scale = 1.0                         # хвост в мм
+    elif _same(a * 10, own_l) and _same(b * 10, own_w) or \
+            _same(a * 10, own_w) and _same(b * 10, own_l):
+        scale = 10.0                        # хвост уже в см — только причесать запись
+    else:
+        return text
+    parts = [_cm(a * scale), _cm(b * scale)]
+    if found.group(3):
+        parts.append(_cm(_f(found.group(3)) * scale))
+    return "x".join(parts)
+
+
 #: Нулевая часть размера в КОНЦЕ размерной группы: «1500x750x0», «60х60х0,0», «1500*750*0».
 _ZERO_PART = re.compile(r"(?<=\d)\s*[xх×*]\s*0(?:[.,]0+)?(?![\d.,])", re.I)
 

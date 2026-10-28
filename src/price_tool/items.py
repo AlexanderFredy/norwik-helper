@@ -32,7 +32,8 @@ from src.price_tool.naming import (collection_case, collection_from_folder,
                                    drop_own_article, drop_own_size, drop_zero_size,
                                    ensure_type_prefix,
                                    folder_name,
-                                   format_size, size_in_folder, size_in_name, tidy,
+                                   format_size, size_in_cm, size_in_folder, size_in_name,
+                                   tidy,
                                    title_case, tm_for_name, uniform_size, violations)
 
 # Поля, изменение которых показывается админу и менеджерам поимённо (§19.9).
@@ -397,6 +398,10 @@ def plan_collection(inp: dict, current: list, scope: list[str] | None = None
         # ввода, и ругаться на него в каждой позиции значит топить настоящие замечания.
         if tail and not size_in_name(type_name, inp.get("product_type")):
             tail = ""
+        # В НАИМЕНОВАНИИ РАЗМЕР — В САНТИМЕТРАХ, в полях — в мм (правило админа 28.10.2026):
+        # «Dayton Sand 33,3x100», а не «333x1000», как вышло из поля `size` карточки 1С.
+        if tail:
+            tail = size_in_cm(tail, own_l, own_w, own_t)
 
         # СВОЙ артикул вычищаем ПОСЛЕ сборки, а не полагаемся на то, что модель не
         # передаст его в `tail`: она уже передавала, и молча.

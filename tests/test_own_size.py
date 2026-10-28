@@ -69,9 +69,48 @@ class PlanTest(unittest.TestCase):
                        "tail": "2780x1200x0"}]}, [self.card()], [])
         item = plan.items[0]
         self.assertEqual(item.name, "Керамическая плитка Atlas Concorde Marvel Meraviglia "
-                                    "Calacatta Meraviglia Lapp. 2780x1200x6")
+                                    "Calacatta Meraviglia Lapp. 278x120x0,6")
         self.assertEqual(item.fields.get("thickness"), 6.0)
         self.assertTrue(any("убран размер" in w for w in item.warnings))
+
+
+class SizeInCentimetresTest(unittest.TestCase):
+    """В полях — мм, в наименовании — см с одним разрядом, если он не ноль (28.10.2026)."""
+
+    def test_millimetres_become_centimetres(self):
+        from src.price_tool.naming import size_in_cm
+        self.assertEqual(size_in_cm("333x1000", 1000, 333), "33,3x100")
+        self.assertEqual(size_in_cm("600x1200x9", 1200, 600, 9), "60x120x0,9")
+
+    def test_centimetres_are_kept_and_tidied(self):
+        from src.price_tool.naming import size_in_cm
+        self.assertEqual(size_in_cm("33,3x100", 1000, 333), "33,3x100")
+        self.assertEqual(size_in_cm("60.0x120", 1200, 600), "60x120")
+
+    def test_foreign_or_unknown_numbers_are_left_alone(self):
+        """Чужой размер или карточка без полей — не угадываем единицы."""
+        from src.price_tool.naming import size_in_cm
+        self.assertEqual(size_in_cm("300x300", 1000, 333), "300x300")
+        self.assertEqual(size_in_cm("333x1000", None, None), "333x1000")
+
+    def test_dayton_sand_keeps_its_centimetres(self):
+        """БОЙ 28.10.2026: «Dayton Sand 33,3x100» нормализация переименовала в
+        «Porcelanosa Dayton Sand 333x1000» — хвост взят из поля `size` карточки (мм)."""
+        card = NomItem(ref="D1", id="", name="Керамическая плитка Dayton Sand 33,3x100",
+                       article="", unit="м2", size="333x1000",
+                       product_type="Керамическая плитка", collection="Dayton",
+                       parent="Dayton", collection_ref="F", alt_units={}, purchase=None,
+                       retail=None, rrc=None, site_name="Sand", product_type_ref="000000010",
+                       length_from=1000, length_to=1000, width_from=333, width_to=333,
+                       thickness=0)
+        plan = plan_collection({"tm_code": "000000132", "tm_name": "Porcelanosa",
+                                "collection": "Dayton", "product_type": "000000010",
+                                "product_type_name": "Керамическая плитка",
+                                "items": [{"op": "update", "ref": "D1", "title": "Sand",
+                                           "tail": "333x1000"}]}, [card], [])
+        item = plan.items[0]
+        self.assertEqual(item.name, "Керамическая плитка Porcelanosa Dayton Sand 33,3x100")
+        self.assertEqual(item.full_name, item.name)
 
 
 class FullNameSizeTest(unittest.TestCase):
@@ -99,19 +138,19 @@ class FullNameSizeTest(unittest.TestCase):
         self.assertEqual(
             self.full({"op": "update", "ref": "P1", "title": "Bone", "tail": "333x1000x10",
                        "full_name": "Керамическая плитка Porcelanosa Persia Bone"}),
-            "Керамическая плитка Porcelanosa Persia Bone 333x1000x10")
+            "Керамическая плитка Porcelanosa Persia Bone 33,3x100x1")
 
     def test_size_written_otherwise_is_not_doubled(self):
         """«33,3x100» в сантиметрах — тот же размер: снимаем и ставим в конец один раз."""
         self.assertEqual(
             self.full({"op": "update", "ref": "P1", "title": "Bone", "tail": "333x1000x10",
                        "full_name": "Керамическая плитка Porcelanosa Persia Bone 33,3x100"}),
-            "Керамическая плитка Porcelanosa Persia Bone 333x1000x10")
+            "Керамическая плитка Porcelanosa Persia Bone 33,3x100x1")
 
     def test_already_at_the_end_stays_as_is(self):
         self.assertEqual(
             self.full({"op": "update", "ref": "P1", "title": "Bone", "tail": "333x1000x10"}),
-            "Керамическая плитка Porcelanosa Persia Bone 333x1000x10")
+            "Керамическая плитка Porcelanosa Persia Bone 33,3x100x1")
 
     def test_laminate_full_name_gets_no_size(self):
         """У ламината размер живёт в имени папки, а не в карточке (§19.5)."""
