@@ -2585,7 +2585,20 @@ def owner_map(folders, marks) -> dict[str, set]:
         if node is None or node.kind != "tm":
             continue
 
-        mark = _mark_of_folder(normalize(node.name), known)
+        # МАРКА — ИЗ ССЫЛКИ УЗЛА, а имя только запасной путь (бой 28.10.2026). Папка
+        # «Atlas Concorde керамическая плитка» оканчивается видом товара, и сравнение по
+        # окончанию имени нашло в справочнике ГРУППУ «Керамическая плитка» (000000198):
+        # задачи по Boost Expression, Arkshade, Blaze ушли на «марку», под которой нет ни
+        # одного товара. У узла марки 1С отдаёт `tm_ref` — код производителя его товаров;
+        # берём его, когда папка принадлежит марке хотя бы наполовину (`tm_share`):
+        # «Сопутствующие товары» смешанные, там ссылка ничего не доказывает.
+        mark = None
+        ref = (getattr(node, "tm_ref", "") or "").strip()
+        if ref and (getattr(node, "tm_share", 0) or 0) >= 0.5:
+            mark = next((m for m in marks if m.get("code") == ref),
+                        {"code": ref, "name": node.name})
+        if mark is None:
+            mark = _mark_of_folder(normalize(node.name), known)
         if mark is None:
             continue
 

@@ -1594,6 +1594,28 @@ class OwnerMapTest(unittest.TestCase):
         from src.model.task_builder import owner_map
         self.assertNotIn("сирота", owner_map(tree, MARKS))
 
+    def test_mark_comes_from_the_node_link_not_its_name(self):
+        """БОЙ 28.10.2026, Артисана. Папка «Atlas Concorde керамическая плитка» оканчивается
+        видом товара, и сравнение по окончанию имени нашло ГРУППУ справочника «Керамическая
+        плитка» (000000198) — задачи ушли на «марку», под которой нет ни одного товара. У
+        узла марки есть ссылка на производителя (`tm_ref`), она и решает."""
+        from src.model.task_builder import owner_map
+        node = Folder("t1", "Atlas Concorde керамическая плитка", kind="tm")
+        node.tm_ref, node.tm_share = "000000115", 1.0
+        marks = [{"name": "Atlas Concorde / Атлас конкорд", "code": "000000115"},
+                 {"name": "Керамическая плитка", "code": "000000198"}]
+        owners = owner_map([node, Folder("c1", "Boost Expression", parent_ref="t1")], marks)
+        self.assertEqual(owners["boost expression"],
+                         {("000000115", "Atlas Concorde / Атлас конкорд")})
+
+    def test_mixed_folder_link_is_not_trusted(self):
+        """«Сопутствующие товары» принадлежат марке на 16% — ссылка ничего не доказывает."""
+        from src.model.task_builder import owner_map
+        node = Folder("t1", "Most Flooring", kind="tm")
+        node.tm_ref, node.tm_share = "000000100", 0.16
+        owners = owner_map([node, Folder("c1", "Ле Паркет", parent_ref="t1")], MARKS)
+        self.assertEqual(owners["ле паркет"], {("T311", "Most Flooring")})
+
     def test_broken_tree_does_not_hang(self):
         """Папка, ссылающаяся на себя, не должна крутить цикл вечно."""
         from src.model.task_builder import owner_map
